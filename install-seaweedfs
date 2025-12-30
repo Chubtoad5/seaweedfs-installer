@@ -1,0 +1,412 @@
+#!/bin/bash
+
+
+SWFS_IMAGE=${SWFS_IMAGE:-"chrislusf/seaweedfs:latest"}
+CADDY_IMAGE=${CADDY_IMAGE:-"caddy:latest"}
+
+SWFS_USER=${SWFS_USER:-"admin"}             # Username for SeaweedFS Admin UI, Filer, Master, and Webdav
+SWFS_PASSWORD=${SWFS_PASSWORD:-"changeme"}  # Password for SeaweedFS Admin UI, Filer, Master, and Webdav
+
+HOST_FQDN=${HOST_FQDN:-"$(hostname).edge.lab"}              # FQDN for SeaweedFS host
+SWFS_ADMIN_FQDN=${SWFS_ADMIN_FQDN:-"admin.$HOST_FQDN"}      # FQDN for SeaweedFS Admin UI and Caddy landing page
+SWFS_MASTER_FQDN=${SWFS_MASTER_FQDN:-"master.$HOST_FQDN"}   # FQDN for SeaweedFS Master UI/API
+SWFS_FILER_FQDN=${SWFS_FILER_FQDN:-"artifacts.$HOST_FQDN"}  # FQDN for SeaweedFS Filer UI/API
+SWFS_S3_FQDN=${SWFS_S3_FQDN:-"s3.$HOST_FQDN"}               # FQDN for SeaweedFS S3 API
+SWFS_WEBDAV_FQDN=${SWFS_WEBDAV_FQDN:-"share.$HOST_FQDN"}    # FQDN for SeaweedFS WebDav endpoint
+MGMT_IP=$(hostname -I | awk '{print $1}')                   # Used as default_sni fallback for TLS in non-DNS environments
+
+# -- TCP Ports -- #
+SWFS_ADMIN_PORT=${SWFS_ADMIN_PORT:-"443"}
+SWFS_MASTER_PORT=${SWFS_MASTER_PORT:-"9333"}
+SWFS_FILER_PORT=${SWFS_FILER_PORT:-"8888"}
+SWFS_S3_PORT=${SWFS_S3_PORT:-"8333"}
+SWFS_WEBDAV_PORT=${SWFS_WEBDAV_PORT:-"7333"}
+# Volume Server uses port 9340 in docker environment and is not exposed
+
+# -- Functions -- #
+generate_caddyfile () {
+  CADDY_HASHED_PASSWORD=$(docker run --rm ${CADDY_IMAGE} caddy hash-password --plaintext "${SWFS_PASSWORD}")
+  cat > /opt/caddy/Caddyfile <<EOF
+{
+        debug
+        default_sni $MGMT_IP
+}
+$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT, https://$MGMT_IP:$SWFS_ADMIN_PORT {
+        tls internal
+        handle {
+                root * /srv
+                file_server
+        }
+        handle /static* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /login* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /logout* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /admin* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /cluster* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /files* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /object-store* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /mq* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /metrics* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /logs* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /maintenance* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /api* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /artifacts* {
+                @isDomain host $SWFS_ADMIN_FQDN
+                redir @isDomain https://$SWFS_FILER_FQDN:$SWFS_FILER_PORT/artifacts permanent
+                redir https://{host}:$SWFS_FILER_PORT/artifacts permanent
+        }
+}
+$SWFS_FILER_FQDN:$SWFS_FILER_PORT, https://$MGMT_IP:$SWFS_FILER_PORT {
+        tls internal
+        handle /seaweedfsstatic/* {
+                reverse_proxy seaweed-mini:8888
+        }
+        handle /artifacts* {
+                basic_auth {
+                        admin $2a$14$KJudFGhTiULp7Fj2NIGgJuN3yoRn2lbihOl.jn9YcxeCz3qQdTygO
+                }
+                reverse_proxy seaweed-mini:8888
+        }
+        handle {
+                @isDomain host $SWFS_FILER_FQDN
+                redir @isDomain https://$SWFS_ADMIN_FQDN permanent
+                redir https://{host} permanent
+        }
+}
+master.rke2-1.realmstead.com:9333, https://$MGMT_IP:9333 {
+        tls internal
+        basic_auth {
+                admin $2a$14$KJudFGhTiULp7Fj2NIGgJuN3yoRn2lbihOl.jn9YcxeCz3qQdTygO
+        }
+        reverse_proxy seaweed-mini:9333
+}
+share.rke2-1.realmstead.com:7333, https://$MGMT_IP:7333 {
+        tls internal
+        basic_auth {
+                admin $2a$14$KJudFGhTiULp7Fj2NIGgJuN3yoRn2lbihOl.jn9YcxeCz3qQdTygO
+        }
+        reverse_proxy seaweed-mini:7333
+}
+s3.rke2-1.realmstead.com:8333, https://$MGMT_IP:8333 {
+        tls internal
+        reverse_proxy seaweed-mini:8333
+}
+EOF
+}
+
+generate_compose_file () {
+  cat > /opt/seaweedfs/seaweed-compose.yaml <<EOF
+services:
+  seaweed-mini:
+    image: $SWFS_IMAGE
+    container_name: seaweed-mini
+    command: >
+      mini
+      -admin.user "$SWFS_USER"
+      -admin.password "$SWFS_PASSWORD"
+      -dir=/data
+    volumes:
+      - /opt/seaweedfs/mini:/data
+    networks:
+      - seaweed_net
+    restart: unless-stopped
+  caddy:
+    image: $CADDY_IMAGE
+    container_name: seaweed-caddy
+    ports:
+      - "80:80"
+      - "$SWFS_ADMIN_PORT:$SWFS_ADMIN_PORT"
+      - "$SWFS_MASTER_PORT:$SWFS_MASTER_PORT"
+      - "$SWFS_FILER_PORT:$SWFS_FILER_PORT"
+      - "$SWFS_S3_PORT:$SWFS_S3_PORT"
+      - "$SWFS_WEBDAV_PORT:$SWFS_WEBDAV_PORT"
+
+    volumes:
+      - /opt/caddy/Caddyfile:/etc/caddy/Caddyfile
+      - /opt/caddy/srv/index.html:/srv/index.html
+    networks:
+      - seaweed_net
+    restart: unless-stopped
+    depends_on:
+      - seaweed-mini
+networks:
+  seaweed_net
+EOF 
+}
+
+
+generate_index_html () {
+    echo "Creating index.html files..."
+    cat > /opt/caddy/srv/index.html <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SeaweedFS Artifacts</title>
+    <style>
+        body {
+            box-sizing: border-box;
+            background-color: #1a1a1a;
+            color: #e0e0e0;
+            font-family: 'Google Sans', 'Arial', sans-serif;
+            margin: 0;
+            padding: 40px 20px;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .content-wrapper {
+            max-width: 900px;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .title {
+            font-size: 48px;
+            color: #8ab4f8;
+            margin-bottom: 30px;
+            font-weight: 500;
+            letter-spacing: -0.5px;
+            text-align: center;
+        }
+
+        .main-nav {
+            list-style: none;
+            padding: 0;
+            margin: 0 0 40px 0;
+            text-align: center;
+            width: 100%;
+        }
+
+        .main-nav li {
+            margin-bottom: 15px;
+        }
+
+        .link {
+            font-size: 20px;
+            color: #8ab4f8;
+            text-decoration: none;
+            font-weight: 500;
+            transition: all 0.2s ease;
+            display: inline-block;
+        }
+
+        .link:hover {
+            color: #c5e1a5;
+            text-decoration: underline;
+        }
+
+        /* Styling for non-clickable endpoints */
+        .endpoint-label {
+            font-size: 18px;
+            color: #b0b0b0;
+            font-family: 'Courier New', monospace;
+            background: #2a2a2a;
+            padding: 4px 12px;
+            border-radius: 6px;
+            border: 1px solid #333;
+            display: inline-block;
+            margin-top: 5px;
+        }
+
+        .endpoint-tag {
+            font-size: 14px;
+            color: #8ab4f8;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            display: block;
+            margin-bottom: 2px;
+        }
+
+        .doc-card {
+            background-color: #252525;
+            border: 1px solid #333;
+            border-radius: 12px;
+            padding: 40px;
+            width: 100%;
+            box-sizing: border-box;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+
+        .note {
+            font-size: 18px;
+            color: #a8dadc;
+            margin-top: 0;
+            margin-bottom: 30px;
+            border-left: 4px solid #8ab4f8;
+            padding-left: 15px;
+        }
+
+        .subtitle {
+            font-size: 22px;
+            color: #e0e0e0;
+            margin-top: 25px;
+            margin-bottom: 12px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+        }
+
+        .subtitle::before {
+            content: "";
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background-color: #8ab4f8;
+            border-radius: 50%;
+            margin-right: 12px;
+        }
+
+        .code-block {
+            font-family: 'Courier New', monospace;
+            background-color: #121212;
+            color: #c5e1a5;
+            padding: 20px;
+            border-radius: 8px;
+            line-height: 1.6;
+            text-align: left;
+            display: block;
+            border: 1px solid #333;
+            overflow-x: auto;
+        }
+
+        footer {
+            margin-top: auto;
+            padding-top: 40px;
+            color: #555;
+            font-size: 14px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="content-wrapper">
+        <h1 class="title">SeaweedFS Artifacts</h1>
+
+        <ul class="main-nav">
+            <li><a id="admin-link" class="link" href="/login">Admin Console →</a></li>
+            <li><a id="master-link" class="link" target="_blank" rel="noopener noreferrer" href="#">Master Console →</a></li>
+            <li><a id="artifacts-link" class="link" target="_blank" rel="noopener noreferrer" href="#">File Browser →</a></li>
+        </ul>
+
+        <div class="doc-card">
+            <p class="note">This server is setup with S3 and WebDAV access</p>
+
+            <div class="subtitle">S3 endpoint</div>
+            <pre class="code-block" id="s3-url">loading...</pre>
+
+            <div class="subtitle">WebDAV share</div>
+            <pre class="code-block" id="webdav-url">loading...</pre>
+
+            <p class="note">Manage files using the browser UI (above) or use the following API commands</p>
+
+            <div class="subtitle">Create Directory</div>
+            <pre class="code-block" id="curl-mkdir">loading...</pre>
+
+            <div class="subtitle">Upload File</div>
+            <pre class="code-block" id="curl-upload">loading...</pre>
+
+            <div class="subtitle">Download File</div>
+            <pre class="code-block" id="curl-download">loading...</pre>
+
+            <div class="subtitle">Delete File</div>
+            <pre class="code-block" id="curl-delete">loading...</pre>
+        </div>
+
+        <footer>
+            Powered by Caddy & SeaweedFS
+        </footer>
+    </div>
+        <script>
+            (function() {
+                const currentHost = window.location.hostname;
+                const isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(currentHost);
+
+                function getUrl(subdomain, port, path = "") {
+                        if (isIP) {
+                                return `https://${currentHost}:${port}${path}`;
+                        }
+                        const newHost = currentHost.replace('admin', subdomain);
+                        return `https://${newHost}:${port}${path}`;
+                }
+                const artifactsBase = getUrl('artifacts', '$SWFS_FILER_PORT', '/artifacts');
+
+                // 2. Update Nav Links
+                document.getElementById('master-link').href = getUrl('master', '9333');
+                document.getElementById('artifacts-link').href = artifactsBase;
+
+                // 3. Update S3 & WebDAV display
+                document.getElementById('s3-url').textContent = getUrl('s3', '8333');
+                document.getElementById('webdav-url').textContent = getUrl('share', '7333');
+
+                // 4. Update Curl Commands using the calculated artifactsBase
+                document.getElementById('curl-mkdir').textContent =
+`curl -ku $USER:$PASS \\
+   -X POST ${artifactsBase}/`;
+
+                document.getElementById('curl-upload').textContent =
+`curl -ku $USER:$PASS \\
+   -X POST ${artifactsBase}/file.txt \\
+   -F file=@/path/to/localfile.txt`;
+
+                document.getElementById('curl-download').textContent =
+`curl -ku $USER:$PASS \\
+   ${artifactsBase}/file.txt \\
+   -o localfile.txt`;
+
+                document.getElementById('curl-delete').textContent =
+`curl -ku $USER:$PASS \\
+   -X DELETE ${artifactsBase}/file.txt`;
+            })();
+        </script>
+</body>
+</html>
+EOF
+}
+
+generate_outputs () {
+  echo "Installation completed successfully!"
+}
+
+# -- Main Logic -- #
+
+mkdir -p /opt/caddy/srv
+mkdir -p /opt/seaweedfs/mini
+generate_caddyfile
+generate_compose_file
+generate_index_html
+docker compose -f /opt/seaweedfs/seaweed-compose.yaml up -d
+sleep 10 # add loop to check curl for a 200 response
+docker exec -it seaweed-mini curl -X POST http://localhost:$SWFS_FILER_PORT/artifacts/
+
+
+
+
