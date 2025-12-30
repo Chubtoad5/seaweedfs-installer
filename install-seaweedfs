@@ -380,6 +380,7 @@ upload_binaries () {
 
 mkdir -p /opt/caddy/srv
 mkdir -p /opt/seaweedfs/mini
+download_image_pull_push
 ./image_pull_push.sh docker
 download_binaries
 generate_caddyfile
