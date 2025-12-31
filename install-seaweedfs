@@ -398,6 +398,7 @@ Master UI, Filer UI, Admin UI, and WebDAV require authentication:
 
 Caddy landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
 EOF
+  echo
   cat seaweedfs-install.log | tail -21
   echo
 }
