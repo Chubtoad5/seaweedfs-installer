@@ -34,7 +34,7 @@ SWFS_WEBDAV_PORT=${SWFS_WEBDAV_PORT:-"7333"}
 # -- Functions -- #
 generate_caddyfile () {
   CADDY_HASHED_PASSWORD=$(docker run --rm ${CADDY_IMAGE} caddy hash-password --plaintext "${SWFS_PASSWORD}")
-  echo "  Creating Caddyfile..." | tee -a install-seaweedfs.log
+  echo "  Creating Caddyfile..." | tee -a seaweedfs-install.log
   cat > /opt/caddy/Caddyfile <<EOF
 {
         debug
@@ -127,7 +127,7 @@ EOF
 }
 
 generate_compose_file () {
-  echo "  Creating seaweed-compose.yaml..." | tee -a install-seaweedfs.log
+  echo "  Creating seaweed-compose.yaml..." | tee -a seaweedfs-install.log
   cat > /opt/seaweedfs/seaweed-compose.yaml <<EOF
 services:
   seaweed-mini:
@@ -169,7 +169,7 @@ EOF
 
 
 generate_index_html () {
-    echo "  Creating index.html files..." | tee -a install-seaweedfs.log
+    echo "  Creating index.html files..." | tee -a seaweedfs-install.log
     cat > /opt/caddy/srv/index.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -370,13 +370,13 @@ EOF
 }
 
 download_image_pull_push () {
-  echo "  Downloading image_pull_push..." | tee -a install-seaweedfs.log
+  echo "  Downloading image_pull_push..." | tee -a seaweedfs-install.log
   curl -OL https://github.com/Chubtoad5/images-pull-push/raw/refs/heads/main/image_pull_push.sh
   chmod +x image_pull_push.sh
 }
 generate_outputs () {
-  cat >> install-seaweedfs.log <<EOF
-# -- SeaweedFS Installer Log - $(date) -- #
+  cat >> seaweedfs-install.log <<EOF
+# -- SeaweedFS Installer Finished- $(date) -- #
 
 Docker compose file:   /opt/seaweedfs/seaweedfs-compose.yaml
 SeaweedFS data dir:    /opt/seaweedfs/mini
@@ -386,32 +386,32 @@ To run weed commands:  docker exec -it seaweed-mini weed <command>
 To run caddy commands: docker exec -it seaweed-caddy caddy <command>
  
 The following services are accessible by IP or FQDN:
-Master UI:      https://$SWFQS_MASTER_FQDN:$SWFS_MASTER_PORT
-Filer UI:       https://$SWFQS_FILER_FQDN:$SWFS_FILER_PORT/artifacts
-S3 Endpoint:    https://$SWFQS_S3_FQDN:$SWFS_S3_PORT
-WebDAV:         https://$SWFQS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT
-Admin UI:       https://$SWFQS_ADMIN_FQDN:$SWFS_ADMIN_PORT
-Volume Server:  https://$SWFQS_VOLUME_FQDN:$SWFS_VOLUME_PORT
+Master UI:      https://$SWFS_MASTER_FQDN:$SWFS_MASTER_PORT
+Filer UI:       https://$SWFS_FILER_FQDN:$SWFS_FILER_PORT/artifacts
+S3 Endpoint:    https://$SWFS_S3_FQDN:$SWFS_S3_PORT
+WebDAV:         https://$SWFS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT
+Admin UI:       https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
+Volume Server:  https://$SWFS_VOLUME_FQDN:$SWFS_VOLUME_PORT
 
 Master UI, Filer UI, Admin UI, and WebDAV require authentication:
   Username: $SWFS_USER
   Password: $SWFS_PASSWORD
 Caddy landing page: https://$SWFQS_ADMIN_FQDN:$SWFS_ADMIN_PORT
 EOF
-  cat install-seaweedfs.log
+  cat seaweedfs-install.log
 }
 
 download_binaries () {
-  echo "  Downloading artifact binaries..." | tee -a install-seaweedfs.log
+  echo "  Downloading artifact binaries..." | tee -a seaweedfs-install.log
 }
 
 upload_binaries () {
-  echo "  Uploading artifact binaries to SeaweedFS Filer..." | tee -a install-seaweedfs.log
+  echo "  Uploading artifact binaries to SeaweedFS Filer..." | tee -a seaweedfs-install.log
 }
 
 # -- Main Logic -- #
 
-echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a install-seaweedfs.log
+echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a seaweedfs-install.log
 mkdir -p /opt/caddy/srv
 mkdir -p /opt/seaweedfs/mini
 download_image_pull_push
@@ -422,7 +422,7 @@ generate_compose_file
 generate_index_html
 echo "  Starting SeaweedFS and Caddy containers..."
 docker compose -f /opt/seaweedfs/seaweed-compose.yaml up -d
-sleep 10 # add loop to check curl for a 200 response
+sleep 5 # add loop to check curl for a 200 response
 echo "  Creating default artifact directory on SeaweedFS Filer..."
 docker exec -it seaweed-mini curl -X POST http://localhost:$SWFS_FILER_PORT/artifacts/ && echo 
 upload_binaries
