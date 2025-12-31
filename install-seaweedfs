@@ -127,8 +127,8 @@ EOF
 }
 
 generate_compose_file () {
-  echo "  Creating seaweed-compose.yaml..." | tee -a seaweedfs-install.log
-  cat > /opt/seaweedfs/seaweed-compose.yaml <<EOF
+  echo "  Creating seaweedfs-compose.yaml..." | tee -a seaweedfs-install.log
+  cat > /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
 services:
   seaweed-mini:
     image: $SWFS_IMAGE
@@ -376,7 +376,7 @@ download_image_pull_push () {
 }
 generate_outputs () {
   cat >> seaweedfs-install.log <<EOF
-# -- SeaweedFS Installer Finished- $(date) -- #
+# -- SeaweedFS Installer Finished - $(date) -- #
 
 Docker compose file:   /opt/seaweedfs/seaweedfs-compose.yaml
 SeaweedFS data dir:    /opt/seaweedfs/mini
@@ -391,14 +391,15 @@ Filer UI:       https://$SWFS_FILER_FQDN:$SWFS_FILER_PORT/artifacts
 S3 Endpoint:    https://$SWFS_S3_FQDN:$SWFS_S3_PORT
 WebDAV:         https://$SWFS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT
 Admin UI:       https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
-Volume Server:  https://$SWFS_VOLUME_FQDN:$SWFS_VOLUME_PORT
 
 Master UI, Filer UI, Admin UI, and WebDAV require authentication:
   Username: $SWFS_USER
   Password: $SWFS_PASSWORD
-Caddy landing page: https://$SWFQS_ADMIN_FQDN:$SWFS_ADMIN_PORT
+
+Caddy landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
 EOF
   cat seaweedfs-install.log
+  echo
 }
 
 download_binaries () {
@@ -421,7 +422,7 @@ generate_caddyfile
 generate_compose_file
 generate_index_html
 echo "  Starting SeaweedFS and Caddy containers..."
-docker compose -f /opt/seaweedfs/seaweed-compose.yaml up -d
+docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
 sleep 5 # add loop to check curl for a 200 response
 echo "  Creating default artifact directory on SeaweedFS Filer..."
 docker exec -it seaweed-mini curl -X POST http://localhost:$SWFS_FILER_PORT/artifacts/ && echo 
