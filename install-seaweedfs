@@ -154,6 +154,7 @@ services:
       - seaweed-mini
 networks:
   seaweed_net: {}
+  
 EOF 
 }
 
