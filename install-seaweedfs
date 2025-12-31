@@ -1,12 +1,20 @@
 #!/bin/bash
 
+### Script to install and configure SeaweedFS mini with Caddy reverse proxy in a Docker environment
+### SeaweedFS provides scalable file storage via S3, WebDAV, static Filer
+### Caddy provides TLS, authentication, and reverse proxy services
 
+# -- USER DEFINED Configuration Variables -- #
+
+# - Container Images
 SWFS_IMAGE=${SWFS_IMAGE:-"chrislusf/seaweedfs:latest"}
 CADDY_IMAGE=${CADDY_IMAGE:-"caddy:latest"}
 
+# - Basic Authentication
 SWFS_USER=${SWFS_USER:-"admin"}             # Username for SeaweedFS Admin UI, Filer, Master, and Webdav
 SWFS_PASSWORD=${SWFS_PASSWORD:-"changeme"}  # Password for SeaweedFS Admin UI, Filer, Master, and Webdav
 
+# - Fully Qualified Domain Names (FQDNs)
 HOST_FQDN=${HOST_FQDN:-"$(hostname).edge.lab"}              # FQDN for SeaweedFS host
 SWFS_ADMIN_FQDN=${SWFS_ADMIN_FQDN:-"admin.$HOST_FQDN"}      # FQDN for SeaweedFS Admin UI and Caddy landing page
 SWFS_MASTER_FQDN=${SWFS_MASTER_FQDN:-"master.$HOST_FQDN"}   # FQDN for SeaweedFS Master UI/API
@@ -15,7 +23,7 @@ SWFS_S3_FQDN=${SWFS_S3_FQDN:-"s3.$HOST_FQDN"}               # FQDN for SeaweedFS
 SWFS_WEBDAV_FQDN=${SWFS_WEBDAV_FQDN:-"share.$HOST_FQDN"}    # FQDN for SeaweedFS WebDav endpoint
 MGMT_IP=$(hostname -I | awk '{print $1}')                   # Used as default_sni fallback for TLS in non-DNS environments
 
-# -- TCP Ports -- #
+# - Service TCP Ports
 SWFS_ADMIN_PORT=${SWFS_ADMIN_PORT:-"443"}
 SWFS_MASTER_PORT=${SWFS_MASTER_PORT:-"9333"}
 SWFS_FILER_PORT=${SWFS_FILER_PORT:-"8888"}
@@ -26,6 +34,7 @@ SWFS_WEBDAV_PORT=${SWFS_WEBDAV_PORT:-"7333"}
 # -- Functions -- #
 generate_caddyfile () {
   CADDY_HASHED_PASSWORD=$(docker run --rm ${CADDY_IMAGE} caddy hash-password --plaintext "${SWFS_PASSWORD}")
+  echo "  Creating Caddyfile..." | tee -a install-seaweedfs.log
   cat > /opt/caddy/Caddyfile <<EOF
 {
         debug
@@ -118,7 +127,7 @@ EOF
 }
 
 generate_compose_file () {
-  echo "Creating seaweed-compose.yaml..."
+  echo "  Creating seaweed-compose.yaml..." | tee -a install-seaweedfs.log
   cat > /opt/seaweedfs/seaweed-compose.yaml <<EOF
 services:
   seaweed-mini:
@@ -154,13 +163,13 @@ services:
       - seaweed-mini
 networks:
   seaweed_net: {}
-  
-EOF 
+
+EOF
 }
 
 
 generate_index_html () {
-    echo "Creating index.html files..."
+    echo "  Creating index.html files..." | tee -a install-seaweedfs.log
     cat > /opt/caddy/srv/index.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -340,18 +349,18 @@ generate_index_html () {
                 document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
                 document.getElementById('webdav-url').textContent = getUrl('share', '$SWFS_WEBDAV_PORT');
                 document.getElementById('curl-mkdir').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\\\
+\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\
    -X POST \${artifactsBase}/\`;
                 document.getElementById('curl-upload').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\\\
-   -X POST \${artifactsBase}/file.txt \\\\\\\\
+\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\
+   -X POST \${artifactsBase}/file.txt \\\\\\
    -F file=@/path/to/localfile.txt\`;
                 document.getElementById('curl-download').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\\\
-   \${artifactsBase}/file.txt \\\\\\\\
+\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\
+   \${artifactsBase}/file.txt \\\\\\
    -o localfile.txt\`;
                 document.getElementById('curl-delete').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\\\
+\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\
    -X DELETE \${artifactsBase}/file.txt\`;
             })();
         </script>
@@ -361,24 +370,48 @@ EOF
 }
 
 download_image_pull_push () {
-  echo "Downloading image_pull_push..."
+  echo "  Downloading image_pull_push..." | tee -a install-seaweedfs.log
   curl -OL https://github.com/Chubtoad5/images-pull-push/raw/refs/heads/main/image_pull_push.sh
   chmod +x image_pull_push.sh
 }
 generate_outputs () {
-  echo "Installation completed successfully!"
+  cat >> install-seaweedfs.log <<EOF
+# -- SeaweedFS Installer Log - $(date) -- #
+
+Docker compose file:   /opt/seaweedfs/seaweedfs-compose.yaml
+SeaweedFS data dir:    /opt/seaweedfs/mini
+Caddyfile:             /opt/caddy/Caddyfile
+Caddy web root:        /opt/caddy/srv/
+To run weed commands:  docker exec -it seaweed-mini weed <command>
+To run caddy commands: docker exec -it seaweed-caddy caddy <command>
+ 
+The following services are accessible by IP or FQDN:
+Master UI:      https://$SWFQS_MASTER_FQDN:$SWFS_MASTER_PORT
+Filer UI:       https://$SWFQS_FILER_FQDN:$SWFS_FILER_PORT/artifacts
+S3 Endpoint:    https://$SWFQS_S3_FQDN:$SWFS_S3_PORT
+WebDAV:         https://$SWFQS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT
+Admin UI:       https://$SWFQS_ADMIN_FQDN:$SWFS_ADMIN_PORT
+Volume Server:  https://$SWFQS_VOLUME_FQDN:$SWFS_VOLUME_PORT
+
+Master UI, Filer UI, Admin UI, and WebDAV require authentication:
+  Username: $SWFS_USER
+  Password: $SWFS_PASSWORD
+Caddy landing page: https://$SWFQS_ADMIN_FQDN:$SWFS_ADMIN_PORT
+EOF
+  cat install-seaweedfs.log
 }
 
 download_binaries () {
-  echo "Downloading artifact binaries..."
+  echo "  Downloading artifact binaries..." | tee -a install-seaweedfs.log
 }
 
 upload_binaries () {
-  echo "uploading artifact binaries to SeaweedFS Filer..."
+  echo "  Uploading artifact binaries to SeaweedFS Filer..." | tee -a install-seaweedfs.log
 }
 
 # -- Main Logic -- #
 
+echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a install-seaweedfs.log
 mkdir -p /opt/caddy/srv
 mkdir -p /opt/seaweedfs/mini
 download_image_pull_push
@@ -386,10 +419,11 @@ download_image_pull_push
 download_binaries
 generate_caddyfile
 generate_compose_file
-echo "after compose before index"
 generate_index_html
+echo "  Starting SeaweedFS and Caddy containers..."
 docker compose -f /opt/seaweedfs/seaweed-compose.yaml up -d
 sleep 10 # add loop to check curl for a 200 response
-docker exec -it seaweed-mini curl -X POST http://localhost:$SWFS_FILER_PORT/artifacts/
+echo "  Creating default artifact directory on SeaweedFS Filer..."
+docker exec -it seaweed-mini curl -X POST http://localhost:$SWFS_FILER_PORT/artifacts/ && echo 
 upload_binaries
 generate_outputs
