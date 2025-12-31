@@ -118,6 +118,7 @@ EOF
 }
 
 generate_compose_file () {
+  echo "Creating seaweed-compose.yaml..."
   cat > /opt/seaweedfs/seaweed-compose.yaml <<EOF
 services:
   seaweed-mini:
@@ -143,7 +144,6 @@ services:
       - "$SWFS_FILER_PORT:$SWFS_FILER_PORT"
       - "$SWFS_S3_PORT:$SWFS_S3_PORT"
       - "$SWFS_WEBDAV_PORT:$SWFS_WEBDAV_PORT"
-
     volumes:
       - /opt/caddy/Caddyfile:/etc/caddy/Caddyfile
       - /opt/caddy/srv/index.html:/srv/index.html
@@ -385,6 +385,7 @@ download_image_pull_push
 download_binaries
 generate_caddyfile
 generate_compose_file
+echo "after compose before index"
 generate_index_html
 docker compose -f /opt/seaweedfs/seaweed-compose.yaml up -d
 sleep 10 # add loop to check curl for a 200 response
