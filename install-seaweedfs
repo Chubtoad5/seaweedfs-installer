@@ -113,7 +113,7 @@ EOF
 
 generate_caddyfile () {
   if [[ $PUSH_MODE -eq 1 || $REGISTRY_MODE -eq 1 ]]; then
-    local caddy_image_local="${REG_FQDN}:${REG_PORT}/$CADDY_IMAGE"
+    local caddy_image_local="${REG_FQDN}:${REG_PORT}/library/$CADDY_IMAGE"
   else
     local caddy_image_local="$CADDY_IMAGE"
   fi
@@ -213,7 +213,7 @@ EOF
 generate_compose_file () {
   if [[ $PUSH_MODE -eq 1 || $REGISTRY_MODE -eq 1 ]]; then
     SWFS_IMAGE="${REG_FQDN}:${REG_PORT}/$SWFS_IMAGE"
-    CADDY_IMAGE="${REG_FQDN}:${REG_PORT}/$CADDY_IMAGE"
+    CADDY_IMAGE="${REG_FQDN}:${REG_PORT}/library/$CADDY_IMAGE"
   else
     SWFS_IMAGE="$SWFS_IMAGE"
     CADDY_IMAGE="$CADDY_IMAGE"
