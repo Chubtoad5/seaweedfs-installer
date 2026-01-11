@@ -33,6 +33,8 @@ SWFS_S3_PORT=${SWFS_S3_PORT:-"8333"}
 SWFS_WEBDAV_PORT=${SWFS_WEBDAV_PORT:-"7333"}
 # Volume Server uses port 9340 in docker environment and is not exposed
 
+ENABLE_WEBDAV=${ENABLE_WEBDAV:-"true"}   # Enable WebDAV Gateway over open http (no authentication)
+
 # -- INTERNAL VARIABLES (do not edit) -- #
 AIR_GAPPED_MODE=0
 SAVE_MODE=0
@@ -51,8 +53,6 @@ base_dir=$(pwd)
 user_name=${SUDO_USER:-$(whoami)}
 mgmt_ip=$(hostname -I | awk '{print $1}')
 current_hostname=$(hostname)
-
-
 
 # -- Functions -- #
 
@@ -196,18 +196,19 @@ $SWFS_MASTER_FQDN:$SWFS_MASTER_PORT, https://$MGMT_IP:$SWFS_MASTER_PORT {
         }
         reverse_proxy seaweed-mini:9333
 }
-$SWFS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT, https://$MGMT_IP:$SWFS_WEBDAV_PORT {
-        tls internal
-        basic_auth {
-                $SWFS_USER $CADDY_HASHED_PASSWORD
-        }
-        reverse_proxy seaweed-mini:7333
-}
 $SWFS_S3_FQDN:$SWFS_S3_PORT, https://$MGMT_IP:$SWFS_S3_PORT {
         tls internal
         reverse_proxy seaweed-mini:8333
 }
 EOF
+if [[ "$ENABLE_WEBDAV" == "true" ]]; then
+        cat >> /opt/caddy/Caddyfile <<EOF
+http://$SWFS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT, http://$MGMT_IP:$SWFS_WEBDAV_PORT {
+        reverse_proxy seaweed-mini:7333
+}
+EOF
+fi
+
 }
 
 generate_compose_file () {
@@ -427,18 +428,18 @@ generate_index_html () {
                 const currentHost = window.location.hostname;
                 const isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}\$/.test(currentHost);
 
-                function getUrl(subdomain, port, path = "") {
+                function getUrl(subdomain, port, path = "", protocol = "https") {
                         if (isIP) {
-                                return \`https://\${currentHost}:\${port}\${path}\`;
+                                return \`\${protocol}://\${currentHost}:\${port}\${path}\`;
                         }
                         const newHost = currentHost.replace('admin', subdomain);
-                        return \`https://\${newHost}:\${port}\${path}\`;
+                        return \`\${protocol}://\${newHost}:\${port}\${path}\`;
                 }
                 const artifactsBase = getUrl('artifacts', '$SWFS_FILER_PORT', '/artifacts');
                 document.getElementById('master-link').href = getUrl('master', '$SWFS_MASTER_PORT');
                 document.getElementById('artifacts-link').href = artifactsBase;
                 document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
-                document.getElementById('webdav-url').textContent = getUrl('share', '$SWFS_WEBDAV_PORT');
+                document.getElementById('webdav-url').textContent = getUrl('share', '$SWFS_WEBDAV_PORT', '/artifacts', 'http');
                 document.getElementById('curl-mkdir').textContent =
 \`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\
    -X POST \${artifactsBase}/\`;
