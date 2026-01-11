@@ -556,6 +556,15 @@ EOF
   echo "  created 'swfs-save.tar.gz' for air-gapped deployment."
 }
 
+uninstall_swfs () {
+    echo "# -- SeaweedFS Uninstaller Started - $(date) -- #" | tee -a seaweedfs-uninstall.log
+    echo "  Stopping and removing SeaweedFS and Caddy containers..." | tee -a seaweedfs-uninstall.log
+    docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml down
+    echo "  Removing SeaweedFS and Caddy data and configuration..." | tee -a seaweedfs-uninstall.log
+    rm -rf /opt/seaweedfs
+    rm -rf /opt/caddy
+    echo "# -- SeaweedFS Uninstaller Finished - $(date) -- #" | tee -a seaweedfs-uninstall.log
+}
 
 display_args() {
     echo "  AIR_GAPPED_MODE: $AIR_GAPPED_MODE"
