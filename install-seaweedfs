@@ -105,15 +105,19 @@ EOF
       $base_dir/utilities/image_pull_push.sh reg-cert $REGISTRY_INFO
     fi
   fi
+  if [[ $REGISTRY_MODE -eq 1 ]]; then
+    echo "  Logging into local registry $REG_FQDN:$REG_PORT ..."
+    docker login $REG_FQDN:$REG_PORT -u "$REG_USER" -p "$REG_PASS"
+  fi
 }
 
 generate_caddyfile () {
   if [[ $PUSH_MODE -eq 1 || $REGISTRY_MODE -eq 1 ]]; then
-    CADDY_IMAGE="${REG_FQDN}:${REG_PORT}/$CADDY_IMAGE"
+    local caddy_image_local="${REG_FQDN}:${REG_PORT}/$CADDY_IMAGE"
   else
-    CADDY_IMAGE="$CADDY_IMAGE"
+    local caddy_image_local="$CADDY_IMAGE"
   fi
-  CADDY_HASHED_PASSWORD=$(docker run --rm ${CADDY_IMAGE} caddy hash-password --plaintext "${SWFS_PASSWORD}")
+  CADDY_HASHED_PASSWORD=$(docker run --rm ${caddy_image_local} caddy hash-password --plaintext "${SWFS_PASSWORD}")
   echo "  Creating Caddyfile..." | tee -a seaweedfs-install.log
   cat > /opt/caddy/Caddyfile <<EOF
 {
