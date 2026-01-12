@@ -59,7 +59,9 @@ install_swfs () {
         mkdir -p /opt/caddy/srv
         mkdir -p /opt/seaweedfs/mini
         debug_run run_docker
-        download_binaries
+        if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
+            download_binaries
+        fi
         generate_caddyfile
         generate_compose_file
         generate_index_html
@@ -142,6 +144,9 @@ $SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT, https://$MGMT_IP:$SWFS_ADMIN_PORT {
                 reverse_proxy seaweed-mini:23646
         }
         handle /cluster* {
+                reverse_proxy seaweed-mini:23646
+        }
+        handle /storage* {
                 reverse_proxy seaweed-mini:23646
         }
         handle /files* {
