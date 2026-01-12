@@ -384,6 +384,8 @@ generate_index_html () {
             text-align: left;
             display: block;
             border: 1px solid #333;
+            white-space: pre;
+            word-wrap: break-word;
             overflow-x: auto;
         }
         footer {
@@ -442,18 +444,18 @@ generate_index_html () {
                 document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
                 document.getElementById('webdav-url').textContent = getUrl('share', '$SWFS_WEBDAV_PORT', '/artifacts', 'http');
                 document.getElementById('curl-mkdir').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\
+\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
    -X POST \${artifactsBase}/\`;
                 document.getElementById('curl-upload').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\
-   -X POST \${artifactsBase}/file.txt \\\\\\
+\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
+   -X POST \${artifactsBase}/file.txt \\\\\\  
    -F file=@/path/to/localfile.txt\`;
                 document.getElementById('curl-download').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\
-   \${artifactsBase}/file.txt \\\\\\
+\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
+   \${artifactsBase}/file.txt \\\\\\  
    -o localfile.txt\`;
                 document.getElementById('curl-delete').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\
+\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
    -X DELETE \${artifactsBase}/file.txt\`;
             })();
         </script>

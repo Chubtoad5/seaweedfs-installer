@@ -96,5 +96,5 @@ sudo SUDO SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" ./install-seaweedfs 
 |SWFS_FILER_PORT       |8888                       |TCP port for Filer service                     |
 |SWFS_S3_PORT          |8333                       |TCP port for S3 endpoint                       |
 |SWFS_WEBDAV_PORT      |7333                       |TCP port for WebDAV endpoint                   |
-|ENABLE_WEBDAV         |true                       |Expose WevDAV, uses http and no authentication |
+|ENABLE_WEBDAV         |true                       |Expose WebDAV, uses http and no authentication |
 |ARTIFACTS_TO_DOWNLOAD |""                         |List of space separated binary URLs for filer upload. Example: "https://static/file1.txt https://static/image1.img" |
