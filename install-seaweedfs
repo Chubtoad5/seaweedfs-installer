@@ -13,8 +13,8 @@ SWFS_IMAGE=${SWFS_IMAGE:-"chrislusf/seaweedfs:latest"}
 CADDY_IMAGE=${CADDY_IMAGE:-"caddy:latest"}
 
 # - Basic Authentication
-SWFS_USER=${SWFS_USER:-"admin"}             # Username for SeaweedFS Admin UI, Filer, Master, and Webdav
-SWFS_PASSWORD=${SWFS_PASSWORD:-"changeme"}  # Password for SeaweedFS Admin UI, Filer, Master, and Webdav
+SWFS_USER=${SWFS_USER:-"admin"}             # Username for SeaweedFS Admin UI, Filer, Master
+SWFS_PASSWORD=${SWFS_PASSWORD:-"changeme"}  # Password for SeaweedFS Admin UI, Filer, Master
 
 # - Fully Qualified Domain Names (FQDNs)
 HOST_FQDN=${HOST_FQDN:-"$(hostname).edge.lab"}              # FQDN for SeaweedFS host
@@ -506,6 +506,7 @@ download_binaries () {
   cd $base_dir/utilities/artifacts
   read -a ARTIFACTS_TO_DOWNLOAD_ARRAY <<< "$ARTIFACTS_TO_DOWNLOAD"
   for url in "${ARTIFACTS_TO_DOWNLOAD_ARRAY[@]}"; do
+        echo "  Downloading $(basename $url)..." | tee -a ../seaweedfs-install.log
         curl -kfLO "$url"
   done
   cd $base_dir
