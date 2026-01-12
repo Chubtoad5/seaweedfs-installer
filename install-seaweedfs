@@ -51,9 +51,6 @@ REG_PASS=""
 fqdn_pattern='^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$'
 ipv4_pattern='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
 base_dir=$(pwd)
-user_name=${SUDO_USER:-$(whoami)}
-mgmt_ip=$(hostname -I | awk '{print $1}')
-current_hostname=$(hostname)
 
 # -- Functions -- #
 
@@ -68,6 +65,7 @@ install_swfs () {
         generate_index_html
         echo "  Starting SeaweedFS and Caddy containers..."
         docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
+        echo "  Waiting for SeaweedFS and Caddy to start..."
         sleep 5 # add loop to check curl for a 200 response
         echo "  Creating default artifact directory on SeaweedFS Filer..."
         docker exec -it seaweed-mini curl -X POST http://localhost:$SWFS_FILER_PORT/artifacts/ && echo 
