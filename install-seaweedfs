@@ -408,7 +408,7 @@ generate_index_html () {
             <p class="note">Caddy is deployed on the front end to serve this landing page, provide local TLS with auto-renewing certificates, basic authentication, and a reverse proxy to security harden the SeaweedFS services</p>
             <div class="subtitle">S3 endpoint</div>
             <pre class="code-block" id="s3-url">loading...</pre>
-            <div class="subtitle">WebDAV share</div>
+            <div class="subtitle">WebDAV share - enabled: $ENABLE_WEBDAV</div>
             <pre class="code-block" id="webdav-url">loading...</pre>
             <p class="note">Manage files using the browser UI (link above) or use the following API commands</p>
             <div class="subtitle">Create Directory</div>
