@@ -445,7 +445,7 @@ generate_index_html () {
                 document.getElementById('master-link').href = getUrl('master', '$SWFS_MASTER_PORT');
                 document.getElementById('artifacts-link').href = artifactsBase;
                 document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
-                document.getElementById('webdav-url').textContent = getUrl('share', '$SWFS_WEBDAV_PORT', '/artifacts', 'http');
+                document.getElementById('webdav-url').textContent = getUrl('share', '$SWFS_WEBDAV_PORT', '/artifacts', 'net use Z: http');
                 document.getElementById('curl-mkdir').textContent =
 \`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
    -X POST \${artifactsBase}/\`;
@@ -482,8 +482,6 @@ Docker compose file:   /opt/seaweedfs/seaweedfs-compose.yaml
 SeaweedFS data dir:    /opt/seaweedfs/mini
 Caddyfile:             /opt/caddy/Caddyfile
 Caddy web root:        /opt/caddy/srv/
-To run weed commands:  docker exec -it seaweed-mini weed <command>
-To run caddy commands: docker exec -it seaweed-caddy caddy <command>
  
 The following services are accessible by IP or FQDN if DNS is configured:
   Master UI:    https://$SWFS_MASTER_FQDN:$SWFS_MASTER_PORT
@@ -492,17 +490,20 @@ The following services are accessible by IP or FQDN if DNS is configured:
   WebDAV:       http://$SWFS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT
   Admin UI:     https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
 
-Master UI, Filer UI, Admin UI require authentication:
+To run weed commands:  docker exec -it seaweed-mini weed <command>
+To run caddy commands: docker exec -it seaweed-caddy caddy <command>
+To download the Root CA (if required): docker exec -it seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
+To mount WebDAV share from Windows: net use Z: http://$SWFS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT/artifacts
+
+Master UI, Filer UI, and Admin UI require authentication:
   Username: $SWFS_USER
   Password: $SWFS_PASSWORD
-If Root CA certificate trust is required for TLS connections, download from Caddy container:
-  docker exec -it seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
 
-Caddy landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
+  >>> Landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT <<<
 
 EOF
   echo
-  cat seaweedfs-install.log | tail -21
+  cat seaweedfs-install.log | tail -24
   echo
 }
 
