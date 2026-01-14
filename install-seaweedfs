@@ -243,7 +243,7 @@ services:
     image: $CADDY_IMAGE
     container_name: seaweed-caddy
     ports:
-      - "80:80" # Reserved for future automatic_https
+      # - "80:80" # Reserved for future automatic_https
       - "$SWFS_ADMIN_PORT:$SWFS_ADMIN_PORT"
       - "$SWFS_MASTER_PORT:$SWFS_MASTER_PORT"
       - "$SWFS_FILER_PORT:$SWFS_FILER_PORT"
