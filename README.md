@@ -87,7 +87,7 @@ sudo SUDO SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" ./install-seaweedfs 
 |HOST_FQDN             |$(hostanme).edge.lab       |FQDN for the host, i.e. myhost.mydomain.com    |
 |SWFS_ADMIN_FQDN       |admin.$HOST_FQDN           |FQDN prefix for Admin UI                       |
 |SWFS_MASTER_FQDN      |master.$HOST_FQDN          |FQDN prefix for Master service                 |
-|SWFS_FILER_FQDN       |artifacts.$HOST_FQDN       |FQDN prefix for Filer service                  |
+|SWFS_FILER_FQDN       |filer.$HOST_FQDN       |FQDN prefix for Filer service                  |
 |SWFS_S3_FQDN          |s3.$HOST_FQDN              |FQDN prefix for S3 endpoint service            |
 |SWFS_WEBDAV_FQDN      |share.$HOST_FQDN           |FQDN prefix for WebDAV endpoint                |
 |MGMT_IP               |$(hostname -I)             |Host's IP to use when DNS not configured       |
