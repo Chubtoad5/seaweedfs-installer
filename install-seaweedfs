@@ -309,6 +309,9 @@ services:
   seaweed-mini:
     image: $SWFS_IMAGE
     container_name: seaweed-mini
+    environment:
+      - AWS_ACCESS_KEY_ID=$SWFS_USER
+      - AWS_SECRET_ACCESS_KEY=$SWFS_PASSWORD
     command: >
       mini
       -admin.user "$SWFS_USER"
@@ -318,6 +321,7 @@ services:
 EOF
   if [[ $ENABLE_SMB == "true" ]]; then
     cat >> /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
+      -filer.port.grpc 18888
     ports:
       - 18888:18888
 EOF
