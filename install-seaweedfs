@@ -677,7 +677,7 @@ uninstall_swfs () {
     echo "  Stopping and removing SeaweedFS SMB FUSE service..." | tee -a seaweedfs-uninstall.log
     systemctl disable --now seaweedfs-fuse.service
     systemctl disable --now smbd.service
-    sed -i '/\[$DEFAULT_FILER_DIR_NAME\]/,${s/^/#/}' /etc/samba/smb.conf
+    sed -i "/\[$DEFAULT_FILER_DIR_NAME\]/,${s/^/#/}" /etc/samba/smb.conf
     rm -rf /etc/systemd/system/seaweedfs-fuse.service
     rm -rf /mnt/seaweedfs
   fi
