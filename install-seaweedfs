@@ -61,16 +61,16 @@ install_swfs () {
   mkdir -p /opt/seaweedfs/mini
   if [[ $ENABLE_SMB == "true" ]]; then
     if [[ $AIR_GAPPED_MODE -eq 1 ]]; then
-      cd $base_dir/utilities/install_packages
+      cd $base_dir/utilities/install-packages
       ./install_packages.sh offline fuse3 samba
       cd $base_dir
     else
       mkdir -p /mnt/seaweedfs
       mkdir -p $base_dir/utilities/weed
-      mkdir -p $base_dir/utilities/install_packages
-      curl -sfL https://raw.githubusercontent.com/Chubtoad5/install-packages/main/install_packages.sh -o $base_dir/utilities/install_packages/install_packages.sh
-      chmod +x $base_dir/utilities/install_packages/install-packages.sh
-      $base_dir/utilities/install_packages/install_packages.sh online fuse3 samba
+      mkdir -p $base_dir/utilities/install-packages
+      curl -sfL https://raw.githubusercontent.com/Chubtoad5/install-packages/main/install_packages.sh -o $base_dir/utilities/install-packages/install_packages.sh
+      chmod +x $base_dir/utilities/install-packages/install_packages.sh
+      $base_dir/utilities/install-packages/install_packages.sh online fuse3 samba
       local swfs_release=$(curl -s https://api.github.com/repos/seaweedfs/seaweedfs/releases/latest | grep tag_name |awk '{print $2}' |cut -d , -f 1 |tr -d '"')
       curl -sfL https://github.com/seaweedfs/seaweedfs/releases/download/$swfs_release/linux_amd64.tar.gz -o $base_dir/utilities/weed/linux_amd64.tar.gz
       tar -xzf $base_dir/utilities/weed/linux_amd64.tar.gz -C $base_dir/utilities/weed
@@ -93,11 +93,11 @@ install_swfs () {
   local attempt=1
   while true; do
     echo "  Waiting for SeaweedFS Filer to start..."
-    api_result=$(docker exec -i swfs-mini curl -sS -m 2 -o /dev/null -w '%{http_code}' http://localhost:8888)
+    api_result=$(docker exec -i seaweed-mini curl -sS -m 2 -o /dev/null -w '%{http_code}' http://localhost:8888)
     response_code=$api_result
     if [[ -n $response_code && $response_code -ge "200" && $response_code -lt "300" ]]; then
       echo "  Creating default artifact directory on SeaweedFS Filer..."
-      docker exec -it swfs-mini curl -X POST http://localhost:8888/$DEFAULT_FILER_DIR_NAME/ && echo
+      docker exec -it seaweed-mini curl -X POST http://localhost:8888/$DEFAULT_FILER_DIR_NAME/ && echo
       upload_binaries
       break
     fi
