@@ -111,10 +111,11 @@ install_swfs () {
   done
   if [[ $ENABLE_SMB == "true" ]]; then
     echo "  Starting SeaweedFS SMB service..."
-    chmod 777 /mnt/seaweed
-    chown nobody:nogroup /mnt/seaweed
+    chmod 777 /mnt/seaweedfs
+    chown nobody:nogroup /mnt/seaweedfs
     systemctl daemon-reload
     systemctl enable --now seaweedfs-fuse
+    systemctl enable --now smbd
     systemctl restart smbd
   fi
   generate_outputs
@@ -170,7 +171,7 @@ Requires=docker.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/weed mount -dir=/mnt/seaweed -filer=localhost:18888 -filer.path=/$DEFAULT_FILER_DIR_NAME -cacheCapacityMB=512 -allowOthers
+ExecStart=/usr/local/bin/weed mount -dir=/mnt/seaweedfs -filer=localhost:18888 -filer.path=/$DEFAULT_FILER_DIR_NAME -cacheCapacityMB=512 -allowOthers
 Restart=always
 RestartSec=5
 KillMode=process
@@ -181,7 +182,7 @@ EOF
   echo "  Generating SMB config..."
   cat >> /etc/samba/smb.conf <<EOF
 [$DEFAULT_FILER_DIR_NAME]
-    path = /mnt/seaweed
+    path = /mnt/seaweedfs
     browseable = yes
     read only = no
     guest ok = yes
@@ -315,7 +316,7 @@ services:
       -dir=/data
       -webdav=false
 EOF
-  if [[ ENABLE_SMB == "true" ]]; then
+  if [[ $ENABLE_SMB == "true" ]]; then
     cat >> /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
     ports:
       - 18888:18888
@@ -668,6 +669,14 @@ EOF
 
 uninstall_swfs () {
   echo "# -- SeaweedFS Uninstaller Started - $(date) -- #" | tee -a seaweedfs-uninstall.log
+  if [[ $ENABLE_SMB == "true" ]]; then
+    echo "  Stopping and removing SeaweedFS SMB FUSE service..." | tee -a seaweedfs-uninstall.log
+    systemctl disable --now seaweedfs-fuse.service
+    systemctl disable --now smbd.service
+    sed -i '/\[$DEFAULT_FILER_DIR_NAME\]/,${s/^/#/}' /etc/samba/smb.conf
+    rm -rf /etc/systemd/system/seaweedfs-fuse.service
+    rm -rf /mnt/seaweedfs
+  fi
   echo "  Stopping and removing SeaweedFS and Caddy containers..." | tee -a seaweedfs-uninstall.log
   docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml down
   echo "  Removing SeaweedFS and Caddy data and configuration..." | tee -a seaweedfs-uninstall.log
