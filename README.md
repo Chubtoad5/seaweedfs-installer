@@ -5,7 +5,7 @@ This helper script installs SeaweedFS 'mini' in a docker environment for a secur
 # Features
 
 - Automates pre-requisites, including installing docker runtime based on detected OS release
-- SeaweedFS container using 'weed mini' installs Admin UI, Master, Volume, Filer, S3, and WebDAV (optional)
+- SeaweedFS container using 'weed mini' installs Admin UI, Master, Volume, Filer, S3, and SMB Share (optional)
 - Caddy container serves a reverse proxy, using self-signed TLS, basic authentication, and a web server landing page
 - Supports creating an offline archive for air-gapped environments, including docker binaries and container images for the detected OS release
 - Automatically detects air-gapped mode when a valid ```swfs-save.tar.gz``` is present
@@ -87,14 +87,17 @@ sudo SUDO SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" ./install-seaweedfs 
 |HOST_FQDN             |$(hostanme).edge.lab       |FQDN for the host, i.e. myhost.mydomain.com    |
 |SWFS_ADMIN_FQDN       |admin.$HOST_FQDN           |FQDN prefix for Admin UI                       |
 |SWFS_MASTER_FQDN      |master.$HOST_FQDN          |FQDN prefix for Master service                 |
-|SWFS_FILER_FQDN       |filer.$HOST_FQDN       |FQDN prefix for Filer service                  |
+|SWFS_FILER_FQDN       |filer.$HOST_FQDN           |FQDN prefix for Filer service                  |
 |SWFS_S3_FQDN          |s3.$HOST_FQDN              |FQDN prefix for S3 endpoint service            |
-|SWFS_WEBDAV_FQDN      |share.$HOST_FQDN           |FQDN prefix for WebDAV endpoint                |
 |MGMT_IP               |$(hostname -I)             |Host's IP to use when DNS not configured       |
 |SWFS_ADMIN_PORT       |443                        |TCP port for Admin UI                          |
 |SWFS_MASTER_PORT      |9333                       |TCP port for Master service                    |
 |SWFS_FILER_PORT       |8888                       |TCP port for Filer service                     |
 |SWFS_S3_PORT          |8333                       |TCP port for S3 endpoint                       |
-|SWFS_WEBDAV_PORT      |7333                       |TCP port for WebDAV endpoint                   |
-|ENABLE_WEBDAV         |true                       |Expose WebDAV, uses http and no authentication |
+|S3_BUCKET             |charlie                    |Default S3 bucket name                         |
+|S3_USER               |$SWFS_USER                 |Default S3 API user name                       |
+|S3_ACCESS_KEY         |openssl rand -hex 8        |Default S3 access key (randomly generated)     |
+|S3_SECRET_KEY         |openssl rand -hex 16       |Default S3 secret key (randomly generated)     |
+|DEFAULT_FILER_DIR_NAME|artifacts                  |Default path for filer user data               |
+|ENABLE_SMB            |true                       |Enables SMB with basic auth on default filter path|
 |ARTIFACTS_TO_DOWNLOAD |""                         |List of space separated binary URLs for filer upload. Example: "https://static/file1.txt https://static/image1.img" |

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ### Script to install and configure SeaweedFS mini with Caddy reverse proxy in a Docker environment
-### SeaweedFS provides scalable file storage via S3, WebDAV, static Filer
+### SeaweedFS provides scalable file storage via S3, static Filer, and SMB
 ### Caddy provides TLS, authentication, and reverse proxy services
 
 # -- USER DEFINED Configuration Variables -- #
@@ -17,25 +17,27 @@ SWFS_USER=${SWFS_USER:-"admin"}             # Username for SeaweedFS Admin UI, F
 SWFS_PASSWORD=${SWFS_PASSWORD:-"changeme"}  # Password for SeaweedFS Admin UI, Filer, Master
 
 # - Fully Qualified Domain Names (FQDNs)
-HOST_FQDN=${HOST_FQDN:-"$(hostname).edge.lab"}              # FQDN for SeaweedFS host
-SWFS_ADMIN_FQDN=${SWFS_ADMIN_FQDN:-"admin.$HOST_FQDN"}      # FQDN for SeaweedFS Admin UI and Caddy landing page
-SWFS_MASTER_FQDN=${SWFS_MASTER_FQDN:-"master.$HOST_FQDN"}   # FQDN for SeaweedFS Master UI/API
-SWFS_FILER_FQDN=${SWFS_FILER_FQDN:-"filer.$HOST_FQDN"}  # FQDN for SeaweedFS Filer UI/API
-SWFS_S3_FQDN=${SWFS_S3_FQDN:-"s3.$HOST_FQDN"}               # FQDN for SeaweedFS S3 API
-SWFS_WEBDAV_FQDN=${SWFS_WEBDAV_FQDN:-"share.$HOST_FQDN"}    # FQDN for SeaweedFS WebDav endpoint
-MGMT_IP=$(hostname -I | awk '{print $1}')                   # Used as default_sni fallback for TLS in non-DNS environments
+HOST_FQDN=${HOST_FQDN:-"$(hostname).edge.lab"}             # FQDN for SeaweedFS host
+SWFS_ADMIN_FQDN=${SWFS_ADMIN_FQDN:-"admin.$HOST_FQDN"}     # FQDN for SeaweedFS Admin UI and Caddy landing page
+SWFS_MASTER_FQDN=${SWFS_MASTER_FQDN:-"master.$HOST_FQDN"}  # FQDN for SeaweedFS Master UI/API
+SWFS_FILER_FQDN=${SWFS_FILER_FQDN:-"filer.$HOST_FQDN"}     # FQDN for SeaweedFS Filer UI/API
+SWFS_S3_FQDN=${SWFS_S3_FQDN:-"s3.$HOST_FQDN"}              # FQDN for SeaweedFS S3 API
+MGMT_IP=$(hostname -I | awk '{print $1}')                  # Used as default_sni fallback for TLS in non-DNS environments
 
-# - Service TCP Ports
+# - Service TCP Ports # Volume Server uses port 9340 on internal docker network
 SWFS_ADMIN_PORT=${SWFS_ADMIN_PORT:-"443"}
 SWFS_MASTER_PORT=${SWFS_MASTER_PORT:-"9333"}
 SWFS_FILER_PORT=${SWFS_FILER_PORT:-"8888"}
 SWFS_S3_PORT=${SWFS_S3_PORT:-"8333"}
-SWFS_WEBDAV_PORT=${SWFS_WEBDAV_PORT:-"7333"}
-# Volume Server uses port 9340 in docker environment and is not exposed
 
+# - File share and S3 settings
 DEFAULT_FILER_DIR_NAME=${DEFAULT_FILER_DIR_NAME:-"artifacts"}  # Default directory on SeaweedFS Filer for artifacts
-ENABLE_WEBDAV=${ENABLE_WEBDAV:-"true"}                         # Enable WebDAV Gateway over open http (no authentication)
+ENABLE_SMB=${ENABLE_SMB:-"true"}                               # Enable Samba smb share with basic authentication
 ARTIFACTS_TO_DOWNLOAD=${ARTIFACTS_TO_DOWNLOAD:-""}             # List of artifact URLS to auto download with 'curl -k' and upload to SeaweedFS filer
+S3_BUCKET=${S3_BUCKET:-"charlie"}                              # S3 bucket name
+S3_USER=${S3_USER:-"$SWFS_USER"}                               # S3 user name
+S3_ACCESS_KEY=$(openssl rand -hex 8)                           # S3 access key
+S3_SECRET_KEY=$(openssl rand -hex 16)                          # S3 secret key
 
 # -- INTERNAL VARIABLES (do not edit) -- #
 AIR_GAPPED_MODE=0
@@ -52,6 +54,7 @@ REG_PASS=""
 fqdn_pattern='^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$'
 ipv4_pattern='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
 base_dir=$(pwd)
+SMB_SERVICe="smbd"
 
 # -- Functions -- #
 
@@ -69,10 +72,33 @@ install_swfs () {
   echo "  Starting SeaweedFS and Caddy containers..."
   docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
   echo "  Waiting for SeaweedFS and Caddy to start..."
-  sleep 5 # add loop to check curl for a 200 response
-  echo "  Creating default artifact directory on SeaweedFS Filer..."
-  docker exec -it seaweed-mini curl -X POST http://localhost:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME/ && echo 
-  upload_binaries
+  local api_result=""
+  local response_code=""
+  local attempt=1
+  while true; do
+    echo "  Waiting for SeaweedFS Filer to start..."
+    api_result=$(docker exec -i seaweed-mini curl -sS -m 2 -o /dev/null -w '%{http_code}' http://localhost:8888)
+    response_code=$api_result
+    if [[ -n $response_code && $response_code -ge "200" && $response_code -lt "300" ]]; then
+      echo "  Creating default artifact directory on SeaweedFS Filer..."
+      docker exec -it seaweed-mini curl -X POST http://localhost:8888/$DEFAULT_FILER_DIR_NAME/ && echo
+      upload_binaries
+      break
+    fi
+    if [[ $attempt -ge 10 ]]; then
+      echo "Timeout waiting for SeaweedFS Filer to start.. skipping artifact directory creation"
+      break
+    fi
+    echo "  Attempt: $attempt"
+    ((attempt++))
+    sleep 5
+  done
+  echo "  Configuring S3 bucket and credentials..."
+  echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
+  echo "s3.bucket.create -name $S3_BUCKET -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
+  if [[ $ENABLE_SMB -eq "true" ]]; then
+    run_smb
+  fi
   generate_outputs
 }
 
@@ -111,6 +137,46 @@ EOF
     echo "  Logging into local registry $REG_FQDN:$REG_PORT ..."
     docker login $REG_FQDN:$REG_PORT -u "$REG_USER" -p "$REG_PASS"
   fi
+}
+
+run_smb () {
+  if [[ $ID != "ubuntu" ]]; then
+    SMB_SERVICe="smb"
+  fi
+  if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
+    download_install_packages
+    cd $base_dir/utilities
+    debug_run ./install_packages.sh online samba
+    cd $base_dir
+  else
+    cd $base_dir/utilities
+    debug_run ./install_packages.sh offline samba
+    cd $base_dir
+  fi
+  echo "  Configuring Samba..."
+  useradd -M -s /sbin/nologin $SWFS_USER
+  (echo "$SWFS_PASSWORD"; echo "$SWFS_PASSWORD") | smbpasswd -a -s $SWFS_USER
+  cp /etc/samba/smb.conf /etc/samba/smb.conf.bak
+  cat >> /etc/samba/smb.conf <<EOF
+[$DEFAULT_FILER_DIR_NAME]
+   comment = SeaweedFS FUSE Mount
+   path = /mnt/seaweed
+   browseable = yes
+   read only = no
+   guest ok = no
+   valid users = $SWFS_USER
+   create mask = 0664
+   directory mask = 0775
+   
+   vfs objects = fruit streams_xattr
+   fruit:metadata = stream
+   fruit:model = MacSamba
+   
+   force user = root
+   force group = root
+EOF
+  echo "  Restarting Samba..."
+  systemctl restart $SMB_SERVICE
 }
 
 generate_caddyfile () {
@@ -206,14 +272,6 @@ $SWFS_S3_FQDN:$SWFS_S3_PORT, https://$MGMT_IP:$SWFS_S3_PORT {
         reverse_proxy seaweed-mini:8333
 }
 EOF
-if [[ "$ENABLE_WEBDAV" == "true" ]]; then
-        cat >> /opt/caddy/Caddyfile <<EOF
-http://$SWFS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT, http://$MGMT_IP:$SWFS_WEBDAV_PORT {
-        reverse_proxy seaweed-mini:7333
-}
-EOF
-fi
-
 }
 
 generate_compose_file () {
@@ -226,15 +284,21 @@ generate_compose_file () {
   fi
   echo "  Creating seaweedfs-compose.yaml..." | tee -a seaweedfs-install.log
   cat > /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
+networks:
+  seaweed_net: {}
 services:
   seaweed-mini:
     image: $SWFS_IMAGE
     container_name: seaweed-mini
+    environment:
+      - AWS_ACCESS_KEY_ID=$SWFS_USER
+      - AWS_SECRET_ACCESS_KEY=$SWFS_PASSWORD
     command: >
       mini
       -admin.user "$SWFS_USER"
       -admin.password "$SWFS_PASSWORD"
       -dir=/data
+      -webdav=false
     volumes:
       - /opt/seaweedfs/mini:/data
     networks:
@@ -249,7 +313,6 @@ services:
       - "$SWFS_MASTER_PORT:$SWFS_MASTER_PORT"
       - "$SWFS_FILER_PORT:$SWFS_FILER_PORT"
       - "$SWFS_S3_PORT:$SWFS_S3_PORT"
-      - "$SWFS_WEBDAV_PORT:$SWFS_WEBDAV_PORT"
     volumes:
       - /opt/caddy/Caddyfile:/etc/caddy/Caddyfile
       - /opt/caddy/srv/index.html:/srv/index.html
@@ -258,10 +321,27 @@ services:
     restart: unless-stopped
     depends_on:
       - seaweed-mini
-networks:
-  seaweed_net: {}
-
 EOF
+  if [[ $ENABLE_SMB == true ]]; then
+    mkdir -p /mnt/seaweed
+    echo "user_allow_other" > /etc/fuse.conf
+    cat >> /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
+  seaweed-mount:
+    image: $SWFS_IMAGE
+    container_name: seaweed-mount
+    privileged: true
+    command:
+      mount
+      -filer=seaweed-mini:8888
+      -filer.path=/$DEFAULT_FILER_DIR_NAME
+    volumes:
+      - "/mnt/seaweed:/data:z,shared"
+      - "/etc/fuse.conf:/etc/fuse.conf:ro"
+    restart: unless-stopped
+    networks:
+      - seaweed_net
+EOF
+fi
 }
 
 
@@ -410,12 +490,12 @@ generate_index_html () {
             <li><a id="artifacts-link" class="link" target="_blank" rel="noopener noreferrer" href="#">File Browser →</a></li>
         </ul>
         <div class="doc-card">
-            <p class="note">This server uses the all-in-one 'weed mini' command to deploy the following single-node optimized SeaweedFS services: Master, Volume, & Filer server, Maintenance Worker, Admin UI, S3 Gateway, and WebDAV Gateway</p>
+            <p class="note">This server uses the all-in-one 'weed mini' command to deploy the following single-node optimized SeaweedFS services: Master, Volume, & Filer server, Maintenance Worker, Admin UI, and S3 Gateway</p>
             <p class="note">Caddy is deployed on the front end to serve this landing page, provide local TLS with auto-renewing certificates, basic authentication, and a reverse proxy to security harden the SeaweedFS services</p>
             <div class="subtitle">S3 endpoint</div>
             <pre class="code-block" id="s3-url">loading...</pre>
-            <div class="subtitle">WebDAV share - enabled: $ENABLE_WEBDAV</div>
-            <pre class="code-block" id="webdav-url">loading...</pre>
+            <div class="subtitle">SMB Share - Enabled: $ENABLE_SMB</div>
+            <pre class="code-block" id="smb-url">loading...</pre>
             <p class="note">Manage files using the browser UI (link above) or use the following API commands</p>
             <div class="subtitle">Create Directory</div>
             <pre class="code-block" id="curl-mkdir">loading...</pre>
@@ -446,7 +526,7 @@ generate_index_html () {
                 document.getElementById('master-link').href = getUrl('master', '$SWFS_MASTER_PORT');
                 document.getElementById('artifacts-link').href = artifactsBase;
                 document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
-                document.getElementById('webdav-url').textContent = getUrl('share', '$SWFS_WEBDAV_PORT', '/$DEFAULT_FILER_DIR_NAME', 'net use Z: http');
+                document.getElementById('smb-url').textContent = \`net use Z: \\\\\\\\\${currentHost}\\\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES\`;
                 document.getElementById('curl-mkdir').textContent =
 \`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
    -X POST \${artifactsBase}/\`;
@@ -475,6 +555,15 @@ download_image_pull_push () {
     chmod +x $base_dir/utilities/image_pull_push.sh
   fi
 }
+
+download_install_packages () {
+  if [[ ! -f $base_dir/utilities/install-packages.sh ]]; then
+    echo "  Downloading install_packages.sh..."
+    curl -sfL https://github.com/Chubtoad5/install-packages/raw/refs/heads/main/install_packages.sh  -o $base_dir/utilities/install_packages.sh
+    chmod +x $base_dir/utilities/install_packages.sh
+  fi
+}
+
 generate_outputs () {
   cat >> seaweedfs-install.log <<EOF
 # -- SeaweedFS Installer Finished - $(date) -- #
@@ -488,25 +577,27 @@ The following services are accessible by IP or FQDN if DNS is configured:
   Master UI:    https://$SWFS_MASTER_FQDN:$SWFS_MASTER_PORT
   Filer UI:     https://$SWFS_FILER_FQDN:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME
   S3 Endpoint:  https://$SWFS_S3_FQDN:$SWFS_S3_PORT
-  WebDAV:       http://$SWFS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT
   Admin UI:     https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
 
 To run weed commands:  docker exec -it seaweed-mini weed <command>
 To run caddy commands: docker exec -it seaweed-caddy caddy <command>
 To download the Root CA (if required): docker exec -it seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
-To mount WebDAV share from Windows: net use Z: http://$SWFS_WEBDAV_FQDN:$SWFS_WEBDAV_PORT/$DEFAULT_FILER_DIR_NAME
+To mount SMB share from Windows: net use Z: '\\\\$HOST_FQDN\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES'
 
 Master UI, Filer UI, and Admin UI require authentication:
   Username: $SWFS_USER
   Password: $SWFS_PASSWORD
+S3 Details:
+  API User: $S3_USER
+  API Key:  $S3_ACCESS_KEY
+  API Secret: $S3_SECRET_KEY
+  Default Bucket: $S3_BUCKET
 
   >>> Landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT <<<
   >>>               https://$MGMT_IP:$SWFS_ADMIN_PORT <<<
-
-
 EOF
   echo
-  cat seaweedfs-install.log | tail -24
+  cat seaweedfs-install.log | tail -28
   echo
 }
 
@@ -570,12 +661,14 @@ os_check () {
 run_save () {
   echo "  Preparing SeaweedFS offline archive..."
   debug_run download_image_pull_push
+  debug_run download_install_packages
   cat >$base_dir/utilities/images.txt <<EOF
 $SWFS_IMAGE
 $CADDY_IMAGE
 EOF
   cd $base_dir/utilities
   debug_run ./image_pull_push.sh -f $base_dir/utilities/images.txt save
+  ./install_packages.sh save samba
   cd $base_dir
   debug_run download_binaries
   tar czf $base_dir/swfs-save.tar.gz utilities install-seaweedfs
@@ -583,13 +676,21 @@ EOF
 }
 
 uninstall_swfs () {
-  echo "# -- SeaweedFS Uninstaller Started - $(date) -- #" | tee -a seaweedfs-uninstall.log
   echo "  Stopping and removing SeaweedFS and Caddy containers..." | tee -a seaweedfs-uninstall.log
   docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml down
   echo "  Removing SeaweedFS and Caddy data and configuration..." | tee -a seaweedfs-uninstall.log
   rm -rf /opt/seaweedfs
   rm -rf /opt/caddy
-  echo "# -- SeaweedFS Uninstaller Finished - $(date) -- #" | tee -a seaweedfs-uninstall.log
+  if [[ $ENABLE_SMB == "true" ]]; then
+    echo "  Reverting to default Samba configuration..." | tee -a seaweedfs-uninstall.log
+    rm -f /etc/samba/smb.conf
+    mv /etc/samba/smb.conf.bak /etc/samba/smb.conf
+    echo "  Removing Samba user..." | tee -a seaweedfs-uninstall.log
+    smbpasswd -x $SWFS_USER
+    userdel $SWFS_USER
+    systemctl restart $SMB_SERVICe
+  fi
+  echo "# -- Uninstall tasks complete -- #" | tee -a seaweedfs-uninstall.log
 }
 
 display_args() {
