@@ -608,7 +608,7 @@ The following services are accessible by IP or FQDN if DNS is configured:
 To run weed commands:  docker exec -it seaweed-mini weed <command>
 To run caddy commands: docker exec -it seaweed-caddy caddy <command>
 To download the Root CA (if required): docker exec -it seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
-To mount SMB share from Windows: net use Z: '\\\\$HOST_FQDN\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES'
+To mount SMB share from Windows: 'net use Z: \\\\$HOST_FQDN\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES'
 
 Master UI, Filer UI, and Admin UI require authentication:
   Username: $SWFS_USER
