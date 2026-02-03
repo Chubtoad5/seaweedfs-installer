@@ -339,6 +339,7 @@ EOF
       -master=false
       -master.peers=seaweed-mini:9333
       -volume=false
+      -filer=false
     ports:
       - "$MQ_BROKER_PORT:$MQ_BROKER_PORT"
       - "$MQ_AGENT_PORT:$MQ_AGENT_PORT"
@@ -714,7 +715,7 @@ uninstall_swfs () {
     echo "  Removing Samba user..." | tee -a seaweedfs-uninstall.log
     smbpasswd -x $SWFS_USER
     userdel $SWFS_USER
-    systemctl restart $SMB_SERVICe
+    systemctl restart $SMB_SERVICE
   fi
   echo "# -- Uninstall tasks complete -- #" | tee -a seaweedfs-uninstall.log
 }
