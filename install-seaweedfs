@@ -30,7 +30,6 @@ SWFS_MASTER_PORT=${SWFS_MASTER_PORT:-"9333"}
 SWFS_FILER_PORT=${SWFS_FILER_PORT:-"8888"}
 SWFS_S3_PORT=${SWFS_S3_PORT:-"8333"}
 MQ_BROKER_PORT=${MQ_BROKER_PORT:-"17777"}
-MQ_AGENT_PORT=${MQ_AGENT_PORT:-"16777"}
 
 # - File share, S3 and Message Broker settings
 DEFAULT_FILER_DIR_NAME=${DEFAULT_FILER_DIR_NAME:-"artifacts"}  # Default directory on SeaweedFS Filer for artifacts
@@ -331,18 +330,11 @@ EOF
     image: chrislusf/seaweedfs:latest
     container_name: seaweed-mq
     command: >
-      server
-      -mq.agent
-      -mq.agent.port=$MQ_AGENT_PORT
-      -mq.broker
-      -mq.broker.port=$MQ_BROKER_PORT
-      -master=false
-      -master.peers=seaweed-mini:9333
-      -volume=false
-      -filer=false
+    mq.broker
+    -port=$MQ_BROKER_PORT
+    -master=seaweed-mini:9333
     ports:
       - "$MQ_BROKER_PORT:$MQ_BROKER_PORT"
-      - "$MQ_AGENT_PORT:$MQ_AGENT_PORT"
     networks:
       - seaweed_net
 EOF
