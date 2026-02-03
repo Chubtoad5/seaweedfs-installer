@@ -101,3 +101,43 @@ sudo SUDO SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" ./install-seaweedfs 
 |DEFAULT_FILER_DIR_NAME|artifacts                  |Default path for filer user data               |
 |ENABLE_SMB            |true                       |Enables SMB with basic auth on default filter path|
 |ARTIFACTS_TO_DOWNLOAD |""                         |List of space separated binary URLs for filer upload. Example: "https://static/file1.txt https://static/image1.img" |
+
+## Known Issues
+
+In rare occurances, the `seaweed-mount` container may fail to start with the following error:  
+`Error response from daemon: invalid mount config for type "bind": stat /mnt/seaweed: transport endpoint is not connected`  
+This error may occur when the host fuse process becomes hung due to unexpected confliect (i.e. docker or system crash, OOM, etc.)  
+Follow these steps to resolve the issue.  
+
+1. Verify mount point is hung
+```
+ls -al /mnt/seaweed
+ls -al /mnt/
+```
+Typicaly you see message like `ls: cannot access '/mnt/seaweed': Transport endpoint is not connected` or strange directory listing `d?????????  ? ?    ?       ?            ? seaweed`  
+
+2. Identify the hung mount point and process (if any)
+
+```
+mount | grep /mnt/seaweed || true
+findmnt -T /mnt/seaweed -o TARGET,SOURCE,FSTYPE,OPTIONS || true
+ps aux | egrep 'weed.*mount|seaweed|fuse' | grep -v egrep
+lsof +D /mnt/seaweed 2>/dev/null | head
+```
+
+3. Unmount the hung device
+```
+sudo umount -l /mnt/seaweed
+```
+
+4. Verify directory listing comes back normal
+```
+ ls -al /mnt/seaweed
+ ls -al /mnt/
+ ```
+
+ 5. Start docker compose again
+
+ ```
+sudo docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
+ ```
