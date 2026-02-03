@@ -73,7 +73,7 @@ When specified, will attempt to obtain the registry TLS certificate and login vi
 Edit the ```install-seaweedfs``` file and view the ```USER DEFINED VARIABLES``` section to modify the default behavior of the script.  
 All user defined variables support being passed through from frontend shell, for example:  
 ```
-sudo SUDO SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" ./install-seaweedfs install
+sudo SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" ./install-seaweedfs install
 ```
 
 ## User Defined Variables
@@ -105,18 +105,20 @@ sudo SUDO SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" ./install-seaweedfs 
 ## Known Issues
 
 In rare occurances, the `seaweed-mount` container may fail to start with the following error:  
-`Error response from daemon: invalid mount config for type "bind": stat /mnt/seaweed: transport endpoint is not connected`  
-This error may occur when the host fuse process becomes hung due to unexpected confliect (i.e. docker or system crash, OOM, etc.)  
-Follow these steps to resolve the issue.  
+```
+Error response from daemon: invalid mount config for type "bind": stat /mnt/seaweed: transport endpoint is not connected
+```  
+This error may occur when the host fuse process becomes hung due to unexpected conflict (i.e. docker or system crash, OOM, etc.). Follow these steps to resolve the issue.  
 
-1. Verify mount point is hung
+1. Verify mount point is hung:
 ```
 ls -al /mnt/seaweed
 ls -al /mnt/
 ```
-Typicaly you see message like `ls: cannot access '/mnt/seaweed': Transport endpoint is not connected` or strange directory listing `d?????????  ? ?    ?       ?            ? seaweed`  
+Typicaly you see message like `ls: cannot access '/mnt/seaweed': Transport endpoint is not connected`  
+Or a strange directory listing `d?????????  ? ?    ?       ?            ? seaweed`  
 
-2. Identify the hung mount point and process (if any)
+2. Identify the hung mount point and process (if any):
 
 ```
 mount | grep /mnt/seaweed || true
@@ -125,18 +127,18 @@ ps aux | egrep 'weed.*mount|seaweed|fuse' | grep -v egrep
 lsof +D /mnt/seaweed 2>/dev/null | head
 ```
 
-3. Unmount the hung device
+3. Unmount the hung device:
 ```
 sudo umount -l /mnt/seaweed
 ```
 
-4. Verify directory listing comes back normal
+4. Verify directory listing comes back normal:
 ```
  ls -al /mnt/seaweed
  ls -al /mnt/
  ```
 
- 5. Start docker compose again
+ 5. Start docker compose again:
 
  ```
 sudo docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
