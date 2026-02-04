@@ -193,17 +193,16 @@ run_nfs () {
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_install_packages
     cd $base_dir/utilities
-    debug_run ./install_packages.sh online nfs
+    debug_run ./install_packages.sh online nfs-kernel-server
     cd $base_dir
   else
     cd $base_dir/utilities
-    debug_run ./install_packages.sh offline nfs
+    debug_run ./install_packages.sh offline nfs-kernel-server
     cd $base_dir
   fi
   echo "  Configuring NFS export..."
-  cp /etc/exports /etc/exports.bak 2>/dev/null || touch /etc/exports.bak
   cat >> /etc/exports <<EOF
-/mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure)
+/mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure) # seaweedfs-installer
 EOF
   echo "  Exporting NFS filesystem..."
   exportfs -ra
@@ -361,9 +360,9 @@ EOF
     image: chrislusf/seaweedfs:latest
     container_name: seaweed-mq
     command: >
-    mq.broker
-    -port=$MQ_BROKER_PORT
-    -master=seaweed-mini:9333
+      mq.broker
+      -port=$MQ_BROKER_PORT
+      -master=seaweed-mini:9333
     ports:
       - "$MQ_BROKER_PORT:$MQ_BROKER_PORT"
     networks:
@@ -723,7 +722,7 @@ EOF
   cd $base_dir/utilities
   debug_run ./image_pull_push.sh -f $base_dir/utilities/images.txt save
   ./install_packages.sh save samba
-  ./install_packages.sh save nfs
+  ./install_packages.sh save nfs-kernel-server
   cd $base_dir
   debug_run download_binaries
   tar czf $base_dir/swfs-save.tar.gz utilities install-seaweedfs
@@ -749,9 +748,8 @@ uninstall_swfs () {
     if [[ $ID == "ubuntu" || $ID == "debian" ]]; then
       NFS_SERVICE="nfs-kernel-server"
     fi
-    echo "  Reverting to default NFS configuration..." | tee -a seaweedfs-uninstall.log
-    rm -f /etc/exports
-    mv /etc/exports.bak /etc/exports 2>/dev/null || touch /etc/exports
+    echo "  Removing SeaweedFS NFS export..." | tee -a seaweedfs-uninstall.log
+    sed -i '/ # seaweedfs-installer$/d' /etc/exports
     exportfs -ra
     systemctl restart $NFS_SERVICE
   fi
