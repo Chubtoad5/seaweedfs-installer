@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ### Script to install and configure SeaweedFS mini with Caddy reverse proxy in a Docker environment
-### SeaweedFS provides scalable file storage via S3, static Filer, and SMB
+### SeaweedFS provides scalable file storage via S3, static Filer, SMB, and NFS
 ### Caddy provides TLS, authentication, and reverse proxy services
 
 # -- USER DEFINED Configuration Variables -- #
@@ -34,6 +34,7 @@ MQ_BROKER_PORT=${MQ_BROKER_PORT:-"17777"}
 # - File share, S3 and Message Broker settings
 DEFAULT_FILER_DIR_NAME=${DEFAULT_FILER_DIR_NAME:-"artifacts"}  # Default directory on SeaweedFS Filer for artifacts
 ENABLE_SMB=${ENABLE_SMB:-"true"}                               # Enable Samba smb share with basic authentication
+ENABLE_NFS=${ENABLE_NFS:-"false"}                              # Enable NFS export with NFSv3, no authentication
 ARTIFACTS_TO_DOWNLOAD=${ARTIFACTS_TO_DOWNLOAD:-""}             # List of artifact URLS to auto download with 'curl -k' and upload to SeaweedFS filer
 S3_BUCKET=${S3_BUCKET:-"charlie"}                              # S3 bucket name
 S3_USER=${S3_USER:-"$SWFS_USER"}                               # S3 user name
@@ -57,6 +58,7 @@ fqdn_pattern='^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$'
 ipv4_pattern='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
 base_dir=$(pwd)
 SMB_SERVICE="smbd"
+NFS_SERVICE="nfs-server"
 
 # -- Functions -- #
 
@@ -100,6 +102,9 @@ install_swfs () {
   echo "s3.bucket.create -name $S3_BUCKET -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
   if [[ $ENABLE_SMB -eq "true" ]]; then
     run_smb
+  fi
+  if [[ $ENABLE_NFS -eq "true" ]]; then
+    run_nfs
   fi
   generate_outputs
 }
@@ -179,6 +184,32 @@ run_smb () {
 EOF
   echo "  Restarting Samba..."
   systemctl restart $SMB_SERVICE
+}
+
+run_nfs () {
+  if [[ $ID == "ubuntu" || $ID == "debian" ]]; then
+    NFS_SERVICE="nfs-kernel-server"
+  fi
+  if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
+    download_install_packages
+    cd $base_dir/utilities
+    debug_run ./install_packages.sh online nfs
+    cd $base_dir
+  else
+    cd $base_dir/utilities
+    debug_run ./install_packages.sh offline nfs
+    cd $base_dir
+  fi
+  echo "  Configuring NFS export..."
+  cp /etc/exports /etc/exports.bak 2>/dev/null || touch /etc/exports.bak
+  cat >> /etc/exports <<EOF
+/mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure)
+EOF
+  echo "  Exporting NFS filesystem..."
+  exportfs -ra
+  echo "  Restarting NFS service..."
+  systemctl enable $NFS_SERVICE
+  systemctl restart $NFS_SERVICE
 }
 
 generate_caddyfile () {
@@ -339,7 +370,7 @@ EOF
       - seaweed_net
 EOF
   fi
-  if [[ $ENABLE_SMB == true ]]; then
+  if [[ $ENABLE_SMB == true || $ENABLE_NFS == true ]]; then
     mkdir -p /mnt/seaweed
     echo "user_allow_other" > /etc/fuse.conf
     cat >> /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
@@ -513,6 +544,8 @@ generate_index_html () {
             <pre class="code-block" id="s3-url">loading...</pre>
             <div class="subtitle">SMB Share - Enabled: $ENABLE_SMB</div>
             <pre class="code-block" id="smb-url">loading...</pre>
+            <div class="subtitle">NFS Share - Enabled: $ENABLE_NFS</div>
+            <pre class="code-block" id="nfs-url">loading...</pre>
             <p class="note">Manage files using the browser UI (link above) or use the following API commands</p>
             <div class="subtitle">Create Directory</div>
             <pre class="code-block" id="curl-mkdir">loading...</pre>
@@ -544,6 +577,7 @@ generate_index_html () {
                 document.getElementById('artifacts-link').href = artifactsBase;
                 document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
                 document.getElementById('smb-url').textContent = \`net use Z: \\\\\\\\\${currentHost}\\\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES\`;
+                document.getElementById('nfs-url').textContent = \`sudo mount -t nfs -o vers=3 \${currentHost}:/mnt/seaweed /mnt/seaweed\`;
                 document.getElementById('curl-mkdir').textContent =
 \`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
    -X POST \${artifactsBase}/\`;
@@ -602,6 +636,7 @@ To run weed commands:  docker exec -it seaweed-mini weed <command>
 To run caddy commands: docker exec -it seaweed-caddy caddy <command>
 To download the Root CA (if required): docker exec -it seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
 To mount SMB share from Windows: 'net use Z: \\\\$HOST_FQDN\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES'
+To mount NFS share: 'sudo mount -t nfs -o vers=3 $HOST_FQDN:/mnt/seaweed /mnt/nfs'
 
 Master UI, Filer UI, and Admin UI require authentication:
   Username: $SWFS_USER
@@ -688,6 +723,7 @@ EOF
   cd $base_dir/utilities
   debug_run ./image_pull_push.sh -f $base_dir/utilities/images.txt save
   ./install_packages.sh save samba
+  ./install_packages.sh save nfs
   cd $base_dir
   debug_run download_binaries
   tar czf $base_dir/swfs-save.tar.gz utilities install-seaweedfs
@@ -708,6 +744,16 @@ uninstall_swfs () {
     smbpasswd -x $SWFS_USER
     userdel $SWFS_USER
     systemctl restart $SMB_SERVICE
+  fi
+  if [[ $ENABLE_NFS == "true" ]]; then
+    if [[ $ID == "ubuntu" || $ID == "debian" ]]; then
+      NFS_SERVICE="nfs-kernel-server"
+    fi
+    echo "  Reverting to default NFS configuration..." | tee -a seaweedfs-uninstall.log
+    rm -f /etc/exports
+    mv /etc/exports.bak /etc/exports 2>/dev/null || touch /etc/exports
+    exportfs -ra
+    systemctl restart $NFS_SERVICE
   fi
   echo "# -- Uninstall tasks complete -- #" | tee -a seaweedfs-uninstall.log
 }
