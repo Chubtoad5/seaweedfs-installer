@@ -34,7 +34,7 @@ MQ_BROKER_PORT=${MQ_BROKER_PORT:-"17777"}
 # - File share, S3 and Message Broker settings
 DEFAULT_FILER_DIR_NAME=${DEFAULT_FILER_DIR_NAME:-"artifacts"}  # Default directory on SeaweedFS Filer for artifacts
 ENABLE_SMB=${ENABLE_SMB:-"true"}                               # Enable Samba smb share with basic authentication
-ENABLE_NFS=${ENABLE_NFS:-"false"}                              # Enable NFS export with NFSv3, no authentication
+ENABLE_NFS=${ENABLE_NFS:-"true"}                              # Enable NFS export with NFSv3, no authentication
 ARTIFACTS_TO_DOWNLOAD=${ARTIFACTS_TO_DOWNLOAD:-""}             # List of artifact URLS to auto download with 'curl -k' and upload to SeaweedFS filer
 S3_BUCKET=${S3_BUCKET:-"charlie"}                              # S3 bucket name
 S3_USER=${S3_USER:-"$SWFS_USER"}                               # S3 user name
