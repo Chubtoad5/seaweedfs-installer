@@ -5,7 +5,7 @@ This helper script installs SeaweedFS 'mini' in a docker environment for a secur
 # Features
 
 - Automates pre-requisites, including installing docker runtime based on detected OS release
-- SeaweedFS container using 'weed mini' installs Admin UI, Master, Volume, Filer, S3, and SMB Share (optional)
+- SeaweedFS container using 'weed mini' installs Admin UI, Master, Volume, Filer, S3, and SMB and/or NFS Share (optional)
 - Caddy container serves a reverse proxy, using self-signed TLS, basic authentication, and a web server landing page
 - Supports creating an offline archive for air-gapped environments, including docker binaries and container images for the detected OS release
 - Automatically detects air-gapped mode when a valid ```swfs-save.tar.gz``` is present
@@ -100,6 +100,7 @@ sudo SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" ./install-seaweedfs insta
 |S3_SECRET_KEY         |openssl rand -hex 16       |Default S3 secret key (randomly generated)     |
 |DEFAULT_FILER_DIR_NAME|artifacts                  |Default path for filer user data               |
 |ENABLE_SMB            |true                       |Enables SMB with basic auth on default filter path|
+|ENABLE_NFS            |true                       |Enables SMB with no auth|
 |ARTIFACTS_TO_DOWNLOAD |""                         |List of space separated binary URLs for filer upload. Example: "https://static/file1.txt https://static/image1.img" |
 
 ## Known Issues
