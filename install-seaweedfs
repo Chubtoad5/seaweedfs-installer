@@ -151,11 +151,11 @@ EOF
       fi
       $base_dir/utilities/image_pull_push.sh -f $base_dir/utilities/images.txt push $REGISTRY_INFO $REG_USER $REG_PASS
     else
-      $base_dir/utilities/image_pull_push.sh docker
       # Still grab registry cert if needed
       if [[ $REGISTRY_MODE -eq 1 ]]; then
         $base_dir/utilities/image_pull_push.sh reg-cert $REGISTRY_INFO
       fi
+      $base_dir/utilities/image_pull_push.sh docker
     fi
   else
     # AIR_GAPPED_MODE is set
