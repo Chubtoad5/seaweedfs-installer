@@ -797,7 +797,7 @@ compactor:
   compaction_interval: 10m
   retention_enabled: true
   retention_delete_delay: 2h
-  delete_request_store: object_store
+  delete_request_store: s3
 
 limits_config:
   retention_period: 30d
