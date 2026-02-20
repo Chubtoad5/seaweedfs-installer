@@ -52,7 +52,7 @@ GRAFANA_PORT=${GRAFANA_PORT:-"3000"}                             # Grafana exter
 LOKI_PORT=${LOKI_PORT:-"3100"}                                   # Loki push/query port (direct, no TLS)
 PROMETHEUS_EXT_PORT=${PROMETHEUS_EXT_PORT:-"9090"}               # External Prometheus remote-write receiver port
 LOKI_BUCKET=${LOKI_BUCKET:-"loki-logs"}                          # S3 bucket for Loki log storage
-CLUSTER_NAME=${CLUSTER_NAME:-"rke2-prod"}                        # Cluster label applied to all metrics and logs
+CLUSTER_NAME=${CLUSTER_NAME:-"edge-lab"}                        # Cluster label applied to all metrics and logs
 
 # -- INTERNAL VARIABLES (do not edit) -- #
 AIR_GAPPED_MODE=0
@@ -785,7 +785,7 @@ storage_config:
     active_index_directory: /loki/index
     cache_location: /loki/index_cache
   aws:
-    endpoint: http://${MGMT_IP}:8333
+    endpoint: http://seaweed-mini:8333
     bucketnames: ${LOKI_BUCKET}
     access_key_id: ${S3_ACCESS_KEY}
     secret_access_key: ${S3_SECRET_KEY}
@@ -797,7 +797,7 @@ compactor:
   compaction_interval: 10m
   retention_enabled: true
   retention_delete_delay: 2h
-  delete_request_store: s3
+  delete_request_store: object_store
 
 limits_config:
   retention_period: 30d
@@ -879,11 +879,6 @@ networks:
     external: true
     name: seaweed_net
 
-volumes:
-  loki_data:
-  prometheus_data:
-  grafana_data:
-
 services:
   loki:
     image: ${loki_image}
@@ -893,7 +888,7 @@ services:
       - "${LOKI_PORT}:3100"
     volumes:
       - /opt/monitoring/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
-      - loki_data:/loki
+      - /opt/monitoring/loki/data:/loki
     command: -config.file=/etc/loki/local-config.yaml
     networks:
       - seaweed_net
@@ -911,7 +906,7 @@ services:
       - "${PROMETHEUS_EXT_PORT}:9090"
     volumes:
       - /opt/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
+      - /opt/monitoring/prometheus/data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -935,7 +930,7 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=${SWFS_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
-      - grafana_data:/var/lib/grafana
+      - /opt/monitoring/grafana/data:/var/lib/grafana
       - /opt/monitoring/grafana/provisioning/datasources/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
     networks:
       - seaweed_net
@@ -965,7 +960,8 @@ EOF
 }
 
 setup_monitoring () {
-  mkdir -p /opt/monitoring/{loki,prometheus,grafana/provisioning/datasources}
+  mkdir -p /opt/monitoring/{loki/data,prometheus/data,grafana/data,grafana/provisioning/datasources}
+  chmod 777 /opt/monitoring/{loki/data,prometheus/data,grafana/data}
   generate_loki_config
   generate_prometheus_ext_config
   generate_grafana_datasources
