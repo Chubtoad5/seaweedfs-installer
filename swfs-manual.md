@@ -742,25 +742,134 @@ sudo chmod 600 /opt/seaweedfs/monitoring-credentials.env
 
 ## Offline Preparation
 
-Run these steps on an **internet-connected** machine to build an archive, then transfer it to the air-gapped target.
+This section covers building an offline package archive on an internet-connected machine and deploying it to an air-gapped target. OS packages (Docker, Samba, NFS) are handled with the native package manager. Container images are handled separately with the Docker CLI.
 
-### Pull and Save Docker Images
+> **Important:** The machine used to download packages must be running the **same OS and version** as the air-gapped target. Package archives are OS-specific and are not portable across distros or major versions.
+
+---
+
+### Step 1: Add Docker's Official Repository (internet-connected machine)
+
+Docker packages are not included in default OS repositories. Follow Docker's official installation guide for your OS to add the GPG key and repository before downloading packages:
+
+- **Ubuntu:** [docs.docker.com/engine/install/ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+- **RHEL:** [docs.docker.com/engine/install/rhel](https://docs.docker.com/engine/install/rhel/)
+- **SLES:** [docs.docker.com/engine/install/sles](https://docs.docker.com/engine/install/sles/)
+
+Stop after adding the repository — do not install Docker yet. The next step downloads the packages for transfer.
+
+---
+
+### Step 2: Download and Archive OS Packages (internet-connected machine)
+
+The goal is to recursively resolve all dependencies, download the package files, build a local repository index that the package manager can use offline, and bundle everything into a single transferable archive.
+
+Include all packages you will need — Docker and any optional packages (Samba, NFS) — in a single download so they are all bundled into one archive.
+
+**Ubuntu 22.04 / 24.04:**
 
 ```bash
-# Core images
+# Install dpkg-dev for building the local apt index
+sudo apt-get install -y dpkg-dev
+
+# Create working directory
+mkdir -p ~/offline-packages && cd ~/offline-packages
+
+# Resolve all packages and their full dependency trees recursively
+PKGS=$(apt-cache depends --recurse \
+  --no-recommends --no-suggests --no-conflicts \
+  --no-breaks --no-replaces --no-enhances --no-pre-depends \
+  docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+  samba nfs-kernel-server \
+  | grep "^\w")
+
+# Download all resolved packages into the current directory
+sudo apt-get download $PKGS
+
+# Build a local apt index from the downloaded .deb files
+dpkg-scanpackages -m . > Packages
+
+# Archive and clean up
+cd ~
+tar czf offline-packages.tar.gz offline-packages/
+rm -rf offline-packages/
+```
+
+**RHEL 9.x:**
+
+```bash
+# Install prerequisites for downloading and building an RPM repo index
+sudo dnf install -y dnf-utils createrepo_c
+
+# Create working directory
+mkdir -p ~/offline-packages
+
+# Download all packages with full dependency resolution
+sudo dnf download --resolve \
+  --downloaddir=~/offline-packages \
+  docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+  samba nfs-utils
+
+# Build RPM repository metadata
+createrepo_c ~/offline-packages
+
+# Archive and clean up
+cd ~
+tar czf offline-packages.tar.gz offline-packages/
+rm -rf offline-packages/
+```
+
+**SLES 15 / 16:**
+
+```bash
+# Install prerequisite for building an RPM repo index
+sudo zypper install -y createrepo_c
+
+# Create working directory
+mkdir -p ~/offline-packages
+
+# Clear the zypp package cache to ensure a clean download
+sudo rm -rf /var/cache/zypp/packages/*
+sudo zypper refresh
+
+# Download packages into the zypp cache without installing
+sudo zypper install --download-only \
+  docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+  samba nfs-kernel-server
+
+# Copy downloaded RPMs from the zypp cache into the working directory
+find /var/cache/zypp/packages/ -name "*.rpm" \
+  -exec sudo cp {} ~/offline-packages/ \;
+
+# Build RPM repository metadata
+sudo createrepo_c ~/offline-packages
+
+# Archive and clean up
+cd ~
+tar czf offline-packages.tar.gz offline-packages/
+rm -rf offline-packages/
+```
+
+---
+
+### Step 3: Save Docker Container Images (internet-connected machine)
+
+Container images are saved separately from OS packages using the Docker CLI.
+
+```bash
+# Pull core images
 docker pull chrislusf/seaweedfs:latest
 docker pull caddy:latest
 
-# Monitoring images (skip if not deploying monitoring)
+# Save core images only
+docker save chrislusf/seaweedfs:latest caddy:latest \
+  | gzip > seaweedfs-images.tar.gz
+
+# --- OR --- pull and save core + monitoring images
 docker pull grafana/loki:3.4.2
 docker pull grafana/grafana-oss:11.5.2
 docker pull prom/prometheus:v3.2.1
 
-# Save core images
-docker save chrislusf/seaweedfs:latest caddy:latest \
-  | gzip > seaweedfs-images.tar.gz
-
-# Save core + monitoring images
 docker save \
   chrislusf/seaweedfs:latest \
   caddy:latest \
@@ -770,67 +879,179 @@ docker save \
   | gzip > seaweedfs-images-full.tar.gz
 ```
 
-### Save OS Packages
+---
 
-> Run this on a machine with the same OS version as the target.
+### Step 4: Transfer Files to the Air-Gapped Host
+
+Copy the following files to the target machine (USB drive, SCP via jump host, etc.):
+
+| File | Purpose |
+|:-----|:--------|
+| `offline-packages.tar.gz` | OS packages — Docker, Samba, NFS (all distros, all in one archive) |
+| `seaweedfs-images.tar.gz` | Container images |
+
+---
+
+### Step 5: Extract the Package Archive (air-gapped host)
+
+```bash
+mkdir -p ~/offline-packages
+tar xzf offline-packages.tar.gz -C ~/
+PKG_DIR="$(realpath ~/offline-packages)"
+```
+
+---
+
+### Step 6: Configure a Local Package Repository (air-gapped host)
+
+Create a temporary local repository pointing to the extracted packages so the package manager can resolve and install from them.
+
+**Ubuntu 22.04 / 24.04:**
+
+```bash
+# Back up existing apt sources
+sudo find /etc/apt/sources.list.d/ -name "*.list" \
+  -exec mv {} {}.bak \; 2>/dev/null || true
+[ -f /etc/apt/sources.list ] && \
+  sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak
+
+# Add the local repository
+echo "deb [trusted=yes] file://${PKG_DIR} ./" \
+  | sudo tee /etc/apt/sources.list.d/offline-packages.list
+
+sudo apt-get update
+```
+
+**RHEL 9.x:**
+
+```bash
+# Create a local yum repo pointing to the extracted packages
+sudo tee /etc/yum.repos.d/offline-packages.repo > /dev/null <<EOF
+[offline-packages-repo]
+name=Offline Packages Repository
+baseurl=file://${PKG_DIR}
+enabled=1
+gpgcheck=0
+EOF
+
+sudo dnf clean all
+```
+
+**SLES 15 / 16:**
+
+```bash
+# Export and remove all existing repos temporarily
+sudo zypper repos --export /tmp/repos.bak
+sudo zypper removerepo --all
+
+# Add the local repository
+sudo zypper addrepo "file://${PKG_DIR}" "offline-packages-repo"
+sudo zypper refresh
+```
+
+---
+
+### Step 7: Install Docker (air-gapped host)
 
 **Ubuntu 22.04 / 24.04:**
 ```bash
-sudo apt-get install --download-only samba nfs-kernel-server
-tar czf packages-ubuntu.tar.gz -C /var/cache/apt/archives/ .
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 ```
 
 **RHEL 9.x:**
 ```bash
-sudo dnf download --resolve --destdir=/tmp/pkg samba nfs-utils
-tar czf packages-rhel.tar.gz -C /tmp/pkg .
+sudo dnf --disablerepo="*" --enablerepo="offline-packages-repo" install -y \
+  docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 ```
 
 **SLES 15 / 16:**
 ```bash
-sudo zypper install --download-only samba nfs-kernel-server
-sudo tar czf packages-sles.tar.gz -C /var/cache/zypp/packages/ .
+sudo zypper --no-refresh install -y \
+  docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 ```
 
-### Transfer Files to the Air-Gapped Host
+Enable and start Docker:
+```bash
+sudo systemctl enable --now docker
+docker version && docker compose version
+```
 
-Copy the following to the target machine (USB, SCP to a jump host, etc.):
-- `seaweedfs-images.tar.gz` (or `seaweedfs-images-full.tar.gz`)
-- `packages-<os>.tar.gz`
+---
 
-### Load Docker Images on the Target
+### Step 8: Install Optional OS Packages (air-gapped host)
+
+If Samba or NFS were included in the package archive, install them now from the same local repository while it is still configured. Skip any packages you do not need.
+
+**Ubuntu 22.04 / 24.04:**
+```bash
+# Samba (SMB)
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y samba
+
+# NFS
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server
+```
+
+**RHEL 9.x:**
+```bash
+# Samba (SMB)
+sudo dnf --disablerepo="*" --enablerepo="offline-packages-repo" install -y samba
+
+# NFS
+sudo dnf --disablerepo="*" --enablerepo="offline-packages-repo" install -y nfs-utils
+```
+
+**SLES 15 / 16:**
+```bash
+# Samba (SMB)
+sudo zypper --no-refresh install -y samba
+
+# NFS
+sudo zypper --no-refresh install -y nfs-kernel-server
+```
+
+---
+
+### Step 9: Remove the Local Repository and Restore Original Sources (air-gapped host)
+
+**Ubuntu 22.04 / 24.04:**
+```bash
+sudo rm -f /etc/apt/sources.list.d/offline-packages.list
+sudo find /etc/apt/sources.list.d/ -name "*.bak" \
+  -exec bash -c 'mv "$1" "${1%.bak}"' _ {} \;
+[ -f /etc/apt/sources.list.bak ] && \
+  sudo mv /etc/apt/sources.list.bak /etc/apt/sources.list
+sudo apt-get update
+```
+
+**RHEL 9.x:**
+```bash
+sudo rm -f /etc/yum.repos.d/offline-packages.repo
+```
+
+**SLES 15 / 16:**
+```bash
+sudo zypper removerepo offline-packages-repo
+sudo zypper repos --import /tmp/repos.bak
+sudo rm -f /tmp/repos.bak
+```
+
+---
+
+### Step 10: Load Container Images (air-gapped host)
 
 ```bash
 docker load < seaweedfs-images.tar.gz
 ```
 
-Verify images are loaded:
-
+Verify images are present:
 ```bash
 docker images | grep -E 'seaweedfs|caddy|loki|grafana|prometheus'
 ```
 
-### Install OS Packages on the Target
+---
 
-**Ubuntu 22.04 / 24.04:**
-```bash
-mkdir -p /tmp/pkg && tar xzf packages-ubuntu.tar.gz -C /tmp/pkg/
-sudo dpkg -i /tmp/pkg/*.deb
-```
-
-**RHEL 9.x:**
-```bash
-mkdir -p /tmp/pkg && tar xzf packages-rhel.tar.gz -C /tmp/pkg/
-sudo dnf install /tmp/pkg/*.rpm
-```
-
-**SLES 15 / 16:**
-```bash
-mkdir -p /tmp/pkg && tar xzf packages-sles.tar.gz -C /tmp/pkg/
-sudo rpm -ivh /tmp/pkg/*.rpm
-```
-
-After loading images and packages, follow the core installation steps from [Section 1](#1-define-your-variables) onward. The `docker pull` steps will be skipped since images are already present locally.
+With Docker installed, images loaded, and optional packages present, follow the core installation guide from [Section 1](#1-define-your-variables) onward — no internet access is required.
 
 ---
 ---
