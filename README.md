@@ -99,7 +99,14 @@ Stops and removes all containers, then deletes all configuration and data direct
 
 #### `push` option
 
-When combined with `install` and `-registry`, images are pulled from the internet (or the local archive in air-gapped mode) and pushed to the specified local registry before the install proceeds. The registry must have the `/chrislufs` and `/library` projects pre-created.
+When combined with `install` and `-registry`, images are pulled from the internet (or the local archive in air-gapped mode) and pushed to the specified local registry before the install proceeds. The registry must have the following projects pre-created:
+
+| Project | Image | Required When |
+|:--------|:------|:--------------|
+| `chrislusf` | `chrislusf/seaweedfs` | Always |
+| `library` | `library/caddy` | Always |
+| `grafana` | `grafana/loki`, `grafana/grafana-oss` | `ENABLE_MONITORING=true` |
+| `prom` | `prom/prometheus` | `ENABLE_MONITORING=true` |
 
 #### `-registry` option
 
