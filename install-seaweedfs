@@ -42,6 +42,18 @@ S3_ACCESS_KEY=$(openssl rand -hex 8)                           # S3 access key
 S3_SECRET_KEY=$(openssl rand -hex 16)                          # S3 secret key
 ENABLE_MQ=${ENABLE_MQ:-"true"}                               # Install SeaweedMQ message broker and agent
 
+# Monitoring Stack Configuration
+ENABLE_MONITORING=${ENABLE_MONITORING:-"true"}
+LOKI_IMAGE=${LOKI_IMAGE:-"grafana/loki:3.4.2"}
+GRAFANA_IMAGE=${GRAFANA_IMAGE:-"grafana/grafana-oss:11.5.2"}
+PROMETHEUS_EXT_IMAGE=${PROMETHEUS_EXT_IMAGE:-"prom/prometheus:v3.2.1"}
+GRAFANA_FQDN=${GRAFANA_FQDN:-"grafana.$HOST_FQDN"}              # FQDN for Grafana UI (proxied through Caddy)
+GRAFANA_PORT=${GRAFANA_PORT:-"3000"}                             # Grafana external port
+LOKI_PORT=${LOKI_PORT:-"3100"}                                   # Loki push/query port (direct, no TLS)
+PROMETHEUS_EXT_PORT=${PROMETHEUS_EXT_PORT:-"9090"}               # External Prometheus remote-write receiver port
+LOKI_BUCKET=${LOKI_BUCKET:-"loki-logs"}                          # S3 bucket for Loki log storage
+CLUSTER_NAME=${CLUSTER_NAME:-"edge-lab"}                        # Cluster label applied to all metrics and logs
+
 # -- INTERNAL VARIABLES (do not edit) -- #
 AIR_GAPPED_MODE=0
 SAVE_MODE=0
@@ -97,9 +109,21 @@ install_swfs () {
     ((attempt++))
     sleep 5
   done
-  echo "  Configuring S3 bucket and credentials..."
+  echo "  Configuring S3 credentials..."
   echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
-  echo "s3.bucket.create -name $S3_BUCKET -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
+  echo "  Creating S3 buckets..."
+  local all_buckets="$S3_BUCKET"
+  if [[ $ENABLE_MONITORING == "true" && ! "$all_buckets" =~ (^| )$LOKI_BUCKET( |$) ]]; then
+    all_buckets="$all_buckets $LOKI_BUCKET"
+  fi
+  for bucket in $all_buckets; do
+    echo "  Creating bucket: $bucket"
+    echo "s3.bucket.create -name $bucket -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
+  done
+  if [[ $ENABLE_MONITORING == "true" ]]; then
+    echo "  Setting up monitoring stack (Loki, Grafana, Prometheus)..."
+    debug_run setup_monitoring
+  fi
   if [[ $ENABLE_SMB -eq "true" ]]; then
     run_smb
   fi
@@ -118,13 +142,20 @@ run_docker() {
 $SWFS_IMAGE
 $CADDY_IMAGE
 EOF
+      if [[ $ENABLE_MONITORING == "true" ]]; then
+        cat >> $base_dir/utilities/images.txt <<EOF
+$LOKI_IMAGE
+$GRAFANA_IMAGE
+$PROMETHEUS_EXT_IMAGE
+EOF
+      fi
       $base_dir/utilities/image_pull_push.sh -f $base_dir/utilities/images.txt push $REGISTRY_INFO $REG_USER $REG_PASS
     else
-      $base_dir/utilities/image_pull_push.sh docker
       # Still grab registry cert if needed
       if [[ $REGISTRY_MODE -eq 1 ]]; then
         $base_dir/utilities/image_pull_push.sh reg-cert $REGISTRY_INFO
       fi
+      $base_dir/utilities/image_pull_push.sh docker
     fi
   else
     # AIR_GAPPED_MODE is set
@@ -304,6 +335,14 @@ $SWFS_S3_FQDN:$SWFS_S3_PORT, https://$MGMT_IP:$SWFS_S3_PORT {
         reverse_proxy seaweed-mini:8333
 }
 EOF
+  if [[ $ENABLE_MONITORING == "true" ]]; then
+    cat >> /opt/caddy/Caddyfile <<EOF
+$GRAFANA_FQDN:$GRAFANA_PORT, https://$MGMT_IP:$GRAFANA_PORT {
+        tls internal
+        reverse_proxy grafana:$GRAFANA_PORT
+}
+EOF
+  fi
 }
 
 generate_compose_file () {
@@ -314,10 +353,16 @@ generate_compose_file () {
     SWFS_IMAGE="$SWFS_IMAGE"
     CADDY_IMAGE="$CADDY_IMAGE"
   fi
+  # Pre-compute optional Caddy port line for monitoring
+  local CADDY_MONITORING_PORT=""
+  if [[ $ENABLE_MONITORING == "true" ]]; then
+    CADDY_MONITORING_PORT="      - \"$GRAFANA_PORT:$GRAFANA_PORT\""
+  fi
   echo "  Creating seaweedfs-compose.yaml..." | tee -a seaweedfs-install.log
   cat > /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
 networks:
-  seaweed_net: {}
+  seaweed_net:
+    name: seaweed_net
 services:
   seaweed-mini:
     image: $SWFS_IMAGE
@@ -345,6 +390,7 @@ services:
       - "$SWFS_MASTER_PORT:$SWFS_MASTER_PORT"
       - "$SWFS_FILER_PORT:$SWFS_FILER_PORT"
       - "$SWFS_S3_PORT:$SWFS_S3_PORT"
+$CADDY_MONITORING_PORT
     volumes:
       - /opt/caddy/Caddyfile:/etc/caddy/Caddyfile
       - /opt/caddy/srv/index.html:/srv/index.html
@@ -535,10 +581,16 @@ generate_index_html () {
             <li><a id="admin-link" class="link" href="/login">Admin Console →</a></li>
             <li><a id="master-link" class="link" target="_blank" rel="noopener noreferrer" href="#">Master Console →</a></li>
             <li><a id="artifacts-link" class="link" target="_blank" rel="noopener noreferrer" href="#">File Browser →</a></li>
+            <li><a id="grafana-link" class="link" target="_blank" rel="noopener noreferrer" href="#" style="display:none">Grafana Dashboards →</a></li>
         </ul>
         <div class="doc-card">
-            <p class="note">This server uses the all-in-one 'weed mini' command to deploy the following single-node optimized SeaweedFS services: Master, Volume, & Filer server, Maintenance Worker, Admin UI, and S3 Gateway</p>
+            <p class="note">This server uses the all-in-one 'weed mini' command to deploy the following single-node optimized SeaweedFS services: Master, Volume, &amp; Filer server, Maintenance Worker, Admin UI, and S3 Gateway</p>
             <p class="note">Caddy is deployed on the front end to serve this landing page, provide local TLS with auto-renewing certificates, basic authentication, and a reverse proxy to security harden the SeaweedFS services</p>
+            <div id="monitoring-section" style="display:none">
+              <p class="note">Monitoring stack is deployed as a separate Docker Compose project: Grafana (dashboards), Loki (log aggregation → SeaweedFS S3), and Prometheus (metrics remote-write receiver)</p>
+              <div class="subtitle">Monitoring Endpoints</div>
+              <pre class="code-block" id="monitoring-urls">loading...</pre>
+            </div>
             <div class="subtitle">S3 endpoint</div>
             <pre class="code-block" id="s3-url">loading...</pre>
             <div class="subtitle">SMB Share - Enabled: $ENABLE_SMB</div>
@@ -574,6 +626,18 @@ generate_index_html () {
                 const artifactsBase = getUrl('filer', '$SWFS_FILER_PORT', '/$DEFAULT_FILER_DIR_NAME');
                 document.getElementById('master-link').href = getUrl('master', '$SWFS_MASTER_PORT');
                 document.getElementById('artifacts-link').href = artifactsBase;
+                const monitoringEnabled = '$ENABLE_MONITORING' === 'true';
+                if (monitoringEnabled) {
+                  const grafanaEl = document.getElementById('grafana-link');
+                  const grafanaUrl = getUrl('grafana', '$GRAFANA_PORT');
+                  grafanaEl.href = grafanaUrl;
+                  grafanaEl.style.display = '';
+                  document.getElementById('monitoring-section').style.display = '';
+                  document.getElementById('monitoring-urls').textContent =
+                    'Grafana:    ' + grafanaUrl + '\n' +
+                    'Loki:       http://' + currentHost + ':$LOKI_PORT\n' +
+                    'Prometheus: http://' + currentHost + ':$PROMETHEUS_EXT_PORT';
+                }
                 document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
                 document.getElementById('smb-url').textContent = \`net use Z: \\\\\\\\\${currentHost}\\\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES\`;
                 document.getElementById('nfs-url').textContent = \`sudo mount -t nfs -o vers=3 \${currentHost}:/mnt/seaweed /mnt/seaweed\`;
@@ -649,8 +713,21 @@ S3 Details:
   >>> Landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT <<<
   >>>               https://$MGMT_IP:$SWFS_ADMIN_PORT <<<
 EOF
+  if [[ $ENABLE_MONITORING == "true" ]]; then
+    cat >> seaweedfs-install.log <<EOF
+
+Monitoring Stack:
+  Grafana:            https://$GRAFANA_FQDN:$GRAFANA_PORT  (user: $SWFS_USER / pass: $SWFS_PASSWORD)
+  Grafana (by IP):    https://$MGMT_IP:$GRAFANA_PORT
+  Loki:               http://$MGMT_IP:$LOKI_PORT
+  Prometheus:         http://$MGMT_IP:$PROMETHEUS_EXT_PORT
+  Cluster label:      $CLUSTER_NAME
+  Loki log bucket:    $LOKI_BUCKET
+  Credentials file:   /opt/seaweedfs/monitoring-credentials.env
+EOF
+  fi
   echo
-  cat seaweedfs-install.log | tail -31
+  cat seaweedfs-install.log | tail -40
   echo
 }
 
@@ -671,6 +748,238 @@ upload_binaries () {
     if [[ -f "$file" ]]; then
         curl -ku $SWFS_USER:$SWFS_PASSWORD -X POST https://$MGMT_IP:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME/$(basename "$file") -F file=@$base_dir/utilities/artifacts/$(basename "$file")
     fi
+  done
+}
+
+# -- Monitoring Stack Definitions -- #
+
+generate_loki_config () {
+  echo "  Writing Loki configuration..."
+  cat > /opt/monitoring/loki/loki-config.yaml <<EOF
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: tsdb
+      object_store: s3
+      schema: v13
+      index:
+        prefix: loki_index_
+        period: 24h
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/index_cache
+  aws:
+    endpoint: http://seaweed-mini:8333
+    bucketnames: ${LOKI_BUCKET}
+    access_key_id: ${S3_ACCESS_KEY}
+    secret_access_key: ${S3_SECRET_KEY}
+    s3forcepathstyle: true
+    insecure: true
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  delete_request_store: s3
+
+limits_config:
+  retention_period: 30d
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  max_query_parallelism: 32
+  max_query_series: 5000
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+EOF
+}
+
+generate_prometheus_ext_config () {
+  echo "  Writing external Prometheus configuration..."
+  cat > /opt/monitoring/prometheus/prometheus.yml <<EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: ${CLUSTER_NAME}
+
+scrape_configs:
+  - job_name: "prometheus-self"
+    static_configs:
+      - targets: ["localhost:${PROMETHEUS_EXT_PORT}"]
+
+  - job_name: "loki"
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: "grafana"
+    static_configs:
+      - targets: ["grafana:${GRAFANA_PORT}"]
+EOF
+}
+
+generate_grafana_datasources () {
+  echo "  Writing Grafana datasources provisioning..."
+  cat > /opt/monitoring/grafana/provisioning/datasources/datasources.yaml <<EOF
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:${PROMETHEUS_EXT_PORT}
+    isDefault: true
+    editable: true
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+    jsonData:
+      maxLines: 1000
+EOF
+}
+
+generate_monitoring_compose () {
+  echo "  Writing monitoring docker-compose.yml..."
+  if [[ $PUSH_MODE -eq 1 || $REGISTRY_MODE -eq 1 ]]; then
+    local loki_image="${REG_FQDN}:${REG_PORT}/$LOKI_IMAGE"
+    local grafana_image="${REG_FQDN}:${REG_PORT}/$GRAFANA_IMAGE"
+    local prometheus_image="${REG_FQDN}:${REG_PORT}/$PROMETHEUS_EXT_IMAGE"
+  else
+    local loki_image="$LOKI_IMAGE"
+    local grafana_image="$GRAFANA_IMAGE"
+    local prometheus_image="$PROMETHEUS_EXT_IMAGE"
+  fi
+  cat > /opt/monitoring/docker-compose.yml <<EOF
+networks:
+  seaweed_net:
+    external: true
+    name: seaweed_net
+
+services:
+  loki:
+    image: ${loki_image}
+    container_name: loki
+    restart: unless-stopped
+    ports:
+      - "${LOKI_PORT}:3100"
+    volumes:
+      - /opt/monitoring/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - /opt/monitoring/loki/data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - seaweed_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --output-document=- http://localhost:3100/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: ${prometheus_image}
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_EXT_PORT}:9090"
+    volumes:
+      - /opt/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /opt/monitoring/prometheus/data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=90d"
+      - "--web.enable-remote-write-receiver"
+      - "--web.enable-lifecycle"
+    networks:
+      - seaweed_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --output-document=- http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: ${grafana_image}
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${SWFS_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${SWFS_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - /opt/monitoring/grafana/data:/var/lib/grafana
+      - /opt/monitoring/grafana/provisioning/datasources/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+    networks:
+      - seaweed_net
+    depends_on:
+      loki:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+EOF
+}
+
+write_monitoring_credentials () {
+  echo "  Writing monitoring credentials to /opt/seaweedfs/monitoring-credentials.env..."
+  cat > /opt/seaweedfs/monitoring-credentials.env <<EOF
+# Generated by install-seaweedfs on $(date)
+# Source this file in ap-tools before running 'install monitoring'
+MONITORING_HOST=${MGMT_IP}
+MONITORING_S3_ACCESS_KEY=${S3_ACCESS_KEY}
+MONITORING_S3_SECRET_KEY=${S3_SECRET_KEY}
+MONITORING_S3_ENDPOINT=http://${MGMT_IP}:8333
+MONITORING_LOKI_BUCKET=${LOKI_BUCKET}
+MONITORING_LOKI_PORT=${LOKI_PORT}
+MONITORING_PROMETHEUS_PORT=${PROMETHEUS_EXT_PORT}
+CLUSTER_NAME=${CLUSTER_NAME}
+EOF
+  chmod 600 /opt/seaweedfs/monitoring-credentials.env
+}
+
+setup_monitoring () {
+  mkdir -p /opt/monitoring/{loki/data,prometheus/data,grafana/data,grafana/provisioning/datasources}
+  chmod 777 /opt/monitoring/{loki/data,prometheus/data,grafana/data}
+  generate_loki_config
+  generate_prometheus_ext_config
+  generate_grafana_datasources
+  generate_monitoring_compose
+  write_monitoring_credentials
+  echo "  Starting monitoring stack (Loki, Grafana, Prometheus)..."
+  docker compose -f /opt/monitoring/docker-compose.yml up -d
+  echo "  Waiting for monitoring stack to become healthy..."
+  local attempt=1
+  while [[ $attempt -le 12 ]]; do
+    local loki_ready=$(docker exec loki wget --quiet --tries=1 --output-document=- http://localhost:3100/ready 2>/dev/null || true)
+    if [[ "$loki_ready" == "ready" ]]; then
+      echo "  Monitoring stack is healthy."
+      break
+    fi
+    echo "  Waiting for Loki... attempt $attempt/12"
+    ((attempt++))
+    sleep 10
   done
 }
 
@@ -719,6 +1028,13 @@ run_save () {
 $SWFS_IMAGE
 $CADDY_IMAGE
 EOF
+  if [[ $ENABLE_MONITORING == "true" ]]; then
+    cat >> $base_dir/utilities/images.txt <<EOF
+$LOKI_IMAGE
+$GRAFANA_IMAGE
+$PROMETHEUS_EXT_IMAGE
+EOF
+  fi
   cd $base_dir/utilities
   debug_run ./image_pull_push.sh -f $base_dir/utilities/images.txt save
   ./install_packages.sh save samba
@@ -730,6 +1046,12 @@ EOF
 }
 
 uninstall_swfs () {
+  if [[ -f /opt/monitoring/docker-compose.yml ]]; then
+    echo "  Stopping monitoring stack (Loki, Grafana, Prometheus)..." | tee -a seaweedfs-uninstall.log
+    docker compose -f /opt/monitoring/docker-compose.yml down
+    rm -rf /opt/monitoring
+  fi
+  rm -f /opt/seaweedfs/monitoring-credentials.env
   echo "  Stopping and removing SeaweedFS and Caddy containers..." | tee -a seaweedfs-uninstall.log
   docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml down
   echo "  Removing SeaweedFS and Caddy data and configuration..." | tee -a seaweedfs-uninstall.log
