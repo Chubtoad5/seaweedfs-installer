@@ -339,7 +339,7 @@ EOF
     cat >> /opt/caddy/Caddyfile <<EOF
 $GRAFANA_FQDN:$GRAFANA_PORT, https://$MGMT_IP:$GRAFANA_PORT {
         tls internal
-        reverse_proxy grafana:$GRAFANA_PORT
+        reverse_proxy grafana:3000
 }
 EOF
   fi
