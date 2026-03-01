@@ -81,7 +81,7 @@ Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and Seawe
 
 Creates an offline archive (`swfs-save.tar.gz`) for air-gapped deployment. The archive includes:
 - Docker runtime binaries (for the detected OS)
-- Container images: SeaweedFS, Caddy, and (when `ENABLE_MONITORING=True`) Loki, Grafana, and Prometheus
+- Container images: SeaweedFS, Caddy, and (when `ENABLE_MONITORING=true`) Loki, Grafana, and Prometheus
 - Package installers for Samba and NFS
 - Any binaries listed in `ARTIFACTS_TO_DOWNLOAD`
 
@@ -105,8 +105,8 @@ When combined with `install` and `-registry`, images are pulled from the interne
 |:--------|:------|:--------------|
 | `chrislusf` | `chrislusf/seaweedfs` | Always |
 | `library` | `library/caddy` | Always |
-| `grafana` | `grafana/loki`, `grafana/grafana-oss` | `ENABLE_MONITORING=True` |
-| `prom` | `prom/prometheus` | `ENABLE_MONITORING=True` |
+| `grafana` | `grafana/loki`, `grafana/grafana-oss` | `ENABLE_MONITORING=true` |
+| `prom` | `prom/prometheus` | `ENABLE_MONITORING=true` |
 
 #### `-registry` option
 
@@ -119,7 +119,7 @@ Provides local registry credentials used for both pushing and pulling containers
 sudo ./install-seaweedfs install
 
 # Install without monitoring stack
-sudo ENABLE_MONITORING="False" ./install-seaweedfs install
+sudo ENABLE_MONITORING="false" ./install-seaweedfs install
 
 # Install with custom credentials and hostname
 sudo SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" HOST_FQDN="storage.mylab.com" \
@@ -129,7 +129,7 @@ sudo SWFS_USER="weeduser" SWFS_PASSWORD="weedpassword" HOST_FQDN="storage.mylab.
 sudo ./install-seaweedfs save
 
 # Prepare an offline archive without monitoring images
-sudo ENABLE_MONITORING="False" ./install-seaweedfs save
+sudo ENABLE_MONITORING="false" ./install-seaweedfs save
 
 # Air-gapped install (swfs-save.tar.gz must be present in the same directory)
 sudo ./install-seaweedfs install
@@ -149,7 +149,7 @@ sudo ./install-seaweedfs uninstall
 All user-defined variables can be passed as environment variables:
 
 ```bash
-sudo SWFS_USER="admin" SWFS_PASSWORD="s3cr3t" ENABLE_MONITORING="False" \
+sudo SWFS_USER="admin" SWFS_PASSWORD="s3cr3t" ENABLE_MONITORING="false" \
   ./install-seaweedfs install -registry myregistry:5000 user password
 ```
 
@@ -176,9 +176,9 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `SWFS_FILER_PORT` | `8888` | TCP port for Filer service |
 | `SWFS_S3_PORT` | `8333` | TCP port for S3 endpoint |
 | `DEFAULT_FILER_DIR_NAME` | `artifacts` | Default Filer directory for user data |
-| `ENABLE_SMB` | `True` | Enable Samba (SMB) share with basic auth on the default Filer path |
-| `ENABLE_NFS` | `True` | Enable NFS export (NFSv3, no authentication) of the default Filer path |
-| `ENABLE_MQ` | `True` | Deploy SeaweedMQ message broker |
+| `ENABLE_SMB` | `true` | Enable Samba (SMB) share with basic auth on the default Filer path |
+| `ENABLE_NFS` | `true` | Enable NFS export (NFSv3, no authentication) of the default Filer path |
+| `ENABLE_MQ` | `true` | Deploy SeaweedMQ message broker |
 | `MQ_BROKER_PORT` | `17777` | TCP port for SeaweedMQ broker |
 | `S3_BUCKET` | `charlie` | Default S3 bucket name |
 | `S3_USER` | `$SWFS_USER` | S3 API username |
@@ -188,13 +188,13 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 
 ### Monitoring Stack Variables
 
-> **Recommendation:** The monitoring stack deploys Grafana, Loki, and Prometheus as additional containers and requires additional host resources. Only enable it if you plan to use an external log or metrics collector such as Fluent Bit or a Prometheus remote-write agent to ship data to this host. If no external agents are configured, set `ENABLE_MONITORING="False"` to reduce overhead.
+> **Recommendation:** The monitoring stack deploys Grafana, Loki, and Prometheus as additional containers and requires additional host resources. Only enable it if you plan to use an external log or metrics collector such as Fluent Bit or a Prometheus remote-write agent to ship data to this host. If no external agents are configured, set `ENABLE_MONITORING="false"` to reduce overhead.
 >
 > When monitoring is enabled, a credentials file is written to `/opt/seaweedfs/monitoring-credentials.env` containing the S3 access key, Loki endpoint, and Prometheus endpoint — ready to be sourced by external tools or automation scripts.
 
 | Variable | Default Value | Description |
 |:---------|:-------------|:------------|
-| `ENABLE_MONITORING` | `True` | Deploy Grafana, Loki, and Prometheus monitoring stack |
+| `ENABLE_MONITORING` | `true` | Deploy Grafana, Loki, and Prometheus monitoring stack |
 | `LOKI_IMAGE` | `grafana/loki:3.4.2` | Container image for Loki |
 | `GRAFANA_IMAGE` | `grafana/grafana-oss:11.5.2` | Container image for Grafana |
 | `PROMETHEUS_EXT_IMAGE` | `prom/prometheus:v3.2.1` | Container image for Prometheus |
