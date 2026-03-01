@@ -1041,7 +1041,16 @@ EOF
   ./install_packages.sh save nfs-kernel-server
   cd $base_dir
   debug_run download_binaries
-  tar czf $base_dir/swfs-save.tar.gz utilities install-seaweedfs
+  cat > $base_dir/swfs-save-version.txt <<EOF
+# SeaweedFS Installer Save Archive
+# Created: $(date)
+#
+# Container images included:
+$SWFS_IMAGE
+$CADDY_IMAGE
+$(if [[ ${ENABLE_MONITORING,,} == "true" ]]; then printf "%s\n%s\n%s" "$LOKI_IMAGE" "$GRAFANA_IMAGE" "$PROMETHEUS_EXT_IMAGE"; fi)
+EOF
+  tar czf $base_dir/swfs-save.tar.gz utilities install-seaweedfs swfs-save-version.txt
   echo "  created 'swfs-save.tar.gz' for air-gapped deployment."
 }
 
@@ -1208,7 +1217,7 @@ if [[ "$REGISTRY_MODE" == "1" ]]; then
     exit 1
   fi
 fi
-[[ ! -f $base_dir/swfs-save.tar.gz ]] || AIR_GAPPED_MODE=1
+[[ ! -f $base_dir/swfs-save-version.txt ]] || AIR_GAPPED_MODE=1
 
 
 
