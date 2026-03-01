@@ -24,7 +24,7 @@ The installer sets up the following services depending on configuration:
 - Optional SeaweedMQ message broker for event streaming
 - Optional monitoring stack: Grafana, Loki (log aggregation backed by SeaweedFS S3), and Prometheus (metrics remote-write receiver)
 - Supports air-gapped deployments via a self-contained offline archive (`swfs-save.tar.gz`)
-- Automatically detects air-gapped mode when `swfs-save.tar.gz` is present in the script directory
+- Automatically detects air-gapped mode when `swfs-save-version.txt` is present in the script directory; the archive may be renamed before transfer without breaking detection
 - Supports pushing container images to a local registry and pulling from it at install time
 - Automatic download and upload of user-defined binaries to the default Filer directory
 
@@ -63,7 +63,7 @@ Options:
 
 Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and SeaweedMQ from the internet.
 
-- If `swfs-save.tar.gz` is present in the same directory as `install-seaweedfs`, air-gapped install mode activates automatically
+- If `swfs-save-version.txt` is present in the same directory as `install-seaweedfs`, air-gapped install mode activates automatically (this file is bundled in the archive and extracted alongside the script)
 - If `-registry` is specified, containers are pulled from the local registry instead of Docker Hub
 
 **Configuration paths after installation:**
@@ -80,14 +80,15 @@ Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and Seawe
 #### `save`
 
 Creates an offline archive (`swfs-save.tar.gz`) for air-gapped deployment. The archive includes:
-- Docker runtime binaries (for the detected OS)
+- Docker engine and cli package for t he host OS version
+- `swfs-save-version.txt` — version manifest with creation timestamp and the list of saved container image names
 - Container images: SeaweedFS, Caddy, and (when `ENABLE_MONITORING=true`) Loki, Grafana, and Prometheus
 - Package installers for Samba and NFS
 - Any binaries listed in `ARTIFACTS_TO_DOWNLOAD`
 
-To use the archive on the target machine:
+To use the archive on the target machine (the archive may be renamed before transfer):
 ```bash
-tar xzf swfs-save.tar.gz
+tar xzf <archive-name>.tar.gz
 sudo ./install-seaweedfs install
 ```
 
@@ -131,7 +132,7 @@ sudo ./install-seaweedfs save
 # Prepare an offline archive without monitoring images
 sudo ENABLE_MONITORING="false" ./install-seaweedfs save
 
-# Air-gapped install (swfs-save.tar.gz must be present in the same directory)
+# Air-gapped install (swfs-save-version.txt must be present in the same directory)
 sudo ./install-seaweedfs install
 
 # Install pulling containers from a local registry
