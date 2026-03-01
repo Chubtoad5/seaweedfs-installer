@@ -33,17 +33,17 @@ MQ_BROKER_PORT=${MQ_BROKER_PORT:-"17777"}
 
 # - File share, S3 and Message Broker settings
 DEFAULT_FILER_DIR_NAME=${DEFAULT_FILER_DIR_NAME:-"artifacts"}  # Default directory on SeaweedFS Filer for artifacts
-ENABLE_SMB=${ENABLE_SMB:-"true"}                               # Enable Samba smb share with basic authentication
-ENABLE_NFS=${ENABLE_NFS:-"true"}                              # Enable NFS export with NFSv3, no authentication
+ENABLE_SMB=${ENABLE_SMB:-"True"}                               # Enable Samba smb share with basic authentication
+ENABLE_NFS=${ENABLE_NFS:-"True"}                              # Enable NFS export with NFSv3, no authentication
 ARTIFACTS_TO_DOWNLOAD=${ARTIFACTS_TO_DOWNLOAD:-""}             # List of artifact URLS to auto download with 'curl -k' and upload to SeaweedFS filer
 S3_BUCKET=${S3_BUCKET:-"charlie"}                              # S3 bucket name
 S3_USER=${S3_USER:-"$SWFS_USER"}                               # S3 user name
 S3_ACCESS_KEY=$(openssl rand -hex 8)                           # S3 access key
 S3_SECRET_KEY=$(openssl rand -hex 16)                          # S3 secret key
-ENABLE_MQ=${ENABLE_MQ:-"true"}                               # Install SeaweedMQ message broker and agent
+ENABLE_MQ=${ENABLE_MQ:-"True"}                               # Install SeaweedMQ message broker and agent
 
 # Monitoring Stack Configuration
-ENABLE_MONITORING=${ENABLE_MONITORING:-"true"}
+ENABLE_MONITORING=${ENABLE_MONITORING:-"True"}
 LOKI_IMAGE=${LOKI_IMAGE:-"grafana/loki:3.4.2"}
 GRAFANA_IMAGE=${GRAFANA_IMAGE:-"grafana/grafana-oss:11.5.2"}
 PROMETHEUS_EXT_IMAGE=${PROMETHEUS_EXT_IMAGE:-"prom/prometheus:v3.2.1"}
@@ -113,21 +113,21 @@ install_swfs () {
   echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
   echo "  Creating S3 buckets..."
   local all_buckets="$S3_BUCKET"
-  if [[ $ENABLE_MONITORING == "true" && ! "$all_buckets" =~ (^| )$LOKI_BUCKET( |$) ]]; then
+  if [[ $ENABLE_MONITORING == "True" && ! "$all_buckets" =~ (^| )$LOKI_BUCKET( |$) ]]; then
     all_buckets="$all_buckets $LOKI_BUCKET"
   fi
   for bucket in $all_buckets; do
     echo "  Creating bucket: $bucket"
     echo "s3.bucket.create -name $bucket -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
   done
-  if [[ $ENABLE_MONITORING == "true" ]]; then
+  if [[ $ENABLE_MONITORING == "True" ]]; then
     echo "  Setting up monitoring stack (Loki, Grafana, Prometheus)..."
     debug_run setup_monitoring
   fi
-  if [[ $ENABLE_SMB -eq "true" ]]; then
+  if [[ $ENABLE_SMB -eq "True" ]]; then
     run_smb
   fi
-  if [[ $ENABLE_NFS -eq "true" ]]; then
+  if [[ $ENABLE_NFS -eq "True" ]]; then
     run_nfs
   fi
   generate_outputs
@@ -142,7 +142,7 @@ run_docker() {
 $SWFS_IMAGE
 $CADDY_IMAGE
 EOF
-      if [[ $ENABLE_MONITORING == "true" ]]; then
+      if [[ $ENABLE_MONITORING == "True" ]]; then
         cat >> $base_dir/utilities/images.txt <<EOF
 $LOKI_IMAGE
 $GRAFANA_IMAGE
@@ -335,7 +335,7 @@ $SWFS_S3_FQDN:$SWFS_S3_PORT, https://$MGMT_IP:$SWFS_S3_PORT {
         reverse_proxy seaweed-mini:8333
 }
 EOF
-  if [[ $ENABLE_MONITORING == "true" ]]; then
+  if [[ $ENABLE_MONITORING == "True" ]]; then
     cat >> /opt/caddy/Caddyfile <<EOF
 $GRAFANA_FQDN:$GRAFANA_PORT, https://$MGMT_IP:$GRAFANA_PORT {
         tls internal
@@ -355,7 +355,7 @@ generate_compose_file () {
   fi
   # Pre-compute optional Caddy port line for monitoring
   local CADDY_MONITORING_PORT=""
-  if [[ $ENABLE_MONITORING == "true" ]]; then
+  if [[ $ENABLE_MONITORING == "True" ]]; then
     CADDY_MONITORING_PORT="      - \"$GRAFANA_PORT:$GRAFANA_PORT\""
   fi
   echo "  Creating seaweedfs-compose.yaml..." | tee -a seaweedfs-install.log
@@ -400,7 +400,7 @@ $CADDY_MONITORING_PORT
     depends_on:
       - seaweed-mini
 EOF
-  if [[ $ENABLE_MQ == true ]]; then
+  if [[ $ENABLE_MQ == True ]]; then
     cat >> /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
   seaweed-mq:
     image: chrislusf/seaweedfs:latest
@@ -415,7 +415,7 @@ EOF
       - seaweed_net
 EOF
   fi
-  if [[ $ENABLE_SMB == true || $ENABLE_NFS == true ]]; then
+  if [[ $ENABLE_SMB == True || $ENABLE_NFS == True ]]; then
     mkdir -p /mnt/seaweed
     echo "user_allow_other" > /etc/fuse.conf
     cat >> /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
@@ -626,7 +626,7 @@ generate_index_html () {
                 const artifactsBase = getUrl('filer', '$SWFS_FILER_PORT', '/$DEFAULT_FILER_DIR_NAME');
                 document.getElementById('master-link').href = getUrl('master', '$SWFS_MASTER_PORT');
                 document.getElementById('artifacts-link').href = artifactsBase;
-                const monitoringEnabled = '$ENABLE_MONITORING' === 'true';
+                const monitoringEnabled = '$ENABLE_MONITORING' === 'True';
                 if (monitoringEnabled) {
                   const grafanaEl = document.getElementById('grafana-link');
                   const grafanaUrl = getUrl('grafana', '$GRAFANA_PORT');
@@ -713,7 +713,7 @@ S3 Details:
   >>> Landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT <<<
   >>>               https://$MGMT_IP:$SWFS_ADMIN_PORT <<<
 EOF
-  if [[ $ENABLE_MONITORING == "true" ]]; then
+  if [[ $ENABLE_MONITORING == "True" ]]; then
     cat >> seaweedfs-install.log <<EOF
 
 Monitoring Stack:
@@ -1028,7 +1028,7 @@ run_save () {
 $SWFS_IMAGE
 $CADDY_IMAGE
 EOF
-  if [[ $ENABLE_MONITORING == "true" ]]; then
+  if [[ $ENABLE_MONITORING == "True" ]]; then
     cat >> $base_dir/utilities/images.txt <<EOF
 $LOKI_IMAGE
 $GRAFANA_IMAGE
@@ -1057,7 +1057,7 @@ uninstall_swfs () {
   echo "  Removing SeaweedFS and Caddy data and configuration..." | tee -a seaweedfs-uninstall.log
   rm -rf /opt/seaweedfs
   rm -rf /opt/caddy
-  if [[ $ENABLE_SMB == "true" ]]; then
+  if [[ $ENABLE_SMB == "True" ]]; then
     echo "  Reverting to default Samba configuration..." | tee -a seaweedfs-uninstall.log
     rm -f /etc/samba/smb.conf
     mv /etc/samba/smb.conf.bak /etc/samba/smb.conf
@@ -1066,7 +1066,7 @@ uninstall_swfs () {
     userdel $SWFS_USER
     systemctl restart $SMB_SERVICE
   fi
-  if [[ $ENABLE_NFS == "true" ]]; then
+  if [[ $ENABLE_NFS == "True" ]]; then
     if [[ $ID == "ubuntu" || $ID == "debian" ]]; then
       NFS_SERVICE="nfs-kernel-server"
     fi
