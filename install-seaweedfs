@@ -367,9 +367,6 @@ services:
   seaweed-mini:
     image: $SWFS_IMAGE
     container_name: seaweed-mini
-    environment:
-      - AWS_ACCESS_KEY_ID=$SWFS_USER
-      - AWS_SECRET_ACCESS_KEY=$SWFS_PASSWORD
     command: >
       mini
       -admin.user "$SWFS_USER"
@@ -403,7 +400,7 @@ EOF
   if [[ ${ENABLE_MQ,,} == "true" ]]; then
     cat >> /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
   seaweed-mq:
-    image: chrislusf/seaweedfs:latest
+    image: $SWFS_IMAGE
     container_name: seaweed-mq
     command: >
       mq.broker
