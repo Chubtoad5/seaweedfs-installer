@@ -2,6 +2,21 @@
 
 A bash automation script that deploys a self-contained, production-ready SeaweedFS file storage stack in a Docker environment. A Caddy sidecar container provides reverse proxy, self-signed TLS, basic authentication, and a web-based landing page. An optional monitoring stack (Grafana, Loki, Prometheus) and message broker (SeaweedMQ) can also be deployed.
 
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Usage](#usage)
+  - [Quick Start](#quick-start)
+- [Examples](#examples)
+- [Configuration Variables](#configuration-variables)
+- [Service Endpoints](#service-endpoints)
+- [Known Issues](#known-issues)
+
+---
+
 ## Overview
 
 The installer sets up the following services depending on configuration:
