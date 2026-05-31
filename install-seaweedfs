@@ -48,6 +48,23 @@ ENABLE_MQ=${ENABLE_MQ:-"true"}                               # Install SeaweedMQ
 VOLUME_INDEX=${VOLUME_INDEX:-""}                # [memory|leveldb|leveldbMedium|leveldbLarge] - 'leveldb' lowers RAM use for many small files on edge hosts
 VOLUME_SIZE_LIMIT_MB=${VOLUME_SIZE_LIMIT_MB:-""}  # Master stops directing writes to volumes larger than this (mini auto-sizes 64-1024MB if unset)
 
+# - Clustering (Phase 2; default is single-node and byte-identical to before).
+#   CLUSTER_MODE=cluster makes node 1 'cluster-ready': the mini control plane advertises the host IP
+#   (-ip=$MGMT_IP) instead of the docker-bridge default, sets a default replication, and host-publishes the
+#   cluster gRPC/volume ports so discrete 'weed volume' nodes (added via the 'join' subcommand) can register
+#   and replicate. Anything other than 'cluster' = single-node (unchanged). See the clustering README section.
+CLUSTER_MODE=${CLUSTER_MODE:-""}                              # "cluster" = cluster-ready control plane; empty = single-node default
+# -master.defaultReplication. LEAVE EMPTY until a 2nd volume node has joined: 001 on a lone node has no replica
+# target, so the master cannot allocate volumes and writes block. Set CLUSTER_REPLICATION=001 (re-run install) only
+# AFTER joining node 2. Empty = SeaweedFS default (000, single copy) — safe for a lone cluster-ready node.
+CLUSTER_REPLICATION=${CLUSTER_REPLICATION:-""}               # e.g. 001 once 2+ nodes exist (001 = 2 copies, 1 extra server same rack)
+CLUSTER_DC=${CLUSTER_DC:-"dc1"}                               # topology data center label (-dataCenter)
+CLUSTER_RACK=${CLUSTER_RACK:-"rack1"}                        # topology rack label (-rack)
+CLUSTER_MASTER=${CLUSTER_MASTER:-""}                         # 'join' only: <node1-host-or-ip>:<master-port> of the control plane to join
+CLUSTER_VOLUME_PORT=${CLUSTER_VOLUME_PORT:-"9340"}          # volume http port (host-published in cluster/join)
+CLUSTER_VOLUME_GRPC_PORT=${CLUSTER_VOLUME_GRPC_PORT:-"19340"} # volume grpc port (replication; host-published in cluster/join)
+CLUSTER_MASTER_GRPC_PORT=${CLUSTER_MASTER_GRPC_PORT:-"19333"} # master grpc port (peers register here; host-published in cluster mode)
+
 # Monitoring Stack Configuration
 ENABLE_MONITORING=${ENABLE_MONITORING:-"true"}
 LOKI_IMAGE=${LOKI_IMAGE:-"grafana/loki:3.4.2"}
@@ -65,6 +82,7 @@ AIR_GAPPED_MODE=0
 SAVE_MODE=0
 INSTALL_MODE=0
 UNINSTALL_MODE=0
+JOIN_MODE=0
 PUSH_MODE=0
 REGISTRY_MODE=0
 REGISTRY_INFO=""
@@ -376,6 +394,23 @@ generate_compose_file () {
   local MINI_TUNING=""
   [[ -n "$VOLUME_INDEX" ]] && MINI_TUNING+="      -volume.index=$VOLUME_INDEX"$'\n'
   [[ -n "$VOLUME_SIZE_LIMIT_MB" ]] && MINI_TUNING+="      -master.volumeSizeLimitMB=$VOLUME_SIZE_LIMIT_MB"$'\n'
+  # Pre-compute optional cluster-ready flags + host-published cluster ports (CLUSTER_MODE=cluster).
+  # Empty in single-node mode => the compose below is byte-identical to the non-cluster default.
+  local MINI_CLUSTER=""
+  local MINI_CLUSTER_PORTS=""
+  if [[ ${CLUSTER_MODE,,} == "cluster" ]]; then
+    MINI_CLUSTER+="      -ip=$MGMT_IP"$'\n'
+    [[ -n "$CLUSTER_REPLICATION" ]] && MINI_CLUSTER+="      -master.defaultReplication=$CLUSTER_REPLICATION"$'\n'
+    MINI_CLUSTER+="      -dataCenter=$CLUSTER_DC"$'\n'
+    MINI_CLUSTER+="      -rack=$CLUSTER_RACK"$'\n'
+    MINI_CLUSTER+="      -master.port.grpc=$CLUSTER_MASTER_GRPC_PORT"$'\n'
+    MINI_CLUSTER+="      -volume.port=$CLUSTER_VOLUME_PORT"$'\n'
+    MINI_CLUSTER+="      -volume.port.grpc=$CLUSTER_VOLUME_GRPC_PORT"$'\n'
+    MINI_CLUSTER_PORTS+="    ports:"$'\n'
+    MINI_CLUSTER_PORTS+="      - \"$CLUSTER_MASTER_GRPC_PORT:$CLUSTER_MASTER_GRPC_PORT\""$'\n'
+    MINI_CLUSTER_PORTS+="      - \"$CLUSTER_VOLUME_PORT:$CLUSTER_VOLUME_PORT\""$'\n'
+    MINI_CLUSTER_PORTS+="      - \"$CLUSTER_VOLUME_GRPC_PORT:$CLUSTER_VOLUME_GRPC_PORT\""$'\n'
+  fi
   echo "  Creating seaweedfs-compose.yaml..." | tee -a seaweedfs-install.log
   cat > /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
 networks:
@@ -391,9 +426,9 @@ services:
       -admin.password "$SWFS_PASSWORD"
       -dir=/data
       -webdav=false
-${MINI_TUNING}    volumes:
+${MINI_TUNING}${MINI_CLUSTER}    volumes:
       - /opt/seaweedfs/mini:/data
-    networks:
+${MINI_CLUSTER_PORTS}    networks:
       - seaweed_net
     restart: unless-stopped
   caddy:
@@ -1074,7 +1109,93 @@ EOF
   echo "  created 'swfs-save.tar.gz' for air-gapped deployment."
 }
 
+run_join () {
+  echo "# -- SeaweedFS Volume Join Started - $(date) -- #" | tee -a seaweedfs-install.log
+  echo "  Joining control-plane master at $CLUSTER_MASTER as a volume node (ip=$MGMT_IP, dc=$CLUSTER_DC, rack=$CLUSTER_RACK)..."
+  mkdir -p /opt/seaweedfs/volume
+  debug_run run_docker
+  generate_join_compose_file
+  echo "  Starting SeaweedFS volume node..."
+  docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml up -d
+  generate_join_outputs
+}
+
+generate_join_compose_file () {
+  local swfs_image_local="$SWFS_IMAGE"
+  if [[ $PUSH_MODE -eq 1 || $REGISTRY_MODE -eq 1 ]]; then
+    swfs_image_local="${REG_FQDN}:${REG_PORT}/$SWFS_IMAGE"
+  fi
+  local VOL_TUNING=""
+  [[ -n "$VOLUME_INDEX" ]] && VOL_TUNING+="      -index=$VOLUME_INDEX"$'\n'
+  echo "  Creating seaweedfs-volume-compose.yaml..." | tee -a seaweedfs-install.log
+  cat > /opt/seaweedfs/seaweedfs-volume-compose.yaml <<EOF
+networks:
+  seaweed_net:
+    name: seaweed_net
+services:
+  seaweed-volume:
+    image: $swfs_image_local
+    container_name: seaweed-volume
+    command: >
+      volume
+      -master=$CLUSTER_MASTER
+      -ip=$MGMT_IP
+      -ip.bind=0.0.0.0
+      -dir=/data
+      -max=0
+      -dataCenter=$CLUSTER_DC
+      -rack=$CLUSTER_RACK
+      -port=$CLUSTER_VOLUME_PORT
+      -port.grpc=$CLUSTER_VOLUME_GRPC_PORT
+${VOL_TUNING}    volumes:
+      - /opt/seaweedfs/volume:/data
+    ports:
+      - "$CLUSTER_VOLUME_PORT:$CLUSTER_VOLUME_PORT"
+      - "$CLUSTER_VOLUME_GRPC_PORT:$CLUSTER_VOLUME_GRPC_PORT"
+    networks:
+      - seaweed_net
+    restart: unless-stopped
+EOF
+}
+
+generate_join_outputs () {
+  cat <<EOF | tee -a seaweedfs-install.log
+
+# -- SeaweedFS Volume Node Joined - $(date) -- #
+
+  This host is now a SeaweedFS volume node in the cluster.
+  Joined master:        $CLUSTER_MASTER
+  Advertised volume:    $MGMT_IP:$CLUSTER_VOLUME_PORT (grpc $CLUSTER_VOLUME_GRPC_PORT)
+  Topology:             dataCenter=$CLUSTER_DC rack=$CLUSTER_RACK
+  Data directory:       /opt/seaweedfs/volume
+  Compose file:         /opt/seaweedfs/seaweedfs-volume-compose.yaml
+
+  NEXT STEPS on the control-plane node (node 1) to make the cluster redundant with NO data loss:
+
+  1. Raise default replication for NEW writes (re-run install on node 1; brief data-plane restart, data kept):
+       sudo CLUSTER_MODE=cluster CLUSTER_REPLICATION=001 ./install-seaweedfs install
+
+  2. Replicate EXISTING data onto this node. fix.replication only acts on under-replicated volumes, so first
+     raise existing volumes' replication, then fix (a single weed-shell session; 'lock' is required):
+       printf 'lock\nvolume.configure.replication -replication 001\nvolume.fix.replication -apply\nunlock\n' \
+         | sudo docker exec -i seaweed-mini weed shell -master=localhost:$SWFS_MASTER_PORT
+
+  Verify (each volume should now report 2 copies, one on each node):
+       printf 'lock\nvolume.list\nunlock\n' | sudo docker exec -i seaweed-mini weed shell -master=localhost:$SWFS_MASTER_PORT
+EOF
+}
+
 uninstall_swfs () {
+  if [[ -f /opt/seaweedfs/seaweedfs-volume-compose.yaml ]]; then
+    echo "  Detected a SeaweedFS volume (join) node." | tee -a seaweedfs-uninstall.log
+    echo "  WARNING: replicate/evacuate this node's volumes to surviving nodes first (set replication, run" | tee -a seaweedfs-uninstall.log
+    echo "  'volume.fix.replication -apply' on node 1, confirm full replica counts) or data held only here is lost." | tee -a seaweedfs-uninstall.log
+    echo "  Stopping and removing the SeaweedFS volume container..." | tee -a seaweedfs-uninstall.log
+    docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml down
+    rm -rf /opt/seaweedfs
+    echo "# -- Volume node uninstall complete -- #" | tee -a seaweedfs-uninstall.log
+    return
+  fi
   if [[ -f /opt/monitoring/docker-compose.yml ]]; then
     echo "  Stopping monitoring stack (Loki, Grafana, Prometheus)..." | tee -a seaweedfs-uninstall.log
     docker compose -f /opt/monitoring/docker-compose.yml down
@@ -1113,7 +1234,9 @@ uninstall_swfs () {
 display_args() {
   echo "  AIR_GAPPED_MODE: $AIR_GAPPED_MODE"
   echo "  INSTALL_MODE: $INSTALL_MODE"
+  echo "  JOIN_MODE: $JOIN_MODE"
   echo "  UNINSTALL_MODE: $UNINSTALL_MODE"
+  echo "  CLUSTER_MODE: ${CLUSTER_MODE:-single}"
   echo "  DEBUG: $DEBUG"
   echo "  PUSH_MODE: $PUSH_MODE"
   echo "  SAVE_MODE: $SAVE_MODE"
@@ -1135,13 +1258,19 @@ Usage: $0 [command] [option]
 
 Commands:
   help              | Display this help message
-  install           | Install and configure SeaweedFS and Caddy (Docker Compose)
+  install           | Install and configure SeaweedFS and Caddy (Docker Compose). CLUSTER_MODE=cluster makes this a cluster-ready control plane.
+  join              | Join this host to an existing cluster as a discrete volume node (requires -master). Volume tier only — no Caddy/filer/S3/SMB/NFS/MQ.
   save              | Prepare offline archive for air-gapped deployment
-  uninstall         | Uninstall SeaweedFS and Caddy including data and configuration
+  uninstall         | Uninstall SeaweedFS and Caddy including data and configuration (auto-detects a volume node)
 
 Options:
   push              | Push SeaweedFS and Caddy images to a local registry, must include -registry option
   -registry         | Registry credentials for pushing or pulling from local registry (Format: -registry [registry:port username password])
+  -master           | Control-plane master to join (join only). Format: -master <host-or-ip>:$SWFS_MASTER_PORT
+
+Clustering (Phase 2 — start single-node, grow with no data loss):
+  CLUSTER_MODE=cluster ./install-seaweedfs install   # node 1: cluster-ready control plane (advertises host IP, publishes cluster ports)
+  ./install-seaweedfs join -master <node1-ip>:$SWFS_MASTER_PORT   # node 2/3: add a volume node, then run volume.fix.replication on node 1
 
 Examples:
   $0 install
@@ -1149,6 +1278,8 @@ Examples:
   $0 uninstall
   $0 install -registry myregistry:5000 user password
   $0 install push -registry myregistry:5000 user password
+  CLUSTER_MODE=cluster $0 install
+  $0 join -master 192.168.1.10:$SWFS_MASTER_PORT
 
 EOF
   exit 1
@@ -1175,6 +1306,18 @@ while [[ $# -gt 0 ]]; do
     uninstall)
       UNINSTALL_MODE=1
       ;;
+    join)
+      JOIN_MODE=1
+      ;;
+    -master)
+      CLUSTER_MASTER="${2:-}"
+      if [[ -z "$CLUSTER_MASTER" ]]; then
+        echo "Error: -master requires a control-plane master address. Format: -master <host-or-ip>:$SWFS_MASTER_PORT"
+        echo "Use '--help' for usage."
+        exit 1
+      fi
+      shift
+      ;;
     -registry)
       REGISTRY_MODE=1
       REGISTRY_INFO="${2:-}"
@@ -1199,9 +1342,16 @@ check_root_privileges
 os_check
 
 # -- Argument Validation -- #
-if [[ $INSTALL_MODE -eq 1 ]]; then 
-  if [[ $UNINSTALL_MODE -eq 1 || $SAVE_MODE -eq 1 ]]; then 
-    echo "Error: install, offline-prep, or uninstall cannot be used together."; exit 1; fi
+if [[ $INSTALL_MODE -eq 1 ]]; then
+  if [[ $UNINSTALL_MODE -eq 1 || $SAVE_MODE -eq 1 || $JOIN_MODE -eq 1 ]]; then
+    echo "Error: install, join, save, or uninstall cannot be used together."; exit 1; fi
+fi
+if [[ $JOIN_MODE -eq 1 ]]; then
+  if [[ $INSTALL_MODE -eq 1 || $SAVE_MODE -eq 1 || $UNINSTALL_MODE -eq 1 ]]; then
+    echo "Error: install, join, save, or uninstall cannot be used together."; exit 1; fi
+  if [[ -z "$CLUSTER_MASTER" ]]; then
+    echo "Error: 'join' requires -master <control-plane-host-or-ip>:$SWFS_MASTER_PORT (e.g. -master 192.168.1.10:$SWFS_MASTER_PORT)."
+    exit 1; fi
 fi
 if [[ $UNINSTALL_MODE -eq 1 ]]; then 
   if [[ $INSTALL_MODE -eq 1 || $SAVE_MODE -eq 1 ]]; then 
@@ -1254,6 +1404,10 @@ display_args
 if [[ $INSTALL_MODE -eq 1 ]]; then
   echo "### SeaweedFS/Caddy Installation Starting ###"
   install_swfs
+fi
+if [[ $JOIN_MODE -eq 1 ]]; then
+  echo "### SeaweedFS Volume Node Join Starting ###"
+  run_join
 fi
 if [[ $SAVE_MODE -eq 1 ]]; then
   echo "### SeaweedFS/Caddy Save Starting ###"
