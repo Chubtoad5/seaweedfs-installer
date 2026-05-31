@@ -199,7 +199,14 @@ run_smb () {
     cd $base_dir
   fi
   echo "  Configuring Samba..."
-  id "$SWFS_USER" &>/dev/null || useradd -M -s /sbin/nologin $SWFS_USER
+  # Create the SMB user idempotently. If a group of the same name already exists
+  # (e.g. Ubuntu ships a pre-existing 'admin' group and SWFS_USER defaults to 'admin'),
+  # attach to it with -g; otherwise useradd would abort and the SMB user is never created.
+  if ! id "$SWFS_USER" &>/dev/null; then
+    swfs_user_group_flag=""
+    getent group "$SWFS_USER" >/dev/null 2>&1 && swfs_user_group_flag="-g $SWFS_USER"
+    useradd -M -s /sbin/nologin $swfs_user_group_flag "$SWFS_USER"
+  fi
   (echo "$SWFS_PASSWORD"; echo "$SWFS_PASSWORD") | smbpasswd -a -s $SWFS_USER
   cp /etc/samba/smb.conf /etc/samba/smb.conf.bak
   cat >> /etc/samba/smb.conf <<EOF
@@ -1047,8 +1054,11 @@ EOF
   fi
   cd $base_dir/utilities
   debug_run ./image_pull_push.sh -f $base_dir/utilities/images.txt save
-  ./install_packages.sh save samba
-  ./install_packages.sh save nfs-kernel-server
+  # Save Samba + NFS packages into ONE offline-packages.tar.gz. install_packages.sh 'save'
+  # recreates the bundle on each call, so two separate calls left only the last package set
+  # in the archive (samba was lost) and broke the air-gapped SMB install. One combined call
+  # downloads both dependency trees into a single archive.
+  ./install_packages.sh save samba nfs-kernel-server
   cd $base_dir
   debug_run download_binaries
   cat > $base_dir/swfs-save-version.txt <<EOF
