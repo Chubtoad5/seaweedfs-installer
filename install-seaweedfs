@@ -9,8 +9,10 @@
 DEBUG=${DEBUG:-1}
 
 # - Container Images
-SWFS_IMAGE=${SWFS_IMAGE:-"chrislusf/seaweedfs:latest"}
-CADDY_IMAGE=${CADDY_IMAGE:-"caddy:latest"}
+# Pinned for reproducible online + air-gapped installs (a 'save' on one day and an 'install'
+# weeks later must use the same binary). Override at runtime to track a newer release.
+SWFS_IMAGE=${SWFS_IMAGE:-"chrislusf/seaweedfs:4.30"}
+CADDY_IMAGE=${CADDY_IMAGE:-"caddy:2.11.3"}
 
 # - Basic Authentication
 SWFS_USER=${SWFS_USER:-"admin"}             # Username for SeaweedFS Admin UI, Filer, Master
@@ -38,9 +40,13 @@ ENABLE_NFS=${ENABLE_NFS:-"true"}                              # Enable NFS expor
 ARTIFACTS_TO_DOWNLOAD=${ARTIFACTS_TO_DOWNLOAD:-""}             # List of artifact URLS to auto download with 'curl -k' and upload to SeaweedFS filer
 S3_BUCKET=${S3_BUCKET:-"charlie"}                              # S3 bucket name
 S3_USER=${S3_USER:-"$SWFS_USER"}                               # S3 user name
-S3_ACCESS_KEY=$(openssl rand -hex 8)                           # S3 access key
-S3_SECRET_KEY=$(openssl rand -hex 16)                          # S3 secret key
+S3_ACCESS_KEY=${S3_ACCESS_KEY:-$(openssl rand -hex 8)}         # S3 access key (override to pin; otherwise random per install)
+S3_SECRET_KEY=${S3_SECRET_KEY:-$(openssl rand -hex 16)}        # S3 secret key (override to pin; otherwise random per install)
 ENABLE_MQ=${ENABLE_MQ:-"true"}                               # Install SeaweedMQ message broker and agent
+
+# - Volume server tuning (optional; empty = use 'weed mini' small/dev defaults)
+VOLUME_INDEX=${VOLUME_INDEX:-""}                # [memory|leveldb|leveldbMedium|leveldbLarge] - 'leveldb' lowers RAM use for many small files on edge hosts
+VOLUME_SIZE_LIMIT_MB=${VOLUME_SIZE_LIMIT_MB:-""}  # Master stops directing writes to volumes larger than this (mini auto-sizes 64-1024MB if unset)
 
 # Monitoring Stack Configuration
 ENABLE_MONITORING=${ENABLE_MONITORING:-"true"}
@@ -97,7 +103,7 @@ install_swfs () {
     response_code=$api_result
     if [[ -n $response_code && $response_code -ge "200" && $response_code -lt "300" ]]; then
       echo "  Creating default artifact directory on SeaweedFS Filer..."
-      docker exec -it seaweed-mini curl -X POST http://localhost:8888/$DEFAULT_FILER_DIR_NAME/ && echo
+      docker exec -i seaweed-mini curl -X POST http://localhost:8888/$DEFAULT_FILER_DIR_NAME/ && echo
       upload_binaries
       break
     fi
@@ -159,7 +165,7 @@ EOF
     fi
   else
     # AIR_GAPPED_MODE is set
-    for file in "$base_dir/utilities/container_images_*.tar.gz"; do
+    for file in $base_dir/utilities/container_images_*.tar.gz; do
       if [[ $PUSH_MODE -eq 1 ]]; then
         $base_dir/utilities/image_pull_push.sh -f $file push $REGISTRY_INFO $REG_USER $REG_PASS
       else
@@ -178,7 +184,8 @@ EOF
 }
 
 run_smb () {
-  if [[ $ID != "ubuntu" ]]; then
+  # Debian/Ubuntu name the unit 'smbd'; RHEL/Rocky/SLES use 'smb'
+  if [[ $ID != "ubuntu" && $ID != "debian" ]]; then
     SMB_SERVICE="smb"
   fi
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
@@ -192,7 +199,7 @@ run_smb () {
     cd $base_dir
   fi
   echo "  Configuring Samba..."
-  useradd -M -s /sbin/nologin $SWFS_USER
+  id "$SWFS_USER" &>/dev/null || useradd -M -s /sbin/nologin $SWFS_USER
   (echo "$SWFS_PASSWORD"; echo "$SWFS_PASSWORD") | smbpasswd -a -s $SWFS_USER
   cp /etc/samba/smb.conf /etc/samba/smb.conf.bak
   cat >> /etc/samba/smb.conf <<EOF
@@ -358,6 +365,10 @@ generate_compose_file () {
   if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
     CADDY_MONITORING_PORT="      - \"$GRAFANA_PORT:$GRAFANA_PORT\""
   fi
+  # Pre-compute optional 'weed mini' tuning flags (folded into the command: > block)
+  local MINI_TUNING=""
+  [[ -n "$VOLUME_INDEX" ]] && MINI_TUNING+="      -volume.index=$VOLUME_INDEX"$'\n'
+  [[ -n "$VOLUME_SIZE_LIMIT_MB" ]] && MINI_TUNING+="      -master.volumeSizeLimitMB=$VOLUME_SIZE_LIMIT_MB"$'\n'
   echo "  Creating seaweedfs-compose.yaml..." | tee -a seaweedfs-install.log
   cat > /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
 networks:
@@ -373,7 +384,7 @@ services:
       -admin.password "$SWFS_PASSWORD"
       -dir=/data
       -webdav=false
-    volumes:
+${MINI_TUNING}    volumes:
       - /opt/seaweedfs/mini:/data
     networks:
       - seaweed_net
@@ -410,6 +421,9 @@ EOF
       - "$MQ_BROKER_PORT:$MQ_BROKER_PORT"
     networks:
       - seaweed_net
+    restart: unless-stopped
+    depends_on:
+      - seaweed-mini
 EOF
   fi
   if [[ ${ENABLE_SMB,,} == "true" || ${ENABLE_NFS,,} == "true" ]]; then
@@ -668,7 +682,7 @@ download_image_pull_push () {
 }
 
 download_install_packages () {
-  if [[ ! -f $base_dir/utilities/install-packages.sh ]]; then
+  if [[ ! -f $base_dir/utilities/install_packages.sh ]]; then
     echo "  Downloading install_packages.sh..."
     curl -sfL https://github.com/Chubtoad5/install-packages/raw/refs/heads/main/install_packages.sh  -o $base_dir/utilities/install_packages.sh
     chmod +x $base_dir/utilities/install_packages.sh
@@ -689,8 +703,7 @@ The following services are accessible by IP or FQDN if DNS is configured:
   Filer UI:     https://$SWFS_FILER_FQDN:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME
   S3 Endpoint:  https://$SWFS_S3_FQDN:$SWFS_S3_PORT
   Admin UI:     https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
-  MQTT Broker:  $HOST_FQDN:$MQ_BROKER_PORT
-  MQTT Agent:   $HOST_FQDN:$MQ_AGENT_PORT
+  MQ Broker:    $HOST_FQDN:$MQ_BROKER_PORT
 
 To run weed commands:  docker exec -it seaweed-mini weed <command>
 To run caddy commands: docker exec -it seaweed-caddy caddy <command>
@@ -1064,6 +1077,9 @@ uninstall_swfs () {
   rm -rf /opt/seaweedfs
   rm -rf /opt/caddy
   if [[ ${ENABLE_SMB,,} == "true" ]]; then
+    if [[ $ID != "ubuntu" && $ID != "debian" ]]; then
+      SMB_SERVICE="smb"
+    fi
     echo "  Reverting to default Samba configuration..." | tee -a seaweedfs-uninstall.log
     rm -f /etc/samba/smb.conf
     mv /etc/samba/smb.conf.bak /etc/samba/smb.conf

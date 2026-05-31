@@ -178,8 +178,8 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | Variable | Default Value | Description |
 |:---------|:-------------|:------------|
 | `DEBUG` | `1` | When disabled (`0`), script runs in silent mode |
-| `SWFS_IMAGE` | `chrislusf/seaweedfs:latest` | Container image for SeaweedFS |
-| `CADDY_IMAGE` | `caddy:latest` | Container image for Caddy |
+| `SWFS_IMAGE` | `chrislusf/seaweedfs:4.30` | Container image for SeaweedFS (pinned for reproducible online/air-gapped installs; override to track a newer release) |
+| `CADDY_IMAGE` | `caddy:2.11.3` | Container image for Caddy (pinned; override to track a newer release) |
 | `SWFS_USER` | `admin` | Username for Admin UI, Filer, Master, and Caddy basic auth |
 | `SWFS_PASSWORD` | `changeme` | Password for Admin UI, Filer, Master, and Caddy basic auth |
 | `HOST_FQDN` | `$(hostname).edge.lab` | FQDN for the host (e.g. `myhost.mydomain.com`) |
@@ -198,9 +198,11 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `MQ_BROKER_PORT` | `17777` | TCP port for SeaweedMQ broker |
 | `S3_BUCKET` | `charlie` | Default S3 bucket name |
 | `S3_USER` | `$SWFS_USER` | S3 API username |
-| `S3_ACCESS_KEY` | *(randomly generated)* | S3 access key (`openssl rand -hex 8`) |
-| `S3_SECRET_KEY` | *(randomly generated)* | S3 secret key (`openssl rand -hex 16`) |
+| `S3_ACCESS_KEY` | *(randomly generated)* | S3 access key (`openssl rand -hex 8`); set explicitly to pin a stable key across re-installs |
+| `S3_SECRET_KEY` | *(randomly generated)* | S3 secret key (`openssl rand -hex 16`); set explicitly to pin a stable key across re-installs |
 | `ARTIFACTS_TO_DOWNLOAD` | `""` | Space-separated list of URLs to download and upload to the default Filer path |
+| `VOLUME_INDEX` | `""` | Optional volume index mode `[memory\|leveldb\|leveldbMedium\|leveldbLarge]`. `leveldb` lowers volume-server RAM for many small files on edge hosts. Empty = `weed mini` default (`memory`). |
+| `VOLUME_SIZE_LIMIT_MB` | `""` | Optional cap (MB) after which the master stops directing writes to a volume. Empty = `weed mini` auto-sizing (64–1024 MB). |
 
 ### Monitoring Stack Variables
 
