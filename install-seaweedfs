@@ -77,6 +77,13 @@ PROMETHEUS_EXT_PORT=${PROMETHEUS_EXT_PORT:-"9090"}               # External Prom
 LOKI_BUCKET=${LOKI_BUCKET:-"loki-logs"}                          # S3 bucket for Loki log storage
 CLUSTER_NAME=${CLUSTER_NAME:-"edge-lab"}                        # Cluster label applied to all metrics and logs
 
+# -- Licensing (air-gap bundle copyleft compliance) -- #
+# When monitoring is bundled, the save archive redistributes Grafana and Loki, which
+# are AGPL-3.0. The save flow writes a LICENSES/ dir with a third-party manifest and a
+# written offer; with BUNDLE_COPYLEFT_SOURCE=true it also fetches their pinned source.
+LICENSE_OFFER_CONTACT=${LICENSE_OFFER_CONTACT:-"the Chubtoad5 project via https://github.com/Chubtoad5"}
+BUNDLE_COPYLEFT_SOURCE=${BUNDLE_COPYLEFT_SOURCE:-"true"}        # also bundle AGPL/GPL source tarballs (set false = offer only)
+
 # -- INTERNAL VARIABLES (do not edit) -- #
 AIR_GAPPED_MODE=0
 SAVE_MODE=0
@@ -1072,6 +1079,82 @@ os_check () {
   fi
 }
 
+# best-effort source fetch; never fails the save ($1=url $2=dest $3=label)
+fetch_copyleft_source() {
+  if curl -fsSL --retry 2 -o "$2" "$1" 2>/dev/null; then
+    echo "    bundled $3 source: $(basename "$2") ($(du -h "$2" | cut -f1))"
+  else
+    echo "    NOTE: could not fetch $3 source ($1) — the written offer covers it."
+    rm -f "$2"
+  fi
+}
+
+# Write a LICENSES/ dir into the air-gap archive: a third-party manifest for all
+# bundled images, plus (when the AGPL monitoring stack is bundled) an AGPLv3 written
+# offer for Grafana + Loki and, with BUNDLE_COPYLEFT_SOURCE=true, their pinned source
+# tarballs. Satisfies the GPL/AGPL "corresponding source or written offer" requirement.
+generate_bundle_licenses() {
+  local dir="$base_dir/LICENSES"
+  rm -rf "$dir"; mkdir -p "$dir"
+  local mon="no"; [[ ${ENABLE_MONITORING,,} == "true" ]] && mon="yes"
+  {
+    echo "Third-party components redistributed in this SeaweedFS air-gap bundle"
+    echo "Generated: $(date)"
+    echo ""
+    printf "%-34s %-11s %s\n" "Container image" "License" "Upstream source"
+    printf "%-34s %-11s %s\n" "---------------------------------" "-----------" "--------------------------------------"
+    printf "%-34s %-11s %s\n" "$SWFS_IMAGE"  "Apache-2.0" "https://github.com/seaweedfs/seaweedfs"
+    printf "%-34s %-11s %s\n" "$CADDY_IMAGE" "Apache-2.0" "https://github.com/caddyserver/caddy"
+    if [[ "$mon" == "yes" ]]; then
+      printf "%-34s %-11s %s\n" "$PROMETHEUS_EXT_IMAGE" "Apache-2.0" "https://github.com/prometheus/prometheus"
+      printf "%-34s %-11s %s\n" "$GRAFANA_IMAGE" "AGPL-3.0" "https://github.com/grafana/grafana (see WRITTEN_OFFER.txt)"
+      printf "%-34s %-11s %s\n" "$LOKI_IMAGE"    "AGPL-3.0" "https://github.com/grafana/loki (see WRITTEN_OFFER.txt)"
+    fi
+    echo ""
+    echo "OS packages (samba, nfs-kernel-server) are distribution packages under their own"
+    echo "licenses. The installer scripts themselves are Apache-2.0 (Chubtoad5)."
+  } > "$dir/THIRD_PARTY_NOTICES.txt"
+
+  if [[ "$mon" == "yes" ]]; then
+    local gver="${GRAFANA_IMAGE##*:}" lver="${LOKI_IMAGE##*:}"
+    cat > "$dir/WRITTEN_OFFER.txt" <<EOF
+WRITTEN OFFER FOR CORRESPONDING SOURCE CODE (AGPL-3.0)
+
+This air-gap bundle redistributes the following components in object (image) form,
+each licensed under the GNU Affero General Public License, version 3:
+
+  Grafana   ($GRAFANA_IMAGE)
+  Loki      ($LOKI_IMAGE)
+
+In accordance with AGPLv3 section 6, the distributor of this bundle hereby makes a
+written offer, valid for three (3) years from the date this bundle was created
+($(date +%Y-%m-%d)), to give any third party who possesses this bundle a complete
+machine-readable copy of the corresponding source code for these components, for a
+charge no more than the cost of physically performing the source distribution.
+
+These components are redistributed UNMODIFIED; the AGPLv3 section 13 obligation to
+offer source to remote users of a *modified* program therefore does not apply here.
+
+The corresponding source is also publicly available from upstream:
+  Grafana: https://github.com/grafana/grafana   (tag v${gver})
+  Loki:    https://github.com/grafana/loki       (tag v${lver})
+
+To request the source on a physical medium, contact: ${LICENSE_OFFER_CONTACT}
+
+This offer is independent of the Apache-2.0 license covering the installer scripts.
+EOF
+    if [[ ${BUNDLE_COPYLEFT_SOURCE,,} == "true" && $AIR_GAPPED_MODE -eq 0 ]]; then
+      mkdir -p "$dir/source"
+      echo "  Fetching AGPL corresponding source (Grafana/Loki) — set BUNDLE_COPYLEFT_SOURCE=false to skip..."
+      fetch_copyleft_source "https://github.com/grafana/grafana/archive/refs/tags/v${gver}.tar.gz" "$dir/source/grafana-v${gver}-source.tar.gz" "Grafana"
+      fetch_copyleft_source "https://github.com/grafana/loki/archive/refs/tags/v${lver}.tar.gz" "$dir/source/loki-v${lver}-source.tar.gz" "Loki"
+    fi
+    echo "  Wrote LICENSES/ (manifest + AGPL written offer for Grafana+Loki)."
+  else
+    echo "  Wrote LICENSES/ (third-party manifest; monitoring not bundled, no copyleft images)."
+  fi
+}
+
 run_save () {
   echo "  Preparing SeaweedFS offline archive..."
   debug_run download_image_pull_push
@@ -1105,7 +1188,8 @@ $SWFS_IMAGE
 $CADDY_IMAGE
 $(if [[ ${ENABLE_MONITORING,,} == "true" ]]; then printf "%s\n%s\n%s" "$LOKI_IMAGE" "$GRAFANA_IMAGE" "$PROMETHEUS_EXT_IMAGE"; fi)
 EOF
-  tar czf $base_dir/swfs-save.tar.gz utilities install-seaweedfs swfs-save-version.txt
+  generate_bundle_licenses
+  tar czf $base_dir/swfs-save.tar.gz utilities install-seaweedfs swfs-save-version.txt LICENSES
   echo "  created 'swfs-save.tar.gz' for air-gapped deployment."
 }
 

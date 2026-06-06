@@ -100,6 +100,11 @@ Creates an offline archive (`swfs-save.tar.gz`) for air-gapped deployment. The a
 - Container images: SeaweedFS, Caddy, and (when `ENABLE_MONITORING=true`) Loki, Grafana, and Prometheus
 - Package installers for Samba and NFS
 - Any binaries listed in `ARTIFACTS_TO_DOWNLOAD`
+- A `LICENSES/` directory: a third-party component manifest and, when the monitoring stack is bundled, an
+  **AGPL-3.0 written offer** for the redistributed Grafana and Loki images plus (by default) their pinned
+  **corresponding source** tarballs. Tune with:
+  - `BUNDLE_COPYLEFT_SOURCE` (default `true`) — set `false` to ship the written offer only (no source tarballs)
+  - `LICENSE_OFFER_CONTACT` — the contact named in the written offer
 
 To use the archive on the target machine (the archive may be renamed before transfer):
 ```bash
