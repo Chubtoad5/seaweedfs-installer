@@ -1111,47 +1111,54 @@ generate_bundle_licenses() {
       printf "%-34s %-11s %s\n" "$LOKI_IMAGE"    "AGPL-3.0" "https://github.com/grafana/loki (see WRITTEN_OFFER.txt)"
     fi
     echo ""
-    echo "OS packages (samba, nfs-kernel-server) are distribution packages under their own"
-    echo "licenses. The installer scripts themselves are Apache-2.0 (Chubtoad5)."
+    echo "OS distribution packages bundled via install-packages (each keeps its own license):"
+    echo "  samba ............... GPL-3.0-or-later   (see WRITTEN_OFFER.txt)"
+    echo "  nfs-kernel-server ... GPL-2.0-or-later   (see WRITTEN_OFFER.txt)"
+    echo "The installer scripts themselves are Apache-2.0 (Chubtoad5)."
   } > "$dir/THIRD_PARTY_NOTICES.txt"
 
-  if [[ "$mon" == "yes" ]]; then
-    local gver="${GRAFANA_IMAGE##*:}" lver="${LOKI_IMAGE##*:}"
-    cat > "$dir/WRITTEN_OFFER.txt" <<EOF
-WRITTEN OFFER FOR CORRESPONDING SOURCE CODE (AGPL-3.0)
-
-This air-gap bundle redistributes the following components in object (image) form,
-each licensed under the GNU Affero General Public License, version 3:
-
-  Grafana   ($GRAFANA_IMAGE)
-  Loki      ($LOKI_IMAGE)
-
-In accordance with AGPLv3 section 6, the distributor of this bundle hereby makes a
-written offer, valid for three (3) years from the date this bundle was created
-($(date +%Y-%m-%d)), to give any third party who possesses this bundle a complete
-machine-readable copy of the corresponding source code for these components, for a
-charge no more than the cost of physically performing the source distribution.
-
-These components are redistributed UNMODIFIED; the AGPLv3 section 13 obligation to
-offer source to remote users of a *modified* program therefore does not apply here.
-
-The corresponding source is also publicly available from upstream:
-  Grafana: https://github.com/grafana/grafana   (tag v${gver})
-  Loki:    https://github.com/grafana/loki       (tag v${lver})
-
-To request the source on a physical medium, contact: ${LICENSE_OFFER_CONTACT}
-
-This offer is independent of the Apache-2.0 license covering the installer scripts.
-EOF
-    if [[ ${BUNDLE_COPYLEFT_SOURCE,,} == "true" && $AIR_GAPPED_MODE -eq 0 ]]; then
-      mkdir -p "$dir/source"
-      echo "  Fetching AGPL corresponding source (Grafana/Loki) — set BUNDLE_COPYLEFT_SOURCE=false to skip..."
-      fetch_copyleft_source "https://github.com/grafana/grafana/archive/refs/tags/v${gver}.tar.gz" "$dir/source/grafana-v${gver}-source.tar.gz" "Grafana"
-      fetch_copyleft_source "https://github.com/grafana/loki/archive/refs/tags/v${lver}.tar.gz" "$dir/source/loki-v${lver}-source.tar.gz" "Loki"
+  # The bundle ALWAYS redistributes GPL OS packages (samba GPL-3.0, nfs GPL-2.0) and,
+  # when monitoring is on, AGPL Grafana + Loki images. Always write a covering offer.
+  local gver="${GRAFANA_IMAGE##*:}" lver="${LOKI_IMAGE##*:}"
+  {
+    echo "WRITTEN OFFER FOR CORRESPONDING SOURCE CODE"
+    echo ""
+    echo "This air-gap bundle redistributes the following copyleft-licensed components:"
+    echo ""
+    echo "OS distribution packages (bundled via install-packages):"
+    echo "  samba ............... GPL-3.0-or-later"
+    echo "  nfs-kernel-server ... GPL-2.0-or-later"
+    echo "Their corresponding source is available from the OS distribution's own source"
+    echo "archives ('apt-get source <pkg>' / the distro source mirrors for the bundled version)."
+    if [[ "$mon" == "yes" ]]; then
+      echo ""
+      echo "Container images (AGPL-3.0), redistributed UNMODIFIED (so AGPLv3 s.13 does not apply):"
+      echo "  Grafana ($GRAFANA_IMAGE)  ->  https://github.com/grafana/grafana  (tag v${gver})"
+      echo "  Loki    ($LOKI_IMAGE)      ->  https://github.com/grafana/loki      (tag v${lver})"
     fi
-    echo "  Wrote LICENSES/ (manifest + AGPL written offer for Grafana+Loki)."
+    echo ""
+    echo "In accordance with GPLv2 section 3 / GPLv3 + AGPLv3 section 6, the distributor of"
+    echo "this bundle hereby makes a written offer, valid for three (3) years from the date"
+    echo "this bundle was created ($(date +%Y-%m-%d)), to give any third party who possesses"
+    echo "this bundle a complete machine-readable copy of the corresponding source code for"
+    echo "the components above, for no more than the cost of physically performing the"
+    echo "source distribution."
+    echo ""
+    echo "To request the source on a physical medium, contact: ${LICENSE_OFFER_CONTACT}"
+    echo ""
+    echo "This offer is independent of the Apache-2.0 license covering the installer scripts."
+  } > "$dir/WRITTEN_OFFER.txt"
+
+  if [[ "$mon" == "yes" && ${BUNDLE_COPYLEFT_SOURCE,,} == "true" && $AIR_GAPPED_MODE -eq 0 ]]; then
+    mkdir -p "$dir/source"
+    echo "  Fetching AGPL corresponding source (Grafana/Loki) — set BUNDLE_COPYLEFT_SOURCE=false to skip..."
+    fetch_copyleft_source "https://github.com/grafana/grafana/archive/refs/tags/v${gver}.tar.gz" "$dir/source/grafana-v${gver}-source.tar.gz" "Grafana"
+    fetch_copyleft_source "https://github.com/grafana/loki/archive/refs/tags/v${lver}.tar.gz" "$dir/source/loki-v${lver}-source.tar.gz" "Loki"
+  fi
+  if [[ "$mon" == "yes" ]]; then
+    echo "  Wrote LICENSES/ (manifest + written offer: GPL OS packages + AGPL Grafana/Loki)."
   else
-    echo "  Wrote LICENSES/ (third-party manifest; monitoring not bundled, no copyleft images)."
+    echo "  Wrote LICENSES/ (manifest + written offer: GPL OS packages samba/nfs)."
   fi
 }
 
