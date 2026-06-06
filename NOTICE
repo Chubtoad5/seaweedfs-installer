@@ -1,0 +1,23 @@
+SeaweedFS Installer
+Copyright (C) 2026 Chubtoad5
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This is an original automation script. It deploys and orchestrates the following
+third-party open-source software, each under its own license (all credit to their
+respective authors):
+
+  SeaweedFS               Apache-2.0   https://github.com/seaweedfs/seaweedfs
+  Caddy                   Apache-2.0   https://github.com/caddyserver/caddy
+  Prometheus              Apache-2.0   https://github.com/prometheus/prometheus
+  Docker / Moby           Apache-2.0   https://github.com/moby/moby
+  Grafana                 AGPL-3.0     https://github.com/grafana/grafana
+  Grafana Loki            AGPL-3.0     https://github.com/grafana/loki
+
+The optional monitoring stack (ENABLE_MONITORING) deploys **Grafana and Loki,
+which are licensed AGPL-3.0**. When the `save`/`push` modes bundle or push those
+images, you must retain their license text and provide the corresponding source
+or a written offer per the AGPL. (AGPL §13's remote-source obligation applies only
+if Grafana/Loki are modified; this project ships them unmodified.) The permissive
+components (SeaweedFS, Caddy, Prometheus, Docker) require only that you retain
+their copyright/license notices and any bundled NOTICE files.
