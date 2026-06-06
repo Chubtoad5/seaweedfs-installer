@@ -288,3 +288,17 @@ ls -al /mnt/
 ```bash
 sudo docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
 ```
+
+---
+
+## Upstream / Credits
+
+This project automates the following open-source software; all credit to their authors. See [NOTICE](NOTICE) for
+the full third-party list + licenses.
+
+- SeaweedFS (Apache-2.0), Caddy (Apache-2.0), Prometheus (Apache-2.0), Docker (Apache-2.0)
+- Optional monitoring: **Grafana (AGPL-3.0)** + **Grafana Loki (AGPL-3.0)** — when bundled/pushed, retain their license text and provide the corresponding source or a written offer per the AGPL
+
+## License
+
+Licensed under the **Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
