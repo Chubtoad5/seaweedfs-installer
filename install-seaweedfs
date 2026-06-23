@@ -76,6 +76,7 @@ LOKI_PORT=${LOKI_PORT:-"3100"}                                   # Loki push/que
 PROMETHEUS_EXT_PORT=${PROMETHEUS_EXT_PORT:-"9090"}               # External Prometheus remote-write receiver port
 LOKI_BUCKET=${LOKI_BUCKET:-"loki-logs"}                          # S3 bucket for Loki log storage
 CLUSTER_NAME=${CLUSTER_NAME:-"edge-lab"}                        # Cluster label applied to all metrics and logs
+EXTRA_BUCKETS=${EXTRA_BUCKETS:-""}                               # Space-separated list of additional S3 buckets to create at install time (e.g. per-cluster Velero buckets)
 
 # -- Licensing (air-gap bundle copyleft compliance) -- #
 # When monitoring is bundled, the save archive redistributes Grafana and Loki, which
@@ -147,6 +148,9 @@ install_swfs () {
   if [[ ${ENABLE_MONITORING,,} == "true" && ! "$all_buckets" =~ (^| )$LOKI_BUCKET( |$) ]]; then
     all_buckets="$all_buckets $LOKI_BUCKET"
   fi
+  for extra in $EXTRA_BUCKETS; do
+    [[ "$all_buckets" =~ (^| )$extra( |$) ]] || all_buckets="$all_buckets $extra"
+  done
   for bucket in $all_buckets; do
     echo "  Creating bucket: $bucket"
     echo "s3.bucket.create -name $bucket -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
@@ -768,6 +772,7 @@ S3 Details:
   API Key:  $S3_ACCESS_KEY
   API Secret: $S3_SECRET_KEY
   Default Bucket: $S3_BUCKET
+  Extra Buckets: ${EXTRA_BUCKETS:-<none>}
 
   >>> Landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT <<<
   >>>               https://$MGMT_IP:$SWFS_ADMIN_PORT <<<
