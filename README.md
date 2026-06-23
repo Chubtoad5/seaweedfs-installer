@@ -202,6 +202,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `ENABLE_MQ` | `true` | Deploy SeaweedMQ message broker |
 | `MQ_BROKER_PORT` | `17777` | TCP port for SeaweedMQ broker |
 | `S3_BUCKET` | `charlie` | Default S3 bucket name |
+| `EXTRA_BUCKETS` | `""` | Space-separated list of additional S3 bucket names to create at install time. Useful for pre-creating per-cluster Velero buckets when the cluster inventory is known. Buckets are deduplicated against `S3_BUCKET` and `LOKI_BUCKET`. |
 | `S3_USER` | `$SWFS_USER` | S3 API username |
 | `S3_ACCESS_KEY` | *(randomly generated)* | S3 access key (`openssl rand -hex 8`); set explicitly to pin a stable key across re-installs |
 | `S3_SECRET_KEY` | *(randomly generated)* | S3 secret key (`openssl rand -hex 16`); set explicitly to pin a stable key across re-installs |
