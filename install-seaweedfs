@@ -37,6 +37,7 @@ MQ_BROKER_PORT=${MQ_BROKER_PORT:-"17777"}
 DEFAULT_FILER_DIR_NAME=${DEFAULT_FILER_DIR_NAME:-"artifacts"}  # Default directory on SeaweedFS Filer for artifacts
 ENABLE_SMB=${ENABLE_SMB:-"true"}                               # Enable Samba smb share with basic authentication
 ENABLE_NFS=${ENABLE_NFS:-"true"}                              # Enable NFS export with NFSv3, no authentication
+NFS_META_REFRESH_SEC=${NFS_META_REFRESH_SEC:-"30"}            # NFS re-export cache coherence: server drops its dentry/inode cache every N sec so out-of-band writes (filer HTTP API, S3, web uploader) become visible to NFS clients within ~N sec. 0 = disable. See README "NFS consistency model".
 ARTIFACTS_TO_DOWNLOAD=${ARTIFACTS_TO_DOWNLOAD:-""}             # List of artifact URLS to auto download with 'curl -k' and upload to SeaweedFS filer
 S3_BUCKET=${S3_BUCKET:-"charlie"}                              # S3 bucket name
 S3_USER=${S3_USER:-"$SWFS_USER"}                               # S3 user name
@@ -275,14 +276,69 @@ run_nfs () {
     cd $base_dir
   fi
   echo "  Configuring NFS export..."
+  # fsid= is REQUIRED here: /mnt/seaweed is a FUSE (weed mount) filesystem, which
+  # has no stable device UUID for knfsd to derive filehandles from. Without an
+  # explicit fsid, exportfs warns/refuses and clients hit ESTALE after a weed
+  # mount or server restart. fsid=1 (never 0 — 0 is the NFSv4 pseudo-root).
   cat >> /etc/exports <<EOF
-/mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure) # seaweedfs-installer
+/mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=1) # seaweedfs-installer
 EOF
   echo "  Exporting NFS filesystem..."
   exportfs -ra
   echo "  Restarting NFS service..."
   systemctl enable $NFS_SERVICE
   systemctl restart $NFS_SERVICE
+  configure_nfs_meta_refresh
+}
+
+# NFSv3 re-export of the weed-mount FUSE filesystem is only *eventually* consistent
+# for writes made OUTSIDE the NFS path (filer HTTP API, S3 gateway, the Caddy web
+# uploader, another node). Root cause, confirmed by testing: the filer does not bump
+# a directory's mtime when a child is added/removed, so NFS clients never get the
+# "directory changed" signal that would invalidate their cached listing — and the
+# staleness actually lives in THIS server's kernel dentry/inode cache as consumed by
+# knfsd. No NFS client mount option (noac/actimeo=0/nordirplus/lookupcache), no weed
+# -cacheMetaTtlSec value, and no weed version bump fixes it; only dropping this
+# server's dentry/inode cache does. This timer does exactly that on a fixed interval,
+# bounding out-of-band-write visibility to ~NFS_META_REFRESH_SEC. Writes made THROUGH
+# NFS are already coherent between clients (they share one knfsd). Set
+# NFS_META_REFRESH_SEC=0 to disable (e.g. if every writer uses the NFS path, or each
+# client runs its own weed mount instead — see README "NFS consistency model").
+configure_nfs_meta_refresh () {
+  local svc="/etc/systemd/system/seaweedfs-nfs-meta-refresh.service"
+  local tmr="/etc/systemd/system/seaweedfs-nfs-meta-refresh.timer"
+  if [[ ! "$NFS_META_REFRESH_SEC" =~ ^[0-9]+$ || "$NFS_META_REFRESH_SEC" -eq 0 ]]; then
+    echo "  NFS metadata refresh disabled (NFS_META_REFRESH_SEC=$NFS_META_REFRESH_SEC)."
+    systemctl disable --now seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
+    rm -f "$svc" "$tmr"
+    systemctl daemon-reload
+    return
+  fi
+  echo "  Installing NFS metadata refresh timer (every ${NFS_META_REFRESH_SEC}s)..."
+  cat > "$svc" <<EOF
+[Unit]
+Description=SeaweedFS NFS re-export metadata cache refresh
+Documentation=https://github.com/Chubtoad5/seaweedfs-installer
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'sync; echo 2 > /proc/sys/vm/drop_caches'
+EOF
+  cat > "$tmr" <<EOF
+[Unit]
+Description=Periodic SeaweedFS NFS metadata cache refresh (every ${NFS_META_REFRESH_SEC}s)
+
+[Timer]
+OnBootSec=${NFS_META_REFRESH_SEC}s
+OnUnitActiveSec=${NFS_META_REFRESH_SEC}s
+AccuracySec=1s
+Unit=seaweedfs-nfs-meta-refresh.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now seaweedfs-nfs-meta-refresh.timer
 }
 
 generate_caddyfile () {
@@ -1323,6 +1379,10 @@ uninstall_swfs () {
     sed -i '/ # seaweedfs-installer$/d' /etc/exports
     exportfs -ra
     systemctl restart $NFS_SERVICE
+    echo "  Removing NFS metadata refresh timer..." | tee -a seaweedfs-uninstall.log
+    systemctl disable --now seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
+    rm -f /etc/systemd/system/seaweedfs-nfs-meta-refresh.service /etc/systemd/system/seaweedfs-nfs-meta-refresh.timer
+    systemctl daemon-reload
   fi
   echo "# -- Uninstall tasks complete -- #" | tee -a seaweedfs-uninstall.log
 }

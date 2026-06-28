@@ -199,6 +199,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `DEFAULT_FILER_DIR_NAME` | `artifacts` | Default Filer directory for user data |
 | `ENABLE_SMB` | `true` | Enable Samba (SMB) share with basic auth on the default Filer path |
 | `ENABLE_NFS` | `true` | Enable NFS export (NFSv3, no authentication) of the default Filer path |
+| `NFS_META_REFRESH_SEC` | `30` | NFS re-export cache-coherence interval (seconds). The server drops its dentry/inode cache every N seconds so writes made *outside* the NFS path (filer HTTP API, S3, web uploader, another node) become visible to NFS clients within ~N seconds. `0` disables it. See [NFS consistency model](#nfs-consistency-model). |
 | `ENABLE_MQ` | `true` | Deploy SeaweedMQ message broker |
 | `MQ_BROKER_PORT` | `17777` | TCP port for SeaweedMQ broker |
 | `S3_BUCKET` | `charlie` | Default S3 bucket name |
@@ -252,6 +253,51 @@ docker exec -it seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > s
 ```
 
 ## Known Issues
+
+### NFS consistency model
+
+The NFS share is a **knfsd re-export of the `weed mount` FUSE filesystem**. This makes it
+behave differently from a native filesystem in one specific way you should understand before
+relying on it for multi-writer workflows.
+
+**Writes made *through* the NFS mount are coherent** between all NFS clients immediately —
+they share the single NFS server (`knfsd`) on the SeaweedFS host, whose cache is updated by
+the write itself.
+
+**Writes made *outside* the NFS path are only *eventually* consistent.** "Outside" means the
+filer HTTP API (`curl …filer:8888/…`), the S3 gateway, the Caddy web uploader, or another
+cluster node. After such a write, NFS clients may keep showing a stale directory listing — a
+deleted file still appears, or a newly uploaded file is not yet visible. Root cause (confirmed
+by testing): the filer does not bump a directory's `mtime` when a child is added or removed, so
+NFS clients never receive the "directory changed" signal that would invalidate their cached
+listing, and the stale entries actually live in the **server's** kernel dentry/inode cache as
+served by `knfsd`. No NFS *client* mount option fixes this (`noac`, `actimeo=0`, `nordirplus`,
+and `lookupcache=none` were all tested and do not help), nor does any `weed mount`
+`-cacheMetaTtlSec` value or a newer `weed` version.
+
+**Mitigation (default on).** The installer enables a small systemd timer
+(`seaweedfs-nfs-meta-refresh.timer`) that drops the server's dentry/inode cache
+(`sync; echo 2 > /proc/sys/vm/drop_caches`) every **`NFS_META_REFRESH_SEC`** seconds (default
+`30`). This bounds out-of-band-write visibility to roughly that interval. Tune it lower for
+fresher listings (at the cost of more frequent cache drops) or set `NFS_META_REFRESH_SEC=0` to
+disable. Inspect it with:
+
+```bash
+systemctl status seaweedfs-nfs-meta-refresh.timer
+systemctl list-timers seaweedfs-nfs-meta-refresh.timer
+```
+
+**Want immediate (0-second) consistency for out-of-band writes?** Skip NFS on that client and
+have it run its own `weed mount` against the filer instead — the FUSE layer subscribes to filer
+metadata events and reflects changes in real time (the re-export is the only lossy hop). The
+NFS export remains the simplest option and is ideal for read-mostly or NFS-only-writer use.
+
+> The export line uses `fsid=1` (required — a FUSE filesystem has no stable device UUID for
+> `knfsd` to derive filehandles from; without it `exportfs` warns and clients hit `ESTALE`
+> across a `weed mount`/server restart). `fsid=1` belongs in the server's `/etc/exports`, not
+> the client's `/etc/fstab`.
+
+### Hung FUSE mount
 
 In rare occurrences, the `seaweed-mount` container may fail to start with:
 
