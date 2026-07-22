@@ -24,7 +24,7 @@ SWFS_ADMIN_FQDN=${SWFS_ADMIN_FQDN:-"admin.$HOST_FQDN"}     # FQDN for SeaweedFS 
 SWFS_MASTER_FQDN=${SWFS_MASTER_FQDN:-"master.$HOST_FQDN"}  # FQDN for SeaweedFS Master UI/API
 SWFS_FILER_FQDN=${SWFS_FILER_FQDN:-"filer.$HOST_FQDN"}     # FQDN for SeaweedFS Filer UI/API
 SWFS_S3_FQDN=${SWFS_S3_FQDN:-"s3.$HOST_FQDN"}              # FQDN for SeaweedFS S3 API
-MGMT_IP=$(hostname -I | awk '{print $1}')                  # Used as default_sni fallback for TLS in non-DNS environments
+MGMT_IP=${MGMT_IP:-$(hostname -I | awk '{print $1}')}      # Used as default_sni fallback for TLS in non-DNS environments (overridable, e.g. by ap-tools)
 
 # - Service TCP Ports # Volume Server uses port 9340 on internal docker network
 SWFS_ADMIN_PORT=${SWFS_ADMIN_PORT:-"443"}
@@ -104,61 +104,108 @@ ipv4_pattern='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]
 base_dir=$(pwd)
 SMB_SERVICE="smbd"
 NFS_SERVICE="nfs-server"
+NFS_PACKAGE="nfs-kernel-server"
+LOG_FILE="seaweedfs-install.log"
 
 # -- Functions -- #
 
+# Print an error, record it in the log, and exit non-zero. Callers (ap-tools) rely on
+# a truthful exit code: exit 0 means the requested operation actually succeeded.
+die() {
+  echo "ERROR: $*" >&2
+  echo "ERROR: $*" >> "$LOG_FILE" 2>/dev/null
+  exit 1
+}
+
+# Exact-match membership test: list_contains <needle> "<space separated list>"
+# (regex =~ matching false-positives on metacharacters in bucket names; this does not)
+list_contains() {
+  local needle="$1" item
+  for item in $2; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+# Dependency preflight for minimal images: fail early with a distro-appropriate hint
+# instead of an opaque failure mid-install.
+require_cmds() {
+  local missing=() c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  [[ ${#missing[@]} -eq 0 ]] && return 0
+  local hint="apt-get install -y"
+  case "$OS_ID" in
+    rhel|centos|rocky|almalinux|fedora) hint="dnf install -y" ;;
+    sles|opensuse-leap) hint="zypper install -y" ;;
+  esac
+  die "Missing required command(s): ${missing[*]}. Install them first, e.g.: sudo $hint ${missing[*]}"
+}
+
 install_swfs () {
-  echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a seaweedfs-install.log
+  echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a "$LOG_FILE"
   mkdir -p /opt/caddy/srv
   mkdir -p /opt/seaweedfs/mini
-  debug_run run_docker
+  debug_run run_docker || die "Docker/image preparation failed."
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
-    download_binaries
+    download_binaries || die "Artifact download failed."
   fi
   generate_caddyfile
   generate_compose_file
   generate_index_html
   echo "  Starting SeaweedFS and Caddy containers..."
-  docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
+  docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
+    || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
   echo "  Waiting for SeaweedFS and Caddy to start..."
-  local api_result=""
   local response_code=""
   local attempt=1
-  while true; do
-    echo "  Waiting for SeaweedFS Filer to start..."
-    api_result=$(docker exec -i seaweed-mini curl -sS -m 2 -o /dev/null -w '%{http_code}' http://localhost:8888)
-    response_code=$api_result
+  local filer_ready=0
+  while [[ $attempt -le 24 ]]; do
+    echo "  Waiting for SeaweedFS Filer to start... (attempt $attempt/24)"
+    response_code=$(docker exec -i seaweed-mini curl -sS -m 2 -o /dev/null -w '%{http_code}' http://localhost:8888 2>/dev/null)
     if [[ -n $response_code && $response_code -ge "200" && $response_code -lt "300" ]]; then
-      echo "  Creating default artifact directory on SeaweedFS Filer..."
-      docker exec -i seaweed-mini curl -X POST http://localhost:8888/$DEFAULT_FILER_DIR_NAME/ && echo
-      upload_binaries
+      filer_ready=1
       break
     fi
-    if [[ $attempt -ge 10 ]]; then
-      echo "Timeout waiting for SeaweedFS Filer to start.. skipping artifact directory creation"
-      break
-    fi
-    echo "  Attempt: $attempt"
     ((attempt++))
     sleep 5
   done
+  if [[ $filer_ready -ne 1 ]]; then
+    die "Timeout waiting for SeaweedFS Filer to become ready (120s). Check 'docker logs seaweed-mini'."
+  fi
+  echo "  Creating default artifact directory on SeaweedFS Filer..."
+  docker exec -i seaweed-mini curl -sf -X POST http://localhost:8888/$DEFAULT_FILER_DIR_NAME/ >/dev/null \
+    || die "Failed to create default artifact directory '$DEFAULT_FILER_DIR_NAME' on the Filer."
+  upload_binaries
   echo "  Configuring S3 credentials..."
-  echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
+  local shell_out=""
+  shell_out=$(echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell 2>&1)
+  echo "$shell_out" >> "$LOG_FILE"
+  echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)' && die "S3 credential configuration failed (see $LOG_FILE)."
   echo "  Creating S3 buckets..."
   local all_buckets="$S3_BUCKET"
-  if [[ ${ENABLE_MONITORING,,} == "true" && ! "$all_buckets" =~ (^| )$LOKI_BUCKET( |$) ]]; then
+  if [[ ${ENABLE_MONITORING,,} == "true" ]] && ! list_contains "$LOKI_BUCKET" "$all_buckets"; then
     all_buckets="$all_buckets $LOKI_BUCKET"
   fi
   for extra in $EXTRA_BUCKETS; do
-    [[ "$all_buckets" =~ (^| )$extra( |$) ]] || all_buckets="$all_buckets $extra"
+    list_contains "$extra" "$all_buckets" || all_buckets="$all_buckets $extra"
   done
+  local existing_buckets=""
+  existing_buckets=$(echo "s3.bucket.list" | docker exec -i seaweed-mini /usr/bin/weed shell 2>/dev/null | awk '{print $1}')
   for bucket in $all_buckets; do
+    if echo "$existing_buckets" | grep -Fxq "$bucket"; then
+      echo "  Bucket already exists, skipping: $bucket"
+      continue
+    fi
     echo "  Creating bucket: $bucket"
-    echo "s3.bucket.create -name $bucket -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
+    shell_out=$(echo "s3.bucket.create -name $bucket -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell 2>&1)
+    echo "$shell_out" >> "$LOG_FILE"
+    echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)' && die "Failed to create S3 bucket '$bucket' (see $LOG_FILE)."
   done
   if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
     echo "  Setting up monitoring stack (Loki, Grafana, Prometheus)..."
-    debug_run setup_monitoring
+    debug_run setup_monitoring || die "Monitoring stack setup failed."
   fi
   if [[ ${ENABLE_SMB,,} == "true" ]]; then
     run_smb
@@ -174,42 +221,56 @@ run_docker() {
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_image_pull_push
     if [[ $PUSH_MODE -eq 1 ]]; then
-      cat >$base_dir/utilities/images.txt <<EOF
+      cat >"$base_dir/utilities/images.txt" <<EOF
 $SWFS_IMAGE
 $CADDY_IMAGE
 EOF
       if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
-        cat >> $base_dir/utilities/images.txt <<EOF
+        cat >> "$base_dir/utilities/images.txt" <<EOF
 $LOKI_IMAGE
 $GRAFANA_IMAGE
 $PROMETHEUS_EXT_IMAGE
 EOF
       fi
-      $base_dir/utilities/image_pull_push.sh -f $base_dir/utilities/images.txt push $REGISTRY_INFO $REG_USER $REG_PASS
+      "$base_dir/utilities/image_pull_push.sh" -f "$base_dir/utilities/images.txt" push "$REGISTRY_INFO" "$REG_USER" "$REG_PASS" \
+        || die "image_pull_push.sh push to $REGISTRY_INFO failed."
     else
       # Still grab registry cert if needed
       if [[ $REGISTRY_MODE -eq 1 ]]; then
-        $base_dir/utilities/image_pull_push.sh reg-cert $REGISTRY_INFO
+        "$base_dir/utilities/image_pull_push.sh" reg-cert "$REGISTRY_INFO" \
+          || die "image_pull_push.sh reg-cert for $REGISTRY_INFO failed."
       fi
-      $base_dir/utilities/image_pull_push.sh docker
+      "$base_dir/utilities/image_pull_push.sh" docker \
+        || die "image_pull_push.sh docker (Docker runtime setup) failed."
     fi
   else
     # AIR_GAPPED_MODE is set
-    for file in $base_dir/utilities/container_images_*.tar.gz; do
+    shopt -s nullglob
+    local image_archives=("$base_dir"/utilities/container_images_*.tar.gz)
+    shopt -u nullglob
+    if [[ ${#image_archives[@]} -eq 0 ]]; then
+      die "Air-gapped mode: no container_images_*.tar.gz archives found in $base_dir/utilities/ — the save bundle is incomplete."
+    fi
+    local file
+    for file in "${image_archives[@]}"; do
       if [[ $PUSH_MODE -eq 1 ]]; then
-        $base_dir/utilities/image_pull_push.sh -f $file push $REGISTRY_INFO $REG_USER $REG_PASS
+        "$base_dir/utilities/image_pull_push.sh" -f "$file" push "$REGISTRY_INFO" "$REG_USER" "$REG_PASS" \
+          || die "image_pull_push.sh push of $(basename "$file") failed."
       else
-        $base_dir/utilities/image_pull_push.sh -f $file keep
+        "$base_dir/utilities/image_pull_push.sh" -f "$file" keep \
+          || die "image_pull_push.sh load of $(basename "$file") failed."
       fi
     done
     # Still grab registry cert if needed
     if [[ $REGISTRY_MODE -eq 1 ]]; then
-      $base_dir/utilities/image_pull_push.sh reg-cert $REGISTRY_INFO
+      "$base_dir/utilities/image_pull_push.sh" reg-cert "$REGISTRY_INFO" \
+        || die "image_pull_push.sh reg-cert for $REGISTRY_INFO failed."
     fi
   fi
   if [[ $REGISTRY_MODE -eq 1 ]]; then
     echo "  Logging into local registry $REG_FQDN:$REG_PORT ..."
-    docker login $REG_FQDN:$REG_PORT -u "$REG_USER" -p "$REG_PASS"
+    printf '%s' "$REG_PASS" | docker login "$REG_FQDN:$REG_PORT" -u "$REG_USER" --password-stdin \
+      || die "docker login to $REG_FQDN:$REG_PORT failed."
   fi
 }
 
@@ -348,7 +409,10 @@ generate_caddyfile () {
     local caddy_image_local="$CADDY_IMAGE"
   fi
   CADDY_HASHED_PASSWORD=$(docker run --rm ${caddy_image_local} caddy hash-password --plaintext "${SWFS_PASSWORD}")
-  echo "  Creating Caddyfile..." | tee -a seaweedfs-install.log
+  if [[ -z "$CADDY_HASHED_PASSWORD" ]]; then
+    die "Failed to hash SWFS_PASSWORD with the Caddy image ($caddy_image_local). Is the image available?"
+  fi
+  echo "  Creating Caddyfile..." | tee -a "$LOG_FILE"
   cat > /opt/caddy/Caddyfile <<EOF
 {
         debug
@@ -478,7 +542,7 @@ generate_compose_file () {
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_VOLUME_PORT:$CLUSTER_VOLUME_PORT\""$'\n'
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_VOLUME_GRPC_PORT:$CLUSTER_VOLUME_GRPC_PORT\""$'\n'
   fi
-  echo "  Creating seaweedfs-compose.yaml..." | tee -a seaweedfs-install.log
+  echo "  Creating seaweedfs-compose.yaml..." | tee -a "$LOG_FILE"
   cat > /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
 networks:
   seaweed_net:
@@ -559,7 +623,7 @@ fi
 
 
 generate_index_html () {
-  echo "  Creating index.html files..." | tee -a seaweedfs-install.log
+  echo "  Creating index.html files..." | tee -a "$LOG_FILE"
   cat > /opt/caddy/srv/index.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -783,23 +847,25 @@ EOF
 }
 
 download_image_pull_push () {
-  if [[ ! -f $base_dir/utilities/image_pull_push.sh ]]; then
+  if [[ ! -f "$base_dir/utilities/image_pull_push.sh" ]]; then
     echo "  Downloading image_pull_push.sh..."
-    curl -sfL https://github.com/Chubtoad5/images-pull-push/raw/refs/heads/main/image_pull_push.sh  -o $base_dir/utilities/image_pull_push.sh
-    chmod +x $base_dir/utilities/image_pull_push.sh
+    curl -sfL https://github.com/Chubtoad5/images-pull-push/raw/refs/heads/main/image_pull_push.sh -o "$base_dir/utilities/image_pull_push.sh" \
+      || die "Failed to download image_pull_push.sh (check network access, or use the air-gap bundle)."
+    chmod +x "$base_dir/utilities/image_pull_push.sh"
   fi
 }
 
 download_install_packages () {
-  if [[ ! -f $base_dir/utilities/install_packages.sh ]]; then
+  if [[ ! -f "$base_dir/utilities/install_packages.sh" ]]; then
     echo "  Downloading install_packages.sh..."
-    curl -sfL https://github.com/Chubtoad5/install-packages/raw/refs/heads/main/install_packages.sh  -o $base_dir/utilities/install_packages.sh
-    chmod +x $base_dir/utilities/install_packages.sh
+    curl -sfL https://github.com/Chubtoad5/install-packages/raw/refs/heads/main/install_packages.sh -o "$base_dir/utilities/install_packages.sh" \
+      || die "Failed to download install_packages.sh (check network access, or use the air-gap bundle)."
+    chmod +x "$base_dir/utilities/install_packages.sh"
   fi
 }
 
 generate_outputs () {
-  cat >> seaweedfs-install.log <<EOF
+  cat >> "$LOG_FILE" <<EOF
 # -- SeaweedFS Installer Finished - $(date) -- #
 
 Docker compose file:   /opt/seaweedfs/seaweedfs-compose.yaml
@@ -834,7 +900,7 @@ S3 Details:
   >>>               https://$MGMT_IP:$SWFS_ADMIN_PORT <<<
 EOF
   if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
-    cat >> seaweedfs-install.log <<EOF
+    cat >> "$LOG_FILE" <<EOF
 
 Monitoring Stack:
   Grafana:            https://$GRAFANA_FQDN:$GRAFANA_PORT  (user: $SWFS_USER / pass: $SWFS_PASSWORD)
@@ -852,21 +918,26 @@ EOF
 }
 
 download_binaries () {
-  echo "  Downloading artifact binaries..." | tee -a seaweedfs-install.log
-  cd $base_dir/utilities/artifacts
+  echo "  Downloading artifact binaries..." | tee -a "$LOG_FILE"
+  cd "$base_dir/utilities/artifacts" || return 1
   read -a ARTIFACTS_TO_DOWNLOAD_ARRAY <<< "$ARTIFACTS_TO_DOWNLOAD"
   for url in "${ARTIFACTS_TO_DOWNLOAD_ARRAY[@]}"; do
-    echo "  Downloading $(basename $url)..." | tee -a ../seaweedfs-install.log
-    curl -kfLO "$url"
+    echo "  Downloading $(basename "$url")..." | tee -a "$base_dir/$LOG_FILE"
+    if ! curl -kfLO "$url"; then
+      echo "  ERROR: failed to download artifact $url" | tee -a "$base_dir/$LOG_FILE"
+      cd "$base_dir"
+      return 1
+    fi
   done
-  cd $base_dir
+  cd "$base_dir"
 }
 
 upload_binaries () {
-  echo "  Uploading artifact binaries to SeaweedFS Filer..." | tee -a seaweedfs-install.log
-  for file in $base_dir/utilities/artifacts/*; do
+  echo "  Uploading artifact binaries to SeaweedFS Filer..." | tee -a "$LOG_FILE"
+  for file in "$base_dir"/utilities/artifacts/*; do
     if [[ -f "$file" ]]; then
-        curl -ku $SWFS_USER:$SWFS_PASSWORD -X POST https://$MGMT_IP:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME/$(basename "$file") -F file=@$base_dir/utilities/artifacts/$(basename "$file")
+      curl -skfu "$SWFS_USER:$SWFS_PASSWORD" -X POST "https://$MGMT_IP:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME/$(basename "$file")" -F "file=@$file" \
+        || echo "  WARNING: failed to upload artifact $(basename "$file") to the Filer." | tee -a "$LOG_FILE"
     fi
   done
 }
@@ -1088,7 +1159,8 @@ setup_monitoring () {
   generate_monitoring_compose
   write_monitoring_credentials
   echo "  Starting monitoring stack (Loki, Grafana, Prometheus)..."
-  docker compose -f /opt/monitoring/docker-compose.yml up -d
+  docker compose -f /opt/monitoring/docker-compose.yml up -d --remove-orphans \
+    || die "docker compose up failed for /opt/monitoring/docker-compose.yml."
   echo "  Waiting for monitoring stack to become healthy..."
   local attempt=1
   while [[ $attempt -le 12 ]]; do
@@ -1101,6 +1173,9 @@ setup_monitoring () {
     ((attempt++))
     sleep 10
   done
+  if [[ $attempt -gt 12 ]]; then
+    echo "  WARNING: Loki did not report ready within 120s — monitoring may still be starting. Check 'docker logs loki'." | tee -a "$LOG_FILE"
+  fi
 }
 
 debug_run() {
@@ -1227,27 +1302,30 @@ run_save () {
   echo "  Preparing SeaweedFS offline archive..."
   debug_run download_image_pull_push
   debug_run download_install_packages
-  cat >$base_dir/utilities/images.txt <<EOF
+  cat >"$base_dir/utilities/images.txt" <<EOF
 $SWFS_IMAGE
 $CADDY_IMAGE
 EOF
   if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
-    cat >> $base_dir/utilities/images.txt <<EOF
+    cat >> "$base_dir/utilities/images.txt" <<EOF
 $LOKI_IMAGE
 $GRAFANA_IMAGE
 $PROMETHEUS_EXT_IMAGE
 EOF
   fi
-  cd $base_dir/utilities
-  debug_run ./image_pull_push.sh -f $base_dir/utilities/images.txt save
+  cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
+  debug_run ./image_pull_push.sh -f "$base_dir/utilities/images.txt" save \
+    || die "image_pull_push.sh save failed — container image archive was not produced."
   # Save Samba + NFS packages into ONE offline-packages.tar.gz. install_packages.sh 'save'
   # recreates the bundle on each call, so two separate calls left only the last package set
   # in the archive (samba was lost) and broke the air-gapped SMB install. One combined call
   # downloads both dependency trees into a single archive.
-  ./install_packages.sh save samba nfs-kernel-server
-  cd $base_dir
-  debug_run download_binaries
-  cat > $base_dir/swfs-save-version.txt <<EOF
+  # NFS server package name is distro-specific ($NFS_PACKAGE, set by os_check).
+  ./install_packages.sh save samba "$NFS_PACKAGE" \
+    || die "install_packages.sh save (samba $NFS_PACKAGE) failed — OS package bundle was not produced."
+  cd "$base_dir"
+  debug_run download_binaries || die "Artifact download failed."
+  cat > "$base_dir/swfs-save-version.txt" <<EOF
 # SeaweedFS Installer Save Archive
 # Created: $(date)
 #
@@ -1257,18 +1335,20 @@ $CADDY_IMAGE
 $(if [[ ${ENABLE_MONITORING,,} == "true" ]]; then printf "%s\n%s\n%s" "$LOKI_IMAGE" "$GRAFANA_IMAGE" "$PROMETHEUS_EXT_IMAGE"; fi)
 EOF
   generate_bundle_licenses
-  tar czf $base_dir/swfs-save.tar.gz utilities install-seaweedfs swfs-save-version.txt LICENSES
+  tar czf "$base_dir/swfs-save.tar.gz" utilities install-seaweedfs swfs-save-version.txt LICENSES \
+    || die "Failed to create swfs-save.tar.gz."
   echo "  created 'swfs-save.tar.gz' for air-gapped deployment."
 }
 
 run_join () {
-  echo "# -- SeaweedFS Volume Join Started - $(date) -- #" | tee -a seaweedfs-install.log
+  echo "# -- SeaweedFS Volume Join Started - $(date) -- #" | tee -a "$LOG_FILE"
   echo "  Joining control-plane master at $CLUSTER_MASTER as a volume node (ip=$MGMT_IP, dc=$CLUSTER_DC, rack=$CLUSTER_RACK)..."
   mkdir -p /opt/seaweedfs/volume
-  debug_run run_docker
+  debug_run run_docker || die "Docker/image preparation failed."
   generate_join_compose_file
   echo "  Starting SeaweedFS volume node..."
-  docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml up -d
+  docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml up -d --remove-orphans \
+    || die "docker compose up failed for /opt/seaweedfs/seaweedfs-volume-compose.yaml."
   generate_join_outputs
 }
 
@@ -1279,7 +1359,7 @@ generate_join_compose_file () {
   fi
   local VOL_TUNING=""
   [[ -n "$VOLUME_INDEX" ]] && VOL_TUNING+="      -index=$VOLUME_INDEX"$'\n'
-  echo "  Creating seaweedfs-volume-compose.yaml..." | tee -a seaweedfs-install.log
+  echo "  Creating seaweedfs-volume-compose.yaml..." | tee -a "$LOG_FILE"
   cat > /opt/seaweedfs/seaweedfs-volume-compose.yaml <<EOF
 networks:
   seaweed_net:
@@ -1311,7 +1391,7 @@ EOF
 }
 
 generate_join_outputs () {
-  cat <<EOF | tee -a seaweedfs-install.log
+  cat <<EOF | tee -a "$LOG_FILE"
 
 # -- SeaweedFS Volume Node Joined - $(date) -- #
 
@@ -1438,18 +1518,18 @@ Examples:
   $0 join -master 192.168.1.10:$SWFS_MASTER_PORT
 
 EOF
-  exit 1
 }
 
 # --- CLI Wrapper --- #
 if [[ "$#" -eq 0 ]]; then
   echo "Error: No arguments provided."
   help
+  exit 1
 fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    help|--help|-h) help ;;
+    help|--help|-h) help; exit 0 ;;
     install)
       INSTALL_MODE=1
       ;;
@@ -1487,8 +1567,9 @@ while [[ $# -gt 0 ]]; do
       shift 3
       ;;
     *)
-      echo "Invalid argument: $1"
-      echo
+      echo "Error: Invalid argument: $1"
+      echo "Use 'help' for usage."
+      exit 1
       ;;
   esac
   shift
@@ -1496,6 +1577,8 @@ done
 
 check_root_privileges
 os_check
+# Preflight for minimal images: these must exist before any real work starts.
+require_cmds curl tar openssl
 
 # -- Argument Validation -- #
 if [[ $INSTALL_MODE -eq 1 ]]; then
@@ -1521,9 +1604,11 @@ if [[ $SAVE_MODE -eq 1 ]]; then
   if [[ $PUSH_MODE -eq 1 || $REGISTRY_MODE -eq 1 ]]; then
     echo "Error: push or registry cannot be used with save."; exit 1; fi
 fi
-if [[ $PUSH_MODE -eq 1 ]]; then 
+if [[ $PUSH_MODE -eq 1 ]]; then
   if [[ $SAVE_MODE -eq 1 || $UNINSTALL_MODE -eq 1 ]]; then
     echo "Error: save or uninstall cannot be used with push."; exit 1; fi
+  if [[ $REGISTRY_MODE -eq 0 ]]; then
+    echo "Error: 'push' requires the -registry option. Format: push -registry <registry:port> <user> <pass>"; exit 1; fi
 fi
 if [[ "$REGISTRY_MODE" == "1" ]]; then
   if [[ "$REGISTRY_INFO" =~ ^https?:// ]]; then
