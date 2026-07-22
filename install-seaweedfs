@@ -82,6 +82,9 @@ EXTRA_BUCKETS=${EXTRA_BUCKETS:-""}                               # Space-separat
 # - Uninstall behavior
 SWFS_REMOVE_IMAGES=${SWFS_REMOVE_IMAGES:-"false"}  # uninstall: also 'docker rmi' the container images this installer loaded (recorded in the install-state file)
 
+# - Air-gap detection override
+SWFS_FORCE_ONLINE=${SWFS_FORCE_ONLINE:-"false"}    # true = ignore a swfs-save-version.txt sentinel in the working directory and stay in online mode
+
 # -- Licensing (air-gap bundle copyleft compliance) -- #
 # When monitoring is bundled, the save archive redistributes Grafana and Loki, which
 # are AGPL-3.0. The save flow writes a LICENSES/ dir with a third-party manifest and a
@@ -209,6 +212,89 @@ ${MARKER_BEGIN}
 user_allow_other
 ${MARKER_END}
 EOF
+}
+
+file_md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# Restart a running container when its bind-mounted config content changed (SW-8):
+# 'docker compose up' only reacts to compose-file changes, not to regenerated
+# bind-mounted configs, so password/setting rotations never reached the containers.
+restart_if_changed() {
+  local container="$1" before="$2" after="$3"
+  [[ "$before" == "$after" ]] && return 0
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$container"; then
+    echo "  Configuration changed — restarting $container..."
+    docker restart "$container" >/dev/null 2>&1
+  fi
+}
+
+# Re-install convergence (SW-7): when a previous install configured something that is
+# now toggled off via ENABLE_*, tear that piece down so re-install converges instead
+# of leaving orphan stacks/config behind. Driven by the recorded install state.
+reconcile_disabled_services() {
+  [[ -f "$STATE_FILE" ]] || return 0
+  # Monitoring stack
+  if [[ ${ENABLE_MONITORING,,} != "true" && "$(get_state MONITORING_CONFIGURED)" == "true" ]]; then
+    echo "  ENABLE_MONITORING=false — removing previously-installed monitoring stack..."
+    [[ -f /opt/monitoring/docker-compose.yml ]] && docker compose -f /opt/monitoring/docker-compose.yml down --remove-orphans
+    rm -rf /opt/monitoring
+    rm -f /opt/seaweedfs/monitoring-credentials.env
+    record_state MONITORING_CONFIGURED "false"
+    record_state LOADED_MONITORING_IMAGES ""
+  fi
+  # Samba share
+  if [[ ${ENABLE_SMB,,} != "true" && "$(get_state SMB_CONFIGURED)" == "true" ]]; then
+    echo "  ENABLE_SMB=false — removing previously-configured Samba share..."
+    local smb_service share user created
+    smb_service=$(get_state SMB_SERVICE_NAME); smb_service=${smb_service:-$SMB_SERVICE}
+    share=$(get_state SMB_SHARE_NAME); share=${share:-$DEFAULT_FILER_DIR_NAME}
+    user=$(get_state SWFS_USER_NAME); user=${user:-$SWFS_USER}
+    created=$(get_state SWFS_USER_CREATED)
+    remove_marker_block /etc/samba/smb.conf
+    remove_legacy_smb_block "$share"
+    smbpasswd -x "$user" 2>/dev/null || true
+    if [[ "$created" == "true" ]] && id "$user" &>/dev/null; then
+      userdel "$user"
+    fi
+    systemctl restart "$smb_service" 2>/dev/null
+    record_state SMB_CONFIGURED "false"
+    record_state SWFS_USER_CREATED "false"
+  fi
+  # NFS export + refresh timer
+  if [[ ${ENABLE_NFS,,} != "true" && "$(get_state NFS_CONFIGURED)" == "true" ]]; then
+    echo "  ENABLE_NFS=false — removing previously-configured NFS export..."
+    local nfs_service
+    nfs_service=$(get_state NFS_SERVICE_NAME)
+    if [[ -z "$nfs_service" ]]; then
+      nfs_service="$NFS_SERVICE"
+      [[ $ID == "ubuntu" || $ID == "debian" ]] && nfs_service="nfs-kernel-server"
+    fi
+    [[ -f /etc/exports ]] && sed -i '/ # seaweedfs-installer$/d' /etc/exports
+    exportfs -ra 2>/dev/null
+    systemctl restart "$nfs_service" 2>/dev/null
+    systemctl disable --now seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
+    rm -f /etc/systemd/system/seaweedfs-nfs-meta-refresh.service /etc/systemd/system/seaweedfs-nfs-meta-refresh.timer
+    systemctl daemon-reload
+    record_state NFS_CONFIGURED "false"
+  fi
+  # fuse.conf: when neither share type is wanted anymore, revert the recorded change.
+  if [[ ${ENABLE_SMB,,} != "true" && ${ENABLE_NFS,,} != "true" ]]; then
+    case "$(get_state FUSE_CONF_ACTION)" in
+      created)
+        remove_marker_block /etc/fuse.conf
+        [[ -s /etc/fuse.conf ]] || rm -f /etc/fuse.conf
+        record_state FUSE_CONF_ACTION ""
+        ;;
+      backed_up)
+        if [[ -f /etc/fuse.conf.seaweedfs-bak ]]; then
+          mv /etc/fuse.conf.seaweedfs-bak /etc/fuse.conf
+        else
+          remove_marker_block /etc/fuse.conf
+        fi
+        record_state FUSE_CONF_ACTION ""
+        ;;
+    esac
+  fi
 }
 
 # --- Firewall handling (SW-9) --- #
@@ -351,10 +437,13 @@ install_swfs () {
   record_state NODE_ROLE "control"
   record_state FILER_DIR_NAME "$DEFAULT_FILER_DIR_NAME"
   record_state MQ_CONFIGURED "${ENABLE_MQ,,}"
+  reconcile_disabled_services
   debug_run run_docker || die "Docker/image preparation failed."
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_binaries || die "Artifact download failed."
   fi
+  local caddyfile_before
+  caddyfile_before=$(file_md5 /opt/caddy/Caddyfile)
   generate_caddyfile
   generate_compose_file
   record_state LOADED_IMAGES "$SWFS_IMAGE $CADDY_IMAGE"
@@ -362,6 +451,9 @@ install_swfs () {
   echo "  Starting SeaweedFS and Caddy containers..."
   docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+  # Apply a regenerated Caddyfile to an already-running container (SW-8): compose
+  # only recreates on compose-file changes, not bind-mounted config changes.
+  restart_if_changed seaweed-caddy "$caddyfile_before" "$(file_md5 /opt/caddy/Caddyfile)"
   echo "  Waiting for SeaweedFS and Caddy to start..."
   local response_code=""
   local attempt=1
@@ -631,7 +723,9 @@ Unit=seaweedfs-nfs-meta-refresh.service
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now seaweedfs-nfs-meta-refresh.timer
+  systemctl enable seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
+  # restart (not 'enable --now') so a CHANGED interval takes effect on a running timer (SW-16)
+  systemctl restart seaweedfs-nfs-meta-refresh.timer || die "Failed to start the NFS metadata refresh timer."
 }
 
 generate_caddyfile () {
@@ -1436,6 +1530,10 @@ setup_monitoring () {
   chown 65534:65534 /opt/monitoring/prometheus/data
   chown 472:472 /opt/monitoring/grafana/data
   chmod 750 /opt/monitoring/loki/data /opt/monitoring/prometheus/data /opt/monitoring/grafana/data
+  local loki_before prom_before ds_before
+  loki_before=$(file_md5 /opt/monitoring/loki/loki-config.yaml)
+  prom_before=$(file_md5 /opt/monitoring/prometheus/prometheus.yml)
+  ds_before=$(file_md5 /opt/monitoring/grafana/provisioning/datasources/datasources.yaml)
   generate_loki_config
   generate_prometheus_ext_config
   generate_grafana_datasources
@@ -1445,6 +1543,10 @@ setup_monitoring () {
   docker compose -f /opt/monitoring/docker-compose.yml up -d --remove-orphans \
     || die "docker compose up failed for /opt/monitoring/docker-compose.yml."
   record_state MONITORING_CONFIGURED "true"
+  # Apply regenerated bind-mounted configs to running containers (SW-8).
+  restart_if_changed loki "$loki_before" "$(file_md5 /opt/monitoring/loki/loki-config.yaml)"
+  restart_if_changed prometheus "$prom_before" "$(file_md5 /opt/monitoring/prometheus/prometheus.yml)"
+  restart_if_changed grafana "$ds_before" "$(file_md5 /opt/monitoring/grafana/provisioning/datasources/datasources.yaml)"
   echo "  Waiting for monitoring stack to become healthy..."
   local attempt=1
   while [[ $attempt -le 12 ]]; do
@@ -2053,7 +2155,30 @@ if [[ "$REGISTRY_MODE" == "1" ]]; then
     exit 1
   fi
 fi
-[[ ! -f $base_dir/swfs-save-version.txt ]] || AIR_GAPPED_MODE=1
+# Air-gap auto-detection with sanity check + explicit override (SW-17). A stale
+# sentinel (e.g. a build host that ran 'save' earlier) used to flip later runs into
+# air-gapped mode silently.
+if [[ -f "$base_dir/swfs-save-version.txt" ]]; then
+  if [[ ${SWFS_FORCE_ONLINE,,} == "true" ]]; then
+    echo "NOTE: swfs-save-version.txt present but SWFS_FORCE_ONLINE=true — staying in online mode."
+  else
+    AIR_GAPPED_MODE=1
+    if [[ $INSTALL_MODE -eq 1 || $JOIN_MODE -eq 1 ]]; then
+      shopt -s nullglob
+      _swfs_archives=("$base_dir"/utilities/container_images_*.tar.gz)
+      shopt -u nullglob
+      if [[ ${#_swfs_archives[@]} -eq 0 ]]; then
+        echo "ERROR: swfs-save-version.txt found (air-gapped mode) but no container_images_*.tar.gz in $base_dir/utilities/."
+        echo "Either extract the full swfs-save.tar.gz here, delete the stale sentinel, or set SWFS_FORCE_ONLINE=true."
+        exit 1
+      fi
+    fi
+    if [[ $SAVE_MODE -eq 1 ]]; then
+      echo "WARNING: 'save' is running in a directory containing swfs-save-version.txt — this run is treated as"
+      echo "         air-gapped (AGPL source fetch is skipped). Set SWFS_FORCE_ONLINE=true to build a fresh bundle online."
+    fi
+  fi
+fi
 
 
 
