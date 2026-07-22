@@ -1055,7 +1055,9 @@ generate_index_html () {
                     'Prometheus: http://' + currentHost + ':$PROMETHEUS_EXT_PORT';
                 }
                 document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
-                document.getElementById('smb-url').textContent = \`net use Z: \\\\\\\\\${currentHost}\\\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES\`;
+                // SW-4: never embed the real password in this unauthenticated page.
+                // '*' makes 'net use' prompt for the password interactively.
+                document.getElementById('smb-url').textContent = \`net use Z: \\\\\\\\\${currentHost}\\\\$DEFAULT_FILER_DIR_NAME * /USER:$SWFS_USER /PERSISTENT:YES\`;
                 document.getElementById('nfs-url').textContent = \`sudo mount -t nfs -o vers=3 \${currentHost}:/mnt/seaweed /mnt/seaweed\`;
                 document.getElementById('curl-mkdir').textContent =
 \`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
@@ -1144,8 +1146,47 @@ Monitoring Stack:
   Credentials file:   /opt/seaweedfs/monitoring-credentials.env
 EOF
   fi
-  echo
-  cat seaweedfs-install.log | tail -40
+  chmod 600 "$LOG_FILE"
+  # Console banner: same summary but with secrets MASKED (SW-13). ap-tools captures
+  # stdout into its own logs; the full credentials live only in the 600-mode files.
+  cat <<EOF
+
+# -- SeaweedFS Installer Finished - $(date) -- #
+
+The following services are accessible by IP or FQDN if DNS is configured:
+  Master UI:    https://$SWFS_MASTER_FQDN:$SWFS_MASTER_PORT
+  Filer UI:     https://$SWFS_FILER_FQDN:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME
+  S3 Endpoint:  https://$SWFS_S3_FQDN:$SWFS_S3_PORT
+  Admin UI:     https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
+  MQ Broker:    $HOST_FQDN:$MQ_BROKER_PORT
+
+Master UI, Filer UI, and Admin UI require authentication:
+  Username: $SWFS_USER
+  Password: (hidden — see $base_dir/$LOG_FILE)
+S3 Details:
+  API User: $S3_USER
+  API Key/Secret: (hidden — see $base_dir/$LOG_FILE or /opt/seaweedfs/monitoring-credentials.env)
+  Default Bucket: $S3_BUCKET
+  Extra Buckets: ${EXTRA_BUCKETS:-<none>}
+
+Full credentials and connection examples: $base_dir/$LOG_FILE (mode 600)
+
+  >>> Landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT <<<
+  >>>               https://$MGMT_IP:$SWFS_ADMIN_PORT <<<
+EOF
+  if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
+    cat <<EOF
+
+Monitoring Stack:
+  Grafana:            https://$GRAFANA_FQDN:$GRAFANA_PORT  (user: $SWFS_USER, password hidden)
+  Grafana (by IP):    https://$MGMT_IP:$GRAFANA_PORT
+  Loki:               http://$MGMT_IP:$LOKI_PORT
+  Prometheus:         http://$MGMT_IP:$PROMETHEUS_EXT_PORT
+  Cluster label:      $CLUSTER_NAME
+  Loki log bucket:    $LOKI_BUCKET
+  Credentials file:   /opt/seaweedfs/monitoring-credentials.env (mode 600)
+EOF
+  fi
   echo
 }
 
@@ -1236,6 +1277,10 @@ query_range:
         enabled: true
         max_size_mb: 100
 EOF
+  # The config embeds the S3 keys (SW-13): readable only by the Loki container user
+  # (grafana/loki runs as UID 10001) and root.
+  chown 10001:10001 /opt/monitoring/loki/loki-config.yaml 2>/dev/null
+  chmod 400 /opt/monitoring/loki/loki-config.yaml
 }
 
 generate_prometheus_ext_config () {
@@ -1385,7 +1430,12 @@ EOF
 
 setup_monitoring () {
   mkdir -p /opt/monitoring/{loki/data,prometheus/data,grafana/data,grafana/provisioning/datasources}
-  chmod 777 /opt/monitoring/{loki/data,prometheus/data,grafana/data}
+  # Data dirs owned by each container's runtime user instead of world-writable (SW-23):
+  # loki=10001, prometheus=nobody(65534), grafana=472.
+  chown 10001:10001 /opt/monitoring/loki/data
+  chown 65534:65534 /opt/monitoring/prometheus/data
+  chown 472:472 /opt/monitoring/grafana/data
+  chmod 750 /opt/monitoring/loki/data /opt/monitoring/prometheus/data /opt/monitoring/grafana/data
   generate_loki_config
   generate_prometheus_ext_config
   generate_grafana_datasources
@@ -1853,7 +1903,7 @@ display_args() {
   echo "  REG_FQDN: $REG_FQDN"
   echo "  REG_PORT: $REG_PORT"
   echo "  REG_USER: $REG_USER"
-  echo "  REG_PASS: $REG_PASS"
+  echo "  REG_PASS: $([[ -n "$REG_PASS" ]] && echo '******')"
   echo "  OS: $OS_ID"
 }
 
@@ -2009,6 +2059,11 @@ fi
 
 
 # -- Main Logic -- #
+
+# The install log receives credentials — restrict it before anything writes to it (SW-13).
+if [[ $UNINSTALL_MODE -eq 0 ]]; then
+  touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
+fi
 
 echo "### SeaweedFS Installer Started - $(date) ###"
 display_args
