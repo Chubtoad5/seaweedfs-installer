@@ -184,9 +184,31 @@ remove_marker_block() {
 remove_legacy_smb_block() {
   local conf="/etc/samba/smb.conf" share="$1"
   [[ -f "$conf" ]] || return 0
-  grep -q "^\[${share}\]" "$conf" || return 0
-  # The legacy block is exactly the share header through the 'force group = root' line.
-  sed -i "\|^\[${share}\]\$|,\|^   force group = root\$|d" "$conf"
+  grep -qF "[${share}]" "$conf" || return 0
+  # Bounded removal: drop only the span from the share header to its
+  # 'force group = root' terminator. If another section header appears first
+  # (user-authored section with the same name, or a truncated block), leave the
+  # file untouched - an unterminated sed range would eat everything to EOF.
+  local tmp
+  tmp=$(mktemp)
+  if awk -v hdr="[${share}]" '
+      BEGIN { inblk=0 }
+      {
+        if (!inblk && $0 == hdr) { inblk=1; next }
+        if (inblk) {
+          if ($0 == "   force group = root") { inblk=0; next }
+          if (substr($0,1,1) == "[") { exit 1 }
+          next
+        }
+        print
+      }
+      END { if (inblk) exit 1 }
+    ' "$conf" > "$tmp"; then
+    cat "$tmp" > "$conf"
+  else
+    echo "  WARNING: found a [${share}] section in smb.conf that does not match the legacy installer format; leaving smb.conf untouched. Remove the stale section manually if it is a leftover."
+  fi
+  rm -f "$tmp"
 }
 
 # Never clobber the host's /etc/fuse.conf (SW-12): back it up (or create it) and
@@ -2102,7 +2124,11 @@ done
 check_root_privileges
 os_check
 # Preflight for minimal images: these must exist before any real work starts.
-require_cmds curl tar openssl
+# Uninstall is exempt - teardown must keep working on air-gapped hosts that
+# never had curl/openssl (it only needs docker, systemctl, and coreutils).
+if [[ $UNINSTALL_MODE -ne 1 ]]; then
+  require_cmds curl tar openssl
+fi
 
 # -- Argument Validation -- #
 if [[ $INSTALL_MODE -eq 1 ]]; then
