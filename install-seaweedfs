@@ -122,7 +122,7 @@ MARKER_END="# END seaweedfs-installer"
 # a truthful exit code: exit 0 means the requested operation actually succeeded.
 die() {
   echo "ERROR: $*" >&2
-  echo "ERROR: $*" >> "$LOG_FILE" 2>/dev/null
+  echo "ERROR: $*" 2>/dev/null >> "$LOG_FILE"
   exit 1
 }
 
