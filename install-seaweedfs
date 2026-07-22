@@ -211,6 +211,137 @@ ${MARKER_END}
 EOF
 }
 
+# --- Firewall handling (SW-9) --- #
+# Rocky/RHEL and Leap 16 default-enforce firewalld; Ubuntu may run UFW. Open only
+# what the enabled services need, remember exactly what WE added in the state file,
+# reconcile on re-install (toggled-off ports are closed again), and let uninstall
+# remove exactly the recorded set.
+
+# Port/proto list for the currently-enabled features (Caddy/S3/MQ/monitoring/cluster).
+firewall_collect_ports() {
+  local ports="$SWFS_ADMIN_PORT/tcp $SWFS_MASTER_PORT/tcp $SWFS_FILER_PORT/tcp $SWFS_S3_PORT/tcp"
+  [[ ${ENABLE_MQ,,} == "true" ]] && ports+=" $MQ_BROKER_PORT/tcp"
+  [[ ${ENABLE_MONITORING,,} == "true" ]] && ports+=" $GRAFANA_PORT/tcp $LOKI_PORT/tcp $PROMETHEUS_EXT_PORT/tcp"
+  [[ ${CLUSTER_MODE,,} == "cluster" ]] && ports+=" $CLUSTER_MASTER_GRPC_PORT/tcp $CLUSTER_VOLUME_PORT/tcp $CLUSTER_VOLUME_GRPC_PORT/tcp"
+  echo "$ports"
+}
+
+# configure_firewall "<port/proto list>" "<smb: true|false>" "<nfs: true|false>"
+configure_firewall() {
+  local want_ports="$1" want_smb="$2" want_nfs="$3"
+  local want_services=""
+  # firewalld models SMB/NFSv3 helper ports (rpcbind/mountd) as named services.
+  [[ "$want_smb" == "true" ]] && want_services+="samba "
+  [[ "$want_nfs" == "true" ]] && want_services+="nfs rpc-bind mountd "
+  if systemctl is-active firewalld >/dev/null 2>&1 && command -v firewall-cmd >/dev/null 2>&1; then
+    echo "  firewalld is active — reconciling required ports/services..."
+    local prior_ports prior_services keep_ports="" keep_services="" p s changed=0
+    prior_ports=$(get_state FIREWALLD_ADDED_PORTS)
+    prior_services=$(get_state FIREWALLD_ADDED_SERVICES)
+    # Close ports/services we opened earlier that are no longer wanted (toggle-off).
+    for p in $prior_ports; do
+      if ! list_contains "$p" "$want_ports"; then
+        firewall-cmd --permanent --remove-port="$p" >/dev/null 2>&1 && changed=1
+      fi
+    done
+    for s in $prior_services; do
+      if ! list_contains "$s" "$want_services"; then
+        firewall-cmd --permanent --remove-service="$s" >/dev/null 2>&1 && changed=1
+      fi
+    done
+    # Open what is wanted; only claim ownership of entries WE actually add.
+    for p in $want_ports; do
+      if firewall-cmd --permanent --query-port="$p" >/dev/null 2>&1; then
+        list_contains "$p" "$prior_ports" && keep_ports+="$p "
+      else
+        firewall-cmd --permanent --add-port="$p" >/dev/null 2>&1 && keep_ports+="$p " && changed=1
+      fi
+    done
+    for s in $want_services; do
+      if firewall-cmd --permanent --query-service="$s" >/dev/null 2>&1; then
+        list_contains "$s" "$prior_services" && keep_services+="$s "
+      else
+        firewall-cmd --permanent --add-service="$s" >/dev/null 2>&1 && keep_services+="$s " && changed=1
+      fi
+    done
+    [[ $changed -eq 1 ]] && firewall-cmd --reload >/dev/null 2>&1
+    record_state FIREWALLD_ADDED_PORTS "${keep_ports% }"
+    record_state FIREWALLD_ADDED_SERVICES "${keep_services% }"
+  elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    echo "  UFW is active — reconciling required ports..."
+    # UFW has no service objects for SMB/NFS — use the well-known ports. NOTE: NFSv3
+    # mountd uses a dynamic port unless pinned; firewalld handles this via its
+    # 'mountd' service, UFW cannot (documented in README).
+    [[ "$want_smb" == "true" ]] && want_ports+=" 445/tcp 139/tcp"
+    [[ "$want_nfs" == "true" ]] && want_ports+=" 2049/tcp 111/tcp 111/udp"
+    local prior_ports keep_ports="" p
+    prior_ports=$(get_state UFW_ADDED_PORTS)
+    for p in $prior_ports; do
+      if ! list_contains "$p" "$want_ports"; then
+        ufw --force delete allow "$p" >/dev/null 2>&1
+      fi
+    done
+    for p in $want_ports; do
+      ufw allow "$p" comment 'seaweedfs-installer' >/dev/null 2>&1 && keep_ports+="$p "
+    done
+    record_state UFW_ADDED_PORTS "${keep_ports% }"
+  else
+    echo "  No active firewall manager (firewalld/UFW) detected — no firewall changes made."
+  fi
+}
+
+# Uninstall: remove exactly what configure_firewall recorded.
+# $1=firewalld ports  $2=firewalld services  $3=ufw ports
+remove_firewall_rules() {
+  local fwd_ports="$1" fwd_services="$2" ufw_ports="$3" p s changed=0
+  if [[ -n "$fwd_ports$fwd_services" ]] && command -v firewall-cmd >/dev/null 2>&1; then
+    echo "  Removing firewalld ports/services added by this installer..." | tee -a "$LOG_FILE"
+    for p in $fwd_ports; do
+      firewall-cmd --permanent --remove-port="$p" >/dev/null 2>&1 && changed=1
+    done
+    for s in $fwd_services; do
+      firewall-cmd --permanent --remove-service="$s" >/dev/null 2>&1 && changed=1
+    done
+    [[ $changed -eq 1 ]] && firewall-cmd --reload >/dev/null 2>&1
+  fi
+  if [[ -n "$ufw_ports" ]] && command -v ufw >/dev/null 2>&1; then
+    echo "  Removing UFW rules added by this installer..." | tee -a "$LOG_FILE"
+    for p in $ufw_ports; do
+      ufw --force delete allow "$p" >/dev/null 2>&1
+    done
+  fi
+}
+
+# --- SELinux handling (SW-10) --- #
+# On enforcing hosts (Rocky/RHEL, Leap 16) smbd cannot read the FUSE-mounted
+# /mnt/seaweed without the samba_share_fusefs boolean. Apply it (recording the prior
+# value for uninstall) or warn loudly with the exact remediation.
+configure_selinux() {
+  command -v getenforce >/dev/null 2>&1 || return 0
+  [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]] || return 0
+  if [[ ${ENABLE_SMB,,} == "true" ]]; then
+    echo "  SELinux is enforcing — enabling Samba access to the FUSE share..."
+    local prior=""
+    prior=$(getsebool samba_share_fusefs 2>/dev/null | awk '{print $3}')
+    if [[ -z "$prior" ]]; then
+      echo "  WARNING: samba_share_fusefs boolean not found — the SMB share will likely be blocked by SELinux." | tee -a "$LOG_FILE"
+      echo "  Remediation: install the samba SELinux policy, then: setsebool -P samba_share_fusefs on" | tee -a "$LOG_FILE"
+    elif [[ "$prior" != "on" ]]; then
+      if setsebool -P samba_share_fusefs on 2>/dev/null; then
+        record_state SELINUX_SAMBA_FUSEFS_PRIOR "$prior"
+      else
+        echo "  WARNING: failed to set samba_share_fusefs — run manually: setsebool -P samba_share_fusefs on" | tee -a "$LOG_FILE"
+      fi
+    fi
+  fi
+  if [[ ${ENABLE_NFS,,} == "true" ]]; then
+    if [[ "$(getsebool nfs_export_all_rw 2>/dev/null | awk '{print $3}')" == "off" ]]; then
+      echo "  WARNING: SELinux boolean nfs_export_all_rw is off — NFS clients may be denied writes." | tee -a "$LOG_FILE"
+      echo "  Remediation: setsebool -P nfs_export_all_rw on" | tee -a "$LOG_FILE"
+    fi
+  fi
+}
+
 install_swfs () {
   echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a "$LOG_FILE"
   mkdir -p /opt/caddy/srv
@@ -287,6 +418,10 @@ install_swfs () {
   if [[ ${ENABLE_NFS,,} == "true" ]]; then
     run_nfs
   fi
+  # SELinux boolean check must come AFTER the samba packages (and their SELinux
+  # policy) are installed by run_smb.
+  configure_selinux
+  configure_firewall "$(firewall_collect_ports)" "${ENABLE_SMB,,}" "${ENABLE_NFS,,}"
   generate_outputs
 }
 
@@ -1312,6 +1447,13 @@ os_check () {
     echo "Unknown or unsupported OS $OS_ID."
     exit 1
   fi
+  # NFS server package name is distro-specific (SW-1): 'nfs-kernel-server' does not
+  # exist on the RHEL family — requesting it there silently left NFS uninstalled and
+  # produced save bundles without NFS packages.
+  case "$OS_ID" in
+    rhel|centos|rocky|almalinux|fedora) NFS_PACKAGE="nfs-utils" ;;
+    *)                                  NFS_PACKAGE="nfs-kernel-server" ;;  # Debian/Ubuntu and SUSE both ship nfs-kernel-server
+  esac
 }
 
 # best-effort source fetch; never fails the save ($1=url $2=dest $3=label)
@@ -1348,7 +1490,7 @@ generate_bundle_licenses() {
     echo ""
     echo "OS distribution packages bundled via install-packages (each keeps its own license):"
     echo "  samba ............... GPL-3.0-or-later   (see WRITTEN_OFFER.txt)"
-    echo "  nfs-kernel-server ... GPL-2.0-or-later   (see WRITTEN_OFFER.txt)"
+    printf "  %-21s GPL-2.0-or-later   (see WRITTEN_OFFER.txt)\\n" "$NFS_PACKAGE ...."
     echo "The installer scripts themselves are Apache-2.0 (Chubtoad5)."
   } > "$dir/THIRD_PARTY_NOTICES.txt"
 
@@ -1362,7 +1504,7 @@ generate_bundle_licenses() {
     echo ""
     echo "OS distribution packages (bundled via install-packages):"
     echo "  samba ............... GPL-3.0-or-later"
-    echo "  nfs-kernel-server ... GPL-2.0-or-later"
+    printf "  %-21s GPL-2.0-or-later\\n" "$NFS_PACKAGE ...."
     echo "Their corresponding source is available from the OS distribution's own source"
     echo "archives ('apt-get source <pkg>' / the distro source mirrors for the bundled version)."
     if [[ "$mon" == "yes" ]]; then
@@ -1448,6 +1590,7 @@ run_join () {
   echo "  Starting SeaweedFS volume node..."
   docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml up -d --remove-orphans \
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-volume-compose.yaml."
+  configure_firewall "$CLUSTER_VOLUME_PORT/tcp $CLUSTER_VOLUME_GRPC_PORT/tcp" "false" "false"
   generate_join_outputs
 }
 
@@ -1528,6 +1671,7 @@ uninstall_swfs () {
   local st_smb="" st_nfs="" st_user_created="false" st_user_name="$SWFS_USER"
   local st_smb_service="" st_nfs_service="" st_share_name="$DEFAULT_FILER_DIR_NAME"
   local st_fuse_action="" st_registry_login="" st_images="" st_mon_images=""
+  local st_fwd_ports="" st_fwd_services="" st_ufw_ports="" st_selinux_prior=""
   local have_state=0
   if [[ -f "$STATE_FILE" ]]; then
     have_state=1
@@ -1542,6 +1686,10 @@ uninstall_swfs () {
     st_registry_login=$(get_state REGISTRY_LOGIN)
     st_images=$(get_state LOADED_IMAGES)
     st_mon_images=$(get_state LOADED_MONITORING_IMAGES)
+    st_fwd_ports=$(get_state FIREWALLD_ADDED_PORTS)
+    st_fwd_services=$(get_state FIREWALLD_ADDED_SERVICES)
+    st_ufw_ports=$(get_state UFW_ADDED_PORTS)
+    st_selinux_prior=$(get_state SELINUX_SAMBA_FUSEFS_PRIOR)
   else
     echo "  NOTE: no install-state file found ($STATE_FILE) — pre-state-file install or already uninstalled." | tee -a "$LOG_FILE"
     echo "  Falling back to ENABLE_* env plus on-disk evidence for SMB/NFS cleanup; user accounts will NOT be removed." | tee -a "$LOG_FILE"
@@ -1555,6 +1703,7 @@ uninstall_swfs () {
     echo "  'volume.fix.replication -apply' on node 1, confirm full replica counts) or data held only here is lost." | tee -a "$LOG_FILE"
     echo "  Stopping and removing the SeaweedFS volume container..." | tee -a "$LOG_FILE"
     docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml down --remove-orphans
+    remove_firewall_rules "$st_fwd_ports" "$st_fwd_services" "$st_ufw_ports"
     uninstall_docker_residue "$st_registry_login" "$st_images" "$st_mon_images"
     rm -rf /opt/seaweedfs
     echo "# -- Volume node uninstall complete -- #" | tee -a "$LOG_FILE"
@@ -1659,6 +1808,12 @@ uninstall_swfs () {
       remove_marker_block /etc/fuse.conf
       ;;
   esac
+  remove_firewall_rules "$st_fwd_ports" "$st_fwd_services" "$st_ufw_ports"
+  # Restore the SELinux boolean only if THIS tool changed it (recorded prior value).
+  if [[ -n "$st_selinux_prior" && "$st_selinux_prior" != "on" ]] && command -v setsebool >/dev/null 2>&1; then
+    echo "  Restoring SELinux boolean samba_share_fusefs=$st_selinux_prior..." | tee -a "$LOG_FILE"
+    setsebool -P samba_share_fusefs "$st_selinux_prior" 2>/dev/null
+  fi
   uninstall_docker_residue "$st_registry_login" "$st_images" "$st_mon_images"
   # The install log contains credentials (SW-24) — remove it with the deployment.
   if [[ -f "$base_dir/seaweedfs-install.log" ]]; then
