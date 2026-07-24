@@ -494,8 +494,15 @@ install_swfs () {
     die "Timeout waiting for SeaweedFS Filer to become ready (120s). Check 'docker logs seaweed-mini'."
   fi
   echo "  Creating default artifact directory on SeaweedFS Filer..."
-  docker exec -i seaweed-mini curl -sf -X POST http://localhost:8888/$DEFAULT_FILER_DIR_NAME/ >/dev/null \
-    || die "Failed to create default artifact directory '$DEFAULT_FILER_DIR_NAME' on the Filer."
+  # 409 = already exists: the seaweed-mount container auto-creates the filer
+  # path when it wins the startup race, and re-runs always find it - both are
+  # success for an idempotent install, not a failure
+  local mkdir_code
+  mkdir_code=$(docker exec -i seaweed-mini curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST "http://localhost:8888/$DEFAULT_FILER_DIR_NAME/" 2>/dev/null)
+  case "$mkdir_code" in
+    2??|409) : ;;
+    *) die "Failed to create default artifact directory '$DEFAULT_FILER_DIR_NAME' on the Filer (HTTP ${mkdir_code:-no-response})." ;;
+  esac
   upload_binaries
   echo "  Configuring S3 credentials..."
   local shell_out=""
