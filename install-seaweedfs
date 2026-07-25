@@ -450,8 +450,55 @@ configure_selinux() {
   fi
 }
 
+preflight_nfs_check () {
+  # P4-07: the kernel NFS server needs the nfsd module; Ubuntu's 'linux-kvm'
+  # kernel flavor (22.04 minimal images) does not ship it at all. Fail before
+  # any changes are made, with the real remediation, instead of dying mid-install.
+  [[ ${ENABLE_NFS,,} == "true" ]] || return 0
+  if modprobe -n nfsd >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Error: ENABLE_NFS=true but the running kernel ($(uname -r)) has no 'nfsd' module —" | tee -a "$LOG_FILE"
+  echo "  a kernel NFS server cannot run on this kernel. Either re-run with ENABLE_NFS=false," | tee -a "$LOG_FILE"
+  echo "  or install a kernel that ships nfsd (Ubuntu minimal 22.04 images boot the 'linux-kvm'" | tee -a "$LOG_FILE"
+  echo "  flavor, which cannot serve NFS: 'apt install linux-generic' + reboot into it)." | tee -a "$LOG_FILE"
+  exit 1
+}
+
+preflight_port_check () {
+  # P4-06: fail before any changes when a required host port is already bound by
+  # a foreign process (e.g. Rocky 10 ships cockpit.socket enabled on 9090, which
+  # collides with the Prometheus receiver). Converge re-runs skip the check —
+  # the running SeaweedFS stack legitimately holds its own ports.
+  if [[ -f "$STATE_FILE" ]]; then
+    echo "  Existing install state found — port preflight skipped (converge re-run)."
+    return 0
+  fi
+  local conflicts="" entry port proc
+  for entry in $(firewall_collect_ports); do
+    port="${entry%%/*}"
+    proc=$(ss -Hltnp "sport = :$port" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n1)
+    if [[ -z "$proc" ]] && ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
+      proc="unknown"
+    fi
+    if [[ -n "$proc" ]]; then
+      conflicts+="  port $port/tcp is already in use by '$proc'"$'\n'
+    fi
+  done
+  if [[ -n "$conflicts" ]]; then
+    echo "Error: required host ports are already in use:" | tee -a "$LOG_FILE"
+    printf '%s' "$conflicts" | tee -a "$LOG_FILE"
+    echo "  Free the port(s) (or change the corresponding *_PORT variable) and re-run." | tee -a "$LOG_FILE"
+    echo "  (Rocky 10 example: 'systemctl disable --now cockpit.socket' frees 9090.)" | tee -a "$LOG_FILE"
+    exit 1
+  fi
+  echo "  Port preflight passed — all required host ports are free."
+}
+
 install_swfs () {
   echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a "$LOG_FILE"
+  preflight_nfs_check
+  preflight_port_check
   mkdir -p /opt/caddy/srv
   mkdir -p /opt/seaweedfs/mini
   record_state STATE_VERSION "1"
