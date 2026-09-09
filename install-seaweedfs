@@ -24,7 +24,7 @@ SWFS_ADMIN_FQDN=${SWFS_ADMIN_FQDN:-"admin.$HOST_FQDN"}     # FQDN for SeaweedFS 
 SWFS_MASTER_FQDN=${SWFS_MASTER_FQDN:-"master.$HOST_FQDN"}  # FQDN for SeaweedFS Master UI/API
 SWFS_FILER_FQDN=${SWFS_FILER_FQDN:-"filer.$HOST_FQDN"}     # FQDN for SeaweedFS Filer UI/API
 SWFS_S3_FQDN=${SWFS_S3_FQDN:-"s3.$HOST_FQDN"}              # FQDN for SeaweedFS S3 API
-MGMT_IP=$(hostname -I | awk '{print $1}')                  # Used as default_sni fallback for TLS in non-DNS environments
+MGMT_IP=${MGMT_IP:-$(hostname -I | awk '{print $1}')}      # Used as default_sni fallback for TLS in non-DNS environments (overridable, e.g. by ap-tools)
 
 # - Service TCP Ports # Volume Server uses port 9340 on internal docker network
 SWFS_ADMIN_PORT=${SWFS_ADMIN_PORT:-"443"}
@@ -79,6 +79,12 @@ LOKI_BUCKET=${LOKI_BUCKET:-"loki-logs"}                          # S3 bucket for
 CLUSTER_NAME=${CLUSTER_NAME:-"edge-lab"}                        # Cluster label applied to all metrics and logs
 EXTRA_BUCKETS=${EXTRA_BUCKETS:-""}                               # Space-separated list of additional S3 buckets to create at install time (e.g. per-cluster Velero buckets)
 
+# - Uninstall behavior
+SWFS_REMOVE_IMAGES=${SWFS_REMOVE_IMAGES:-"false"}  # uninstall: also 'docker rmi' the container images this installer loaded (recorded in the install-state file)
+
+# - Air-gap detection override
+SWFS_FORCE_ONLINE=${SWFS_FORCE_ONLINE:-"false"}    # true = ignore a swfs-save-version.txt sentinel in the working directory and stay in online mode
+
 # -- Licensing (air-gap bundle copyleft compliance) -- #
 # When monitoring is bundled, the save archive redistributes Grafana and Loki, which
 # are AGPL-3.0. The save flow writes a LICENSES/ dir with a third-party manifest and a
@@ -104,61 +110,475 @@ ipv4_pattern='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]
 base_dir=$(pwd)
 SMB_SERVICE="smbd"
 NFS_SERVICE="nfs-server"
+NFS_PACKAGE="nfs-kernel-server"
+LOG_FILE="seaweedfs-install.log"
+STATE_FILE="/opt/seaweedfs/.install-state"
+MARKER_BEGIN="# BEGIN seaweedfs-installer"
+MARKER_END="# END seaweedfs-installer"
 
 # -- Functions -- #
 
+# Print an error, record it in the log, and exit non-zero. Callers (ap-tools) rely on
+# a truthful exit code: exit 0 means the requested operation actually succeeded.
+die() {
+  echo "ERROR: $*" >&2
+  echo "ERROR: $*" 2>/dev/null >> "$LOG_FILE"
+  exit 1
+}
+
+# Exact-match membership test: list_contains <needle> "<space separated list>"
+# (regex =~ matching false-positives on metacharacters in bucket names; this does not)
+list_contains() {
+  local needle="$1" item
+  for item in $2; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+# Dependency preflight for minimal images: fail early with a distro-appropriate hint
+# instead of an opaque failure mid-install.
+require_cmds() {
+  local missing=() c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  [[ ${#missing[@]} -eq 0 ]] && return 0
+  local hint="apt-get install -y"
+  case "$OS_ID" in
+    rhel|centos|rocky|almalinux|fedora) hint="dnf install -y" ;;
+    sles|opensuse-leap) hint="zypper install -y" ;;
+  esac
+  die "Missing required command(s): ${missing[*]}. Install them first, e.g.: sudo $hint ${missing[*]}"
+}
+
+# --- Install-state recording (SW-2) --- #
+# The state file records what THIS tool actually changed on the host, so uninstall
+# reverts exactly that — never keyed on the ENABLE_* env present at uninstall time.
+# Format: KEY=value lines, one per key (last write wins), mode 600.
+record_state() {
+  local key="$1" value="$2"
+  mkdir -p "$(dirname "$STATE_FILE")"
+  [[ -f "$STATE_FILE" ]] || touch "$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+  sed -i "/^${key}=/d" "$STATE_FILE"
+  echo "${key}=${value}" >> "$STATE_FILE"
+}
+
+# get_state <key> — prints the recorded value (empty if unset / no state file)
+get_state() {
+  [[ -f "$STATE_FILE" ]] || return 1
+  sed -n "s/^$1=//p" "$STATE_FILE" | tail -1
+}
+
+# Remove the marker-delimited seaweedfs-installer block from a file (no-op when absent).
+remove_marker_block() {
+  local target="$1"
+  [[ -f "$target" ]] || return 0
+  sed -i "\|^${MARKER_BEGIN}\$|,\|^${MARKER_END}\$|d" "$target"
+}
+
+# Remove a legacy (pre-marker) seaweedfs share block from smb.conf: older releases
+# appended the share section without markers, so reconciliation must strip it too or a
+# re-install would leave a duplicate share definition behind.
+remove_legacy_smb_block() {
+  local conf="/etc/samba/smb.conf" share="$1"
+  [[ -f "$conf" ]] || return 0
+  grep -qF "[${share}]" "$conf" || return 0
+  # Bounded removal: drop only the span from the share header to its
+  # 'force group = root' terminator. If another section header appears first
+  # (user-authored section with the same name, or a truncated block), leave the
+  # file untouched - an unterminated sed range would eat everything to EOF.
+  local tmp
+  tmp=$(mktemp)
+  if awk -v hdr="[${share}]" '
+      BEGIN { inblk=0 }
+      {
+        if (!inblk && $0 == hdr) { inblk=1; next }
+        if (inblk) {
+          if ($0 == "   force group = root") { inblk=0; next }
+          if (substr($0,1,1) == "[") { exit 1 }
+          next
+        }
+        print
+      }
+      END { if (inblk) exit 1 }
+    ' "$conf" > "$tmp"; then
+    cat "$tmp" > "$conf"
+  else
+    echo "  WARNING: found a [${share}] section in smb.conf that does not match the legacy installer format; leaving smb.conf untouched. Remove the stale section manually if it is a leftover."
+  fi
+  rm -f "$tmp"
+}
+
+# Never clobber the host's /etc/fuse.conf (SW-12): back it up (or create it) and
+# append user_allow_other inside a marker block; record the action for uninstall.
+configure_fuse_conf() {
+  if [[ -f /etc/fuse.conf ]]; then
+    remove_marker_block /etc/fuse.conf
+    if grep -qE '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf; then
+      # The host already enables user_allow_other on its own — change nothing.
+      record_state FUSE_CONF_ACTION "untouched"
+      return 0
+    fi
+    if [[ "$(get_state FUSE_CONF_ACTION)" != "created" ]]; then
+      [[ -f /etc/fuse.conf.seaweedfs-bak ]] || cp -p /etc/fuse.conf /etc/fuse.conf.seaweedfs-bak
+      record_state FUSE_CONF_ACTION "backed_up"
+    fi
+  else
+    touch /etc/fuse.conf
+    record_state FUSE_CONF_ACTION "created"
+  fi
+  cat >> /etc/fuse.conf <<EOF
+${MARKER_BEGIN}
+user_allow_other
+${MARKER_END}
+EOF
+}
+
+file_md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# Restart a running container when its bind-mounted config content changed (SW-8):
+# 'docker compose up' only reacts to compose-file changes, not to regenerated
+# bind-mounted configs, so password/setting rotations never reached the containers.
+restart_if_changed() {
+  local container="$1" before="$2" after="$3"
+  [[ "$before" == "$after" ]] && return 0
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$container"; then
+    echo "  Configuration changed — restarting $container..."
+    docker restart "$container" >/dev/null 2>&1
+  fi
+}
+
+# Re-install convergence (SW-7): when a previous install configured something that is
+# now toggled off via ENABLE_*, tear that piece down so re-install converges instead
+# of leaving orphan stacks/config behind. Driven by the recorded install state.
+reconcile_disabled_services() {
+  [[ -f "$STATE_FILE" ]] || return 0
+  # Monitoring stack
+  if [[ ${ENABLE_MONITORING,,} != "true" && "$(get_state MONITORING_CONFIGURED)" == "true" ]]; then
+    echo "  ENABLE_MONITORING=false — removing previously-installed monitoring stack..."
+    [[ -f /opt/monitoring/docker-compose.yml ]] && docker compose -f /opt/monitoring/docker-compose.yml down --remove-orphans
+    rm -rf /opt/monitoring
+    rm -f /opt/seaweedfs/monitoring-credentials.env
+    record_state MONITORING_CONFIGURED "false"
+    record_state LOADED_MONITORING_IMAGES ""
+  fi
+  # Samba share
+  if [[ ${ENABLE_SMB,,} != "true" && "$(get_state SMB_CONFIGURED)" == "true" ]]; then
+    echo "  ENABLE_SMB=false — removing previously-configured Samba share..."
+    local smb_service share user created
+    smb_service=$(get_state SMB_SERVICE_NAME); smb_service=${smb_service:-$SMB_SERVICE}
+    share=$(get_state SMB_SHARE_NAME); share=${share:-$DEFAULT_FILER_DIR_NAME}
+    user=$(get_state SWFS_USER_NAME); user=${user:-$SWFS_USER}
+    created=$(get_state SWFS_USER_CREATED)
+    remove_marker_block /etc/samba/smb.conf
+    remove_legacy_smb_block "$share"
+    smbpasswd -x "$user" 2>/dev/null || true
+    if [[ "$created" == "true" ]] && id "$user" &>/dev/null; then
+      userdel "$user"
+    fi
+    systemctl restart "$smb_service" 2>/dev/null
+    record_state SMB_CONFIGURED "false"
+    record_state SWFS_USER_CREATED "false"
+  fi
+  # NFS export + refresh timer
+  if [[ ${ENABLE_NFS,,} != "true" && "$(get_state NFS_CONFIGURED)" == "true" ]]; then
+    echo "  ENABLE_NFS=false — removing previously-configured NFS export..."
+    local nfs_service
+    nfs_service=$(get_state NFS_SERVICE_NAME)
+    if [[ -z "$nfs_service" ]]; then
+      nfs_service="$NFS_SERVICE"
+      [[ $ID == "ubuntu" || $ID == "debian" ]] && nfs_service="nfs-kernel-server"
+    fi
+    [[ -f /etc/exports ]] && sed -i '/ # seaweedfs-installer$/d' /etc/exports
+    exportfs -ra 2>/dev/null
+    systemctl restart "$nfs_service" 2>/dev/null
+    systemctl disable --now seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
+    rm -f /etc/systemd/system/seaweedfs-nfs-meta-refresh.service /etc/systemd/system/seaweedfs-nfs-meta-refresh.timer
+    systemctl daemon-reload
+    record_state NFS_CONFIGURED "false"
+  fi
+  # fuse.conf: when neither share type is wanted anymore, revert the recorded change.
+  if [[ ${ENABLE_SMB,,} != "true" && ${ENABLE_NFS,,} != "true" ]]; then
+    case "$(get_state FUSE_CONF_ACTION)" in
+      created)
+        remove_marker_block /etc/fuse.conf
+        [[ -s /etc/fuse.conf ]] || rm -f /etc/fuse.conf
+        record_state FUSE_CONF_ACTION ""
+        ;;
+      backed_up)
+        if [[ -f /etc/fuse.conf.seaweedfs-bak ]]; then
+          mv /etc/fuse.conf.seaweedfs-bak /etc/fuse.conf
+        else
+          remove_marker_block /etc/fuse.conf
+        fi
+        record_state FUSE_CONF_ACTION ""
+        ;;
+    esac
+  fi
+}
+
+# --- Firewall handling (SW-9) --- #
+# Rocky/RHEL and Leap 16 default-enforce firewalld; Ubuntu may run UFW. Open only
+# what the enabled services need, remember exactly what WE added in the state file,
+# reconcile on re-install (toggled-off ports are closed again), and let uninstall
+# remove exactly the recorded set.
+
+# Port/proto list for the currently-enabled features (Caddy/S3/MQ/monitoring/cluster).
+firewall_collect_ports() {
+  local ports="$SWFS_ADMIN_PORT/tcp $SWFS_MASTER_PORT/tcp $SWFS_FILER_PORT/tcp $SWFS_S3_PORT/tcp"
+  [[ ${ENABLE_MQ,,} == "true" ]] && ports+=" $MQ_BROKER_PORT/tcp"
+  [[ ${ENABLE_MONITORING,,} == "true" ]] && ports+=" $GRAFANA_PORT/tcp $LOKI_PORT/tcp $PROMETHEUS_EXT_PORT/tcp"
+  [[ ${CLUSTER_MODE,,} == "cluster" ]] && ports+=" $CLUSTER_MASTER_GRPC_PORT/tcp $CLUSTER_VOLUME_PORT/tcp $CLUSTER_VOLUME_GRPC_PORT/tcp"
+  echo "$ports"
+}
+
+# configure_firewall "<port/proto list>" "<smb: true|false>" "<nfs: true|false>"
+configure_firewall() {
+  local want_ports="$1" want_smb="$2" want_nfs="$3"
+  local want_services=""
+  # firewalld models SMB/NFSv3 helper ports (rpcbind/mountd) as named services.
+  [[ "$want_smb" == "true" ]] && want_services+="samba "
+  [[ "$want_nfs" == "true" ]] && want_services+="nfs rpc-bind mountd "
+  if systemctl is-active firewalld >/dev/null 2>&1 && command -v firewall-cmd >/dev/null 2>&1; then
+    echo "  firewalld is active — reconciling required ports/services..."
+    local prior_ports prior_services keep_ports="" keep_services="" p s changed=0
+    prior_ports=$(get_state FIREWALLD_ADDED_PORTS)
+    prior_services=$(get_state FIREWALLD_ADDED_SERVICES)
+    # Close ports/services we opened earlier that are no longer wanted (toggle-off).
+    for p in $prior_ports; do
+      if ! list_contains "$p" "$want_ports"; then
+        firewall-cmd --permanent --remove-port="$p" >/dev/null 2>&1 && changed=1
+      fi
+    done
+    for s in $prior_services; do
+      if ! list_contains "$s" "$want_services"; then
+        firewall-cmd --permanent --remove-service="$s" >/dev/null 2>&1 && changed=1
+      fi
+    done
+    # Open what is wanted; only claim ownership of entries WE actually add.
+    for p in $want_ports; do
+      if firewall-cmd --permanent --query-port="$p" >/dev/null 2>&1; then
+        list_contains "$p" "$prior_ports" && keep_ports+="$p "
+      else
+        firewall-cmd --permanent --add-port="$p" >/dev/null 2>&1 && keep_ports+="$p " && changed=1
+      fi
+    done
+    for s in $want_services; do
+      if firewall-cmd --permanent --query-service="$s" >/dev/null 2>&1; then
+        list_contains "$s" "$prior_services" && keep_services+="$s "
+      else
+        firewall-cmd --permanent --add-service="$s" >/dev/null 2>&1 && keep_services+="$s " && changed=1
+      fi
+    done
+    [[ $changed -eq 1 ]] && firewall-cmd --reload >/dev/null 2>&1
+    record_state FIREWALLD_ADDED_PORTS "${keep_ports% }"
+    record_state FIREWALLD_ADDED_SERVICES "${keep_services% }"
+  elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    echo "  UFW is active — reconciling required ports..."
+    # UFW has no service objects for SMB/NFS — use the well-known ports. NOTE: NFSv3
+    # mountd uses a dynamic port unless pinned; firewalld handles this via its
+    # 'mountd' service, UFW cannot (documented in README).
+    [[ "$want_smb" == "true" ]] && want_ports+=" 445/tcp 139/tcp"
+    [[ "$want_nfs" == "true" ]] && want_ports+=" 2049/tcp 111/tcp 111/udp"
+    local prior_ports keep_ports="" p
+    prior_ports=$(get_state UFW_ADDED_PORTS)
+    for p in $prior_ports; do
+      if ! list_contains "$p" "$want_ports"; then
+        ufw --force delete allow "$p" >/dev/null 2>&1
+      fi
+    done
+    for p in $want_ports; do
+      ufw allow "$p" comment 'seaweedfs-installer' >/dev/null 2>&1 && keep_ports+="$p "
+    done
+    record_state UFW_ADDED_PORTS "${keep_ports% }"
+  else
+    echo "  No active firewall manager (firewalld/UFW) detected — no firewall changes made."
+  fi
+}
+
+# Uninstall: remove exactly what configure_firewall recorded.
+# $1=firewalld ports  $2=firewalld services  $3=ufw ports
+remove_firewall_rules() {
+  local fwd_ports="$1" fwd_services="$2" ufw_ports="$3" p s changed=0
+  if [[ -n "$fwd_ports$fwd_services" ]] && command -v firewall-cmd >/dev/null 2>&1; then
+    echo "  Removing firewalld ports/services added by this installer..." | tee -a "$LOG_FILE"
+    for p in $fwd_ports; do
+      firewall-cmd --permanent --remove-port="$p" >/dev/null 2>&1 && changed=1
+    done
+    for s in $fwd_services; do
+      firewall-cmd --permanent --remove-service="$s" >/dev/null 2>&1 && changed=1
+    done
+    [[ $changed -eq 1 ]] && firewall-cmd --reload >/dev/null 2>&1
+  fi
+  if [[ -n "$ufw_ports" ]] && command -v ufw >/dev/null 2>&1; then
+    echo "  Removing UFW rules added by this installer..." | tee -a "$LOG_FILE"
+    for p in $ufw_ports; do
+      ufw --force delete allow "$p" >/dev/null 2>&1
+    done
+  fi
+}
+
+# --- SELinux handling (SW-10) --- #
+# On enforcing hosts (Rocky/RHEL, Leap 16) smbd cannot read the FUSE-mounted
+# /mnt/seaweed without the samba_share_fusefs boolean. Apply it (recording the prior
+# value for uninstall) or warn loudly with the exact remediation.
+configure_selinux() {
+  command -v getenforce >/dev/null 2>&1 || return 0
+  [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]] || return 0
+  if [[ ${ENABLE_SMB,,} == "true" ]]; then
+    echo "  SELinux is enforcing — enabling Samba access to the FUSE share..."
+    local prior=""
+    prior=$(getsebool samba_share_fusefs 2>/dev/null | awk '{print $3}')
+    if [[ -z "$prior" ]]; then
+      echo "  WARNING: samba_share_fusefs boolean not found — the SMB share will likely be blocked by SELinux." | tee -a "$LOG_FILE"
+      echo "  Remediation: install the samba SELinux policy, then: setsebool -P samba_share_fusefs on" | tee -a "$LOG_FILE"
+    elif [[ "$prior" != "on" ]]; then
+      if setsebool -P samba_share_fusefs on 2>/dev/null; then
+        record_state SELINUX_SAMBA_FUSEFS_PRIOR "$prior"
+      else
+        echo "  WARNING: failed to set samba_share_fusefs — run manually: setsebool -P samba_share_fusefs on" | tee -a "$LOG_FILE"
+      fi
+    fi
+  fi
+  if [[ ${ENABLE_NFS,,} == "true" ]]; then
+    if [[ "$(getsebool nfs_export_all_rw 2>/dev/null | awk '{print $3}')" == "off" ]]; then
+      echo "  WARNING: SELinux boolean nfs_export_all_rw is off — NFS clients may be denied writes." | tee -a "$LOG_FILE"
+      echo "  Remediation: setsebool -P nfs_export_all_rw on" | tee -a "$LOG_FILE"
+    fi
+  fi
+}
+
+preflight_nfs_check () {
+  # P4-07: the kernel NFS server needs the nfsd module; Ubuntu's 'linux-kvm'
+  # kernel flavor (22.04 minimal images) does not ship it at all. Fail before
+  # any changes are made, with the real remediation, instead of dying mid-install.
+  [[ ${ENABLE_NFS,,} == "true" ]] || return 0
+  if modprobe -n nfsd >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Error: ENABLE_NFS=true but the running kernel ($(uname -r)) has no 'nfsd' module —" | tee -a "$LOG_FILE"
+  echo "  a kernel NFS server cannot run on this kernel. Either re-run with ENABLE_NFS=false," | tee -a "$LOG_FILE"
+  echo "  or install a kernel that ships nfsd (Ubuntu minimal 22.04 images boot the 'linux-kvm'" | tee -a "$LOG_FILE"
+  echo "  flavor, which cannot serve NFS: 'apt install linux-generic' + reboot into it)." | tee -a "$LOG_FILE"
+  exit 1
+}
+
+preflight_port_check () {
+  # P4-06: fail before any changes when a required host port is already bound by
+  # a foreign process (e.g. Rocky 10 ships cockpit.socket enabled on 9090, which
+  # collides with the Prometheus receiver). Converge re-runs skip the check —
+  # the running SeaweedFS stack legitimately holds its own ports.
+  if [[ -f "$STATE_FILE" ]]; then
+    echo "  Existing install state found — port preflight skipped (converge re-run)."
+    return 0
+  fi
+  local conflicts="" entry port proc
+  for entry in $(firewall_collect_ports); do
+    port="${entry%%/*}"
+    proc=$(ss -Hltnp "sport = :$port" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n1)
+    if [[ -z "$proc" ]] && ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
+      proc="unknown"
+    fi
+    if [[ -n "$proc" ]]; then
+      conflicts+="  port $port/tcp is already in use by '$proc'"$'\n'
+    fi
+  done
+  if [[ -n "$conflicts" ]]; then
+    echo "Error: required host ports are already in use:" | tee -a "$LOG_FILE"
+    printf '%s' "$conflicts" | tee -a "$LOG_FILE"
+    echo "  Free the port(s) (or change the corresponding *_PORT variable) and re-run." | tee -a "$LOG_FILE"
+    echo "  (Rocky 10 example: 'systemctl disable --now cockpit.socket' frees 9090.)" | tee -a "$LOG_FILE"
+    exit 1
+  fi
+  echo "  Port preflight passed — all required host ports are free."
+}
+
 install_swfs () {
-  echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a seaweedfs-install.log
+  echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a "$LOG_FILE"
+  preflight_nfs_check
+  preflight_port_check
   mkdir -p /opt/caddy/srv
   mkdir -p /opt/seaweedfs/mini
-  debug_run run_docker
+  record_state STATE_VERSION "1"
+  record_state INSTALL_DATE "$(date)"
+  record_state NODE_ROLE "control"
+  record_state FILER_DIR_NAME "$DEFAULT_FILER_DIR_NAME"
+  record_state MQ_CONFIGURED "${ENABLE_MQ,,}"
+  reconcile_disabled_services
+  debug_run run_docker || die "Docker/image preparation failed."
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
-    download_binaries
+    download_binaries || die "Artifact download failed."
   fi
+  local caddyfile_before
+  caddyfile_before=$(file_md5 /opt/caddy/Caddyfile)
   generate_caddyfile
   generate_compose_file
+  record_state LOADED_IMAGES "$SWFS_IMAGE $CADDY_IMAGE"
   generate_index_html
   echo "  Starting SeaweedFS and Caddy containers..."
-  docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
+  docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
+    || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+  # Apply a regenerated Caddyfile to an already-running container (SW-8): compose
+  # only recreates on compose-file changes, not bind-mounted config changes.
+  restart_if_changed seaweed-caddy "$caddyfile_before" "$(file_md5 /opt/caddy/Caddyfile)"
   echo "  Waiting for SeaweedFS and Caddy to start..."
-  local api_result=""
   local response_code=""
   local attempt=1
-  while true; do
-    echo "  Waiting for SeaweedFS Filer to start..."
-    api_result=$(docker exec -i seaweed-mini curl -sS -m 2 -o /dev/null -w '%{http_code}' http://localhost:8888)
-    response_code=$api_result
+  local filer_ready=0
+  while [[ $attempt -le 24 ]]; do
+    echo "  Waiting for SeaweedFS Filer to start... (attempt $attempt/24)"
+    response_code=$(docker exec -i seaweed-mini curl -sS -m 2 -o /dev/null -w '%{http_code}' http://localhost:8888 2>/dev/null)
     if [[ -n $response_code && $response_code -ge "200" && $response_code -lt "300" ]]; then
-      echo "  Creating default artifact directory on SeaweedFS Filer..."
-      docker exec -i seaweed-mini curl -X POST http://localhost:8888/$DEFAULT_FILER_DIR_NAME/ && echo
-      upload_binaries
+      filer_ready=1
       break
     fi
-    if [[ $attempt -ge 10 ]]; then
-      echo "Timeout waiting for SeaweedFS Filer to start.. skipping artifact directory creation"
-      break
-    fi
-    echo "  Attempt: $attempt"
     ((attempt++))
     sleep 5
   done
+  if [[ $filer_ready -ne 1 ]]; then
+    die "Timeout waiting for SeaweedFS Filer to become ready (120s). Check 'docker logs seaweed-mini'."
+  fi
+  echo "  Creating default artifact directory on SeaweedFS Filer..."
+  # 409 = already exists: the seaweed-mount container auto-creates the filer
+  # path when it wins the startup race, and re-runs always find it - both are
+  # success for an idempotent install, not a failure
+  local mkdir_code
+  mkdir_code=$(docker exec -i seaweed-mini curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST "http://localhost:8888/$DEFAULT_FILER_DIR_NAME/" 2>/dev/null)
+  case "$mkdir_code" in
+    2??|409) : ;;
+    *) die "Failed to create default artifact directory '$DEFAULT_FILER_DIR_NAME' on the Filer (HTTP ${mkdir_code:-no-response})." ;;
+  esac
+  upload_binaries
   echo "  Configuring S3 credentials..."
-  echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
+  local shell_out=""
+  shell_out=$(echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell 2>&1)
+  echo "$shell_out" >> "$LOG_FILE"
+  echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)' && die "S3 credential configuration failed (see $LOG_FILE)."
   echo "  Creating S3 buckets..."
   local all_buckets="$S3_BUCKET"
-  if [[ ${ENABLE_MONITORING,,} == "true" && ! "$all_buckets" =~ (^| )$LOKI_BUCKET( |$) ]]; then
+  if [[ ${ENABLE_MONITORING,,} == "true" ]] && ! list_contains "$LOKI_BUCKET" "$all_buckets"; then
     all_buckets="$all_buckets $LOKI_BUCKET"
   fi
   for extra in $EXTRA_BUCKETS; do
-    [[ "$all_buckets" =~ (^| )$extra( |$) ]] || all_buckets="$all_buckets $extra"
+    list_contains "$extra" "$all_buckets" || all_buckets="$all_buckets $extra"
   done
+  local existing_buckets=""
+  existing_buckets=$(echo "s3.bucket.list" | docker exec -i seaweed-mini /usr/bin/weed shell 2>/dev/null | awk '{print $1}')
   for bucket in $all_buckets; do
+    if echo "$existing_buckets" | grep -Fxq "$bucket"; then
+      echo "  Bucket already exists, skipping: $bucket"
+      continue
+    fi
     echo "  Creating bucket: $bucket"
-    echo "s3.bucket.create -name $bucket -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell >> seaweedfs-install.log
+    shell_out=$(echo "s3.bucket.create -name $bucket -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell 2>&1)
+    echo "$shell_out" >> "$LOG_FILE"
+    echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)' && die "Failed to create S3 bucket '$bucket' (see $LOG_FILE)."
   done
   if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
     echo "  Setting up monitoring stack (Loki, Grafana, Prometheus)..."
-    debug_run setup_monitoring
+    debug_run setup_monitoring || die "Monitoring stack setup failed."
   fi
   if [[ ${ENABLE_SMB,,} == "true" ]]; then
     run_smb
@@ -166,6 +586,10 @@ install_swfs () {
   if [[ ${ENABLE_NFS,,} == "true" ]]; then
     run_nfs
   fi
+  # SELinux boolean check must come AFTER the samba packages (and their SELinux
+  # policy) are installed by run_smb.
+  configure_selinux
+  configure_firewall "$(firewall_collect_ports)" "${ENABLE_SMB,,}" "${ENABLE_NFS,,}"
   generate_outputs
 }
 
@@ -174,42 +598,57 @@ run_docker() {
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_image_pull_push
     if [[ $PUSH_MODE -eq 1 ]]; then
-      cat >$base_dir/utilities/images.txt <<EOF
+      cat >"$base_dir/utilities/images.txt" <<EOF
 $SWFS_IMAGE
 $CADDY_IMAGE
 EOF
       if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
-        cat >> $base_dir/utilities/images.txt <<EOF
+        cat >> "$base_dir/utilities/images.txt" <<EOF
 $LOKI_IMAGE
 $GRAFANA_IMAGE
 $PROMETHEUS_EXT_IMAGE
 EOF
       fi
-      $base_dir/utilities/image_pull_push.sh -f $base_dir/utilities/images.txt push $REGISTRY_INFO $REG_USER $REG_PASS
+      "$base_dir/utilities/image_pull_push.sh" -f "$base_dir/utilities/images.txt" push "$REGISTRY_INFO" "$REG_USER" "$REG_PASS" \
+        || die "image_pull_push.sh push to $REGISTRY_INFO failed."
     else
       # Still grab registry cert if needed
       if [[ $REGISTRY_MODE -eq 1 ]]; then
-        $base_dir/utilities/image_pull_push.sh reg-cert $REGISTRY_INFO
+        "$base_dir/utilities/image_pull_push.sh" reg-cert "$REGISTRY_INFO" \
+          || die "image_pull_push.sh reg-cert for $REGISTRY_INFO failed."
       fi
-      $base_dir/utilities/image_pull_push.sh docker
+      "$base_dir/utilities/image_pull_push.sh" docker \
+        || die "image_pull_push.sh docker (Docker runtime setup) failed."
     fi
   else
     # AIR_GAPPED_MODE is set
-    for file in $base_dir/utilities/container_images_*.tar.gz; do
+    shopt -s nullglob
+    local image_archives=("$base_dir"/utilities/container_images_*.tar.gz)
+    shopt -u nullglob
+    if [[ ${#image_archives[@]} -eq 0 ]]; then
+      die "Air-gapped mode: no container_images_*.tar.gz archives found in $base_dir/utilities/ — the save bundle is incomplete."
+    fi
+    local file
+    for file in "${image_archives[@]}"; do
       if [[ $PUSH_MODE -eq 1 ]]; then
-        $base_dir/utilities/image_pull_push.sh -f $file push $REGISTRY_INFO $REG_USER $REG_PASS
+        "$base_dir/utilities/image_pull_push.sh" -f "$file" push "$REGISTRY_INFO" "$REG_USER" "$REG_PASS" \
+          || die "image_pull_push.sh push of $(basename "$file") failed."
       else
-        $base_dir/utilities/image_pull_push.sh -f $file keep
+        "$base_dir/utilities/image_pull_push.sh" -f "$file" keep \
+          || die "image_pull_push.sh load of $(basename "$file") failed."
       fi
     done
     # Still grab registry cert if needed
     if [[ $REGISTRY_MODE -eq 1 ]]; then
-      $base_dir/utilities/image_pull_push.sh reg-cert $REGISTRY_INFO
+      "$base_dir/utilities/image_pull_push.sh" reg-cert "$REGISTRY_INFO" \
+        || die "image_pull_push.sh reg-cert for $REGISTRY_INFO failed."
     fi
   fi
   if [[ $REGISTRY_MODE -eq 1 ]]; then
     echo "  Logging into local registry $REG_FQDN:$REG_PORT ..."
-    docker login $REG_FQDN:$REG_PORT -u "$REG_USER" -p "$REG_PASS"
+    printf '%s' "$REG_PASS" | docker login "$REG_FQDN:$REG_PORT" -u "$REG_USER" --password-stdin \
+      || die "docker login to $REG_FQDN:$REG_PORT failed."
+    record_state REGISTRY_LOGIN "$REG_FQDN:$REG_PORT"
   fi
 }
 
@@ -220,26 +659,39 @@ run_smb () {
   fi
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_install_packages
-    cd $base_dir/utilities
-    debug_run ./install_packages.sh online samba
-    cd $base_dir
+    cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
+    debug_run ./install_packages.sh online samba || die "Samba package installation failed."
+    cd "$base_dir"
   else
-    cd $base_dir/utilities
-    debug_run ./install_packages.sh offline samba
-    cd $base_dir
+    cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
+    debug_run ./install_packages.sh offline samba || die "Samba package installation (offline) failed."
+    cd "$base_dir"
   fi
   echo "  Configuring Samba..."
   # Create the SMB user idempotently. If a group of the same name already exists
   # (e.g. Ubuntu ships a pre-existing 'admin' group and SWFS_USER defaults to 'admin'),
   # attach to it with -g; otherwise useradd would abort and the SMB user is never created.
+  # Record whether WE created the account: uninstall must never delete a pre-existing user.
   if ! id "$SWFS_USER" &>/dev/null; then
     swfs_user_group_flag=""
     getent group "$SWFS_USER" >/dev/null 2>&1 && swfs_user_group_flag="-g $SWFS_USER"
-    useradd -M -s /sbin/nologin $swfs_user_group_flag "$SWFS_USER"
+    useradd -M -s /sbin/nologin $swfs_user_group_flag "$SWFS_USER" || die "Failed to create SMB user '$SWFS_USER'."
+    record_state SWFS_USER_CREATED "true"
+  else
+    [[ "$(get_state SWFS_USER_CREATED)" == "true" ]] || record_state SWFS_USER_CREATED "false"
   fi
-  (echo "$SWFS_PASSWORD"; echo "$SWFS_PASSWORD") | smbpasswd -a -s $SWFS_USER
-  cp /etc/samba/smb.conf /etc/samba/smb.conf.bak
+  record_state SWFS_USER_NAME "$SWFS_USER"
+  (echo "$SWFS_PASSWORD"; echo "$SWFS_PASSWORD") | smbpasswd -a -s "$SWFS_USER" \
+    || die "smbpasswd failed for user '$SWFS_USER'."
+  # One-time backup of the pre-install smb.conf (kept for operator reference; the
+  # marker block below — not this backup — is what uninstall removes).
+  [[ -f /etc/samba/smb.conf.bak ]] || cp -p /etc/samba/smb.conf /etc/samba/smb.conf.bak
+  # Reconcile: remove any previous seaweedfs-installer block (marked or legacy
+  # pre-marker), then append the current one. Re-runs converge instead of duplicating.
+  remove_marker_block /etc/samba/smb.conf
+  remove_legacy_smb_block "$DEFAULT_FILER_DIR_NAME"
   cat >> /etc/samba/smb.conf <<EOF
+${MARKER_BEGIN}
 [$DEFAULT_FILER_DIR_NAME]
    comment = SeaweedFS FUSE Mount
    path = /mnt/seaweed
@@ -249,16 +701,20 @@ run_smb () {
    valid users = $SWFS_USER
    create mask = 0664
    directory mask = 0775
-   
+
    vfs objects = fruit streams_xattr
    fruit:metadata = stream
    fruit:model = MacSamba
-   
+
    force user = root
    force group = root
+${MARKER_END}
 EOF
   echo "  Restarting Samba..."
-  systemctl restart $SMB_SERVICE
+  systemctl restart "$SMB_SERVICE" || die "Failed to restart Samba service '$SMB_SERVICE'."
+  record_state SMB_CONFIGURED "true"
+  record_state SMB_SERVICE_NAME "$SMB_SERVICE"
+  record_state SMB_SHARE_NAME "$DEFAULT_FILER_DIR_NAME"
 }
 
 run_nfs () {
@@ -267,15 +723,18 @@ run_nfs () {
   fi
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_install_packages
-    cd $base_dir/utilities
-    debug_run ./install_packages.sh online nfs-kernel-server
-    cd $base_dir
+    cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
+    debug_run ./install_packages.sh online "$NFS_PACKAGE" || die "NFS server package ($NFS_PACKAGE) installation failed."
+    cd "$base_dir"
   else
-    cd $base_dir/utilities
-    debug_run ./install_packages.sh offline nfs-kernel-server
-    cd $base_dir
+    cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
+    debug_run ./install_packages.sh offline "$NFS_PACKAGE" || die "NFS server package ($NFS_PACKAGE) installation (offline) failed."
+    cd "$base_dir"
   fi
   echo "  Configuring NFS export..."
+  # Reconcile: drop any previously-appended seaweedfs-installer export line first so
+  # re-installs never duplicate the export (the trailing marker tags our lines).
+  [[ -f /etc/exports ]] && sed -i '/ # seaweedfs-installer$/d' /etc/exports
   # fsid= is REQUIRED here: /mnt/seaweed is a FUSE (weed mount) filesystem, which
   # has no stable device UUID for knfsd to derive filehandles from. Without an
   # explicit fsid, exportfs warns/refuses and clients hit ESTALE after a weed
@@ -284,11 +743,13 @@ run_nfs () {
 /mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=1) # seaweedfs-installer
 EOF
   echo "  Exporting NFS filesystem..."
-  exportfs -ra
+  exportfs -ra || die "exportfs -ra failed."
   echo "  Restarting NFS service..."
-  systemctl enable $NFS_SERVICE
-  systemctl restart $NFS_SERVICE
+  systemctl enable "$NFS_SERVICE"
+  systemctl restart "$NFS_SERVICE" || die "Failed to restart NFS service '$NFS_SERVICE'."
   configure_nfs_meta_refresh
+  record_state NFS_CONFIGURED "true"
+  record_state NFS_SERVICE_NAME "$NFS_SERVICE"
 }
 
 # NFSv3 re-export of the weed-mount FUSE filesystem is only *eventually* consistent
@@ -338,7 +799,9 @@ Unit=seaweedfs-nfs-meta-refresh.service
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now seaweedfs-nfs-meta-refresh.timer
+  systemctl enable seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
+  # restart (not 'enable --now') so a CHANGED interval takes effect on a running timer (SW-16)
+  systemctl restart seaweedfs-nfs-meta-refresh.timer || die "Failed to start the NFS metadata refresh timer."
 }
 
 generate_caddyfile () {
@@ -348,7 +811,10 @@ generate_caddyfile () {
     local caddy_image_local="$CADDY_IMAGE"
   fi
   CADDY_HASHED_PASSWORD=$(docker run --rm ${caddy_image_local} caddy hash-password --plaintext "${SWFS_PASSWORD}")
-  echo "  Creating Caddyfile..." | tee -a seaweedfs-install.log
+  if [[ -z "$CADDY_HASHED_PASSWORD" ]]; then
+    die "Failed to hash SWFS_PASSWORD with the Caddy image ($caddy_image_local). Is the image available?"
+  fi
+  echo "  Creating Caddyfile..." | tee -a "$LOG_FILE"
   cat > /opt/caddy/Caddyfile <<EOF
 {
         debug
@@ -478,7 +944,7 @@ generate_compose_file () {
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_VOLUME_PORT:$CLUSTER_VOLUME_PORT\""$'\n'
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_VOLUME_GRPC_PORT:$CLUSTER_VOLUME_GRPC_PORT\""$'\n'
   fi
-  echo "  Creating seaweedfs-compose.yaml..." | tee -a seaweedfs-install.log
+  echo "  Creating seaweedfs-compose.yaml..." | tee -a "$LOG_FILE"
   cat > /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
 networks:
   seaweed_net:
@@ -537,7 +1003,7 @@ EOF
   fi
   if [[ ${ENABLE_SMB,,} == "true" || ${ENABLE_NFS,,} == "true" ]]; then
     mkdir -p /mnt/seaweed
-    echo "user_allow_other" > /etc/fuse.conf
+    configure_fuse_conf
     cat >> /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
   seaweed-mount:
     image: $SWFS_IMAGE
@@ -559,7 +1025,7 @@ fi
 
 
 generate_index_html () {
-  echo "  Creating index.html files..." | tee -a seaweedfs-install.log
+  echo "  Creating index.html files..." | tee -a "$LOG_FILE"
   cat > /opt/caddy/srv/index.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
@@ -759,7 +1225,9 @@ generate_index_html () {
                     'Prometheus: http://' + currentHost + ':$PROMETHEUS_EXT_PORT';
                 }
                 document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
-                document.getElementById('smb-url').textContent = \`net use Z: \\\\\\\\\${currentHost}\\\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES\`;
+                // SW-4: never embed the real password in this unauthenticated page.
+                // '*' makes 'net use' prompt for the password interactively.
+                document.getElementById('smb-url').textContent = \`net use Z: \\\\\\\\\${currentHost}\\\\$DEFAULT_FILER_DIR_NAME * /USER:$SWFS_USER /PERSISTENT:YES\`;
                 document.getElementById('nfs-url').textContent = \`sudo mount -t nfs -o vers=3 \${currentHost}:/mnt/seaweed /mnt/seaweed\`;
                 document.getElementById('curl-mkdir').textContent =
 \`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
@@ -783,23 +1251,25 @@ EOF
 }
 
 download_image_pull_push () {
-  if [[ ! -f $base_dir/utilities/image_pull_push.sh ]]; then
+  if [[ ! -f "$base_dir/utilities/image_pull_push.sh" ]]; then
     echo "  Downloading image_pull_push.sh..."
-    curl -sfL https://github.com/Chubtoad5/images-pull-push/raw/refs/heads/main/image_pull_push.sh  -o $base_dir/utilities/image_pull_push.sh
-    chmod +x $base_dir/utilities/image_pull_push.sh
+    curl -sfL https://github.com/Chubtoad5/images-pull-push/raw/refs/heads/main/image_pull_push.sh -o "$base_dir/utilities/image_pull_push.sh" \
+      || die "Failed to download image_pull_push.sh (check network access, or use the air-gap bundle)."
+    chmod +x "$base_dir/utilities/image_pull_push.sh"
   fi
 }
 
 download_install_packages () {
-  if [[ ! -f $base_dir/utilities/install_packages.sh ]]; then
+  if [[ ! -f "$base_dir/utilities/install_packages.sh" ]]; then
     echo "  Downloading install_packages.sh..."
-    curl -sfL https://github.com/Chubtoad5/install-packages/raw/refs/heads/main/install_packages.sh  -o $base_dir/utilities/install_packages.sh
-    chmod +x $base_dir/utilities/install_packages.sh
+    curl -sfL https://github.com/Chubtoad5/install-packages/raw/refs/heads/main/install_packages.sh -o "$base_dir/utilities/install_packages.sh" \
+      || die "Failed to download install_packages.sh (check network access, or use the air-gap bundle)."
+    chmod +x "$base_dir/utilities/install_packages.sh"
   fi
 }
 
 generate_outputs () {
-  cat >> seaweedfs-install.log <<EOF
+  cat >> "$LOG_FILE" <<EOF
 # -- SeaweedFS Installer Finished - $(date) -- #
 
 Docker compose file:   /opt/seaweedfs/seaweedfs-compose.yaml
@@ -834,7 +1304,7 @@ S3 Details:
   >>>               https://$MGMT_IP:$SWFS_ADMIN_PORT <<<
 EOF
   if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
-    cat >> seaweedfs-install.log <<EOF
+    cat >> "$LOG_FILE" <<EOF
 
 Monitoring Stack:
   Grafana:            https://$GRAFANA_FQDN:$GRAFANA_PORT  (user: $SWFS_USER / pass: $SWFS_PASSWORD)
@@ -846,27 +1316,71 @@ Monitoring Stack:
   Credentials file:   /opt/seaweedfs/monitoring-credentials.env
 EOF
   fi
-  echo
-  cat seaweedfs-install.log | tail -40
+  chmod 600 "$LOG_FILE"
+  # Console banner: same summary but with secrets MASKED (SW-13). ap-tools captures
+  # stdout into its own logs; the full credentials live only in the 600-mode files.
+  cat <<EOF
+
+# -- SeaweedFS Installer Finished - $(date) -- #
+
+The following services are accessible by IP or FQDN if DNS is configured:
+  Master UI:    https://$SWFS_MASTER_FQDN:$SWFS_MASTER_PORT
+  Filer UI:     https://$SWFS_FILER_FQDN:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME
+  S3 Endpoint:  https://$SWFS_S3_FQDN:$SWFS_S3_PORT
+  Admin UI:     https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT
+  MQ Broker:    $HOST_FQDN:$MQ_BROKER_PORT
+
+Master UI, Filer UI, and Admin UI require authentication:
+  Username: $SWFS_USER
+  Password: (hidden — see $base_dir/$LOG_FILE)
+S3 Details:
+  API User: $S3_USER
+  API Key/Secret: (hidden — see $base_dir/$LOG_FILE or /opt/seaweedfs/monitoring-credentials.env)
+  Default Bucket: $S3_BUCKET
+  Extra Buckets: ${EXTRA_BUCKETS:-<none>}
+
+Full credentials and connection examples: $base_dir/$LOG_FILE (mode 600)
+
+  >>> Landing page: https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT <<<
+  >>>               https://$MGMT_IP:$SWFS_ADMIN_PORT <<<
+EOF
+  if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
+    cat <<EOF
+
+Monitoring Stack:
+  Grafana:            https://$GRAFANA_FQDN:$GRAFANA_PORT  (user: $SWFS_USER, password hidden)
+  Grafana (by IP):    https://$MGMT_IP:$GRAFANA_PORT
+  Loki:               http://$MGMT_IP:$LOKI_PORT
+  Prometheus:         http://$MGMT_IP:$PROMETHEUS_EXT_PORT
+  Cluster label:      $CLUSTER_NAME
+  Loki log bucket:    $LOKI_BUCKET
+  Credentials file:   /opt/seaweedfs/monitoring-credentials.env (mode 600)
+EOF
+  fi
   echo
 }
 
 download_binaries () {
-  echo "  Downloading artifact binaries..." | tee -a seaweedfs-install.log
-  cd $base_dir/utilities/artifacts
+  echo "  Downloading artifact binaries..." | tee -a "$LOG_FILE"
+  cd "$base_dir/utilities/artifacts" || return 1
   read -a ARTIFACTS_TO_DOWNLOAD_ARRAY <<< "$ARTIFACTS_TO_DOWNLOAD"
   for url in "${ARTIFACTS_TO_DOWNLOAD_ARRAY[@]}"; do
-    echo "  Downloading $(basename $url)..." | tee -a ../seaweedfs-install.log
-    curl -kfLO "$url"
+    echo "  Downloading $(basename "$url")..." | tee -a "$base_dir/$LOG_FILE"
+    if ! curl -kfLO "$url"; then
+      echo "  ERROR: failed to download artifact $url" | tee -a "$base_dir/$LOG_FILE"
+      cd "$base_dir"
+      return 1
+    fi
   done
-  cd $base_dir
+  cd "$base_dir"
 }
 
 upload_binaries () {
-  echo "  Uploading artifact binaries to SeaweedFS Filer..." | tee -a seaweedfs-install.log
-  for file in $base_dir/utilities/artifacts/*; do
+  echo "  Uploading artifact binaries to SeaweedFS Filer..." | tee -a "$LOG_FILE"
+  for file in "$base_dir"/utilities/artifacts/*; do
     if [[ -f "$file" ]]; then
-        curl -ku $SWFS_USER:$SWFS_PASSWORD -X POST https://$MGMT_IP:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME/$(basename "$file") -F file=@$base_dir/utilities/artifacts/$(basename "$file")
+      curl -skfu "$SWFS_USER:$SWFS_PASSWORD" -X POST "https://$MGMT_IP:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME/$(basename "$file")" -F "file=@$file" \
+        || echo "  WARNING: failed to upload artifact $(basename "$file") to the Filer." | tee -a "$LOG_FILE"
     fi
   done
 }
@@ -933,6 +1447,10 @@ query_range:
         enabled: true
         max_size_mb: 100
 EOF
+  # The config embeds the S3 keys (SW-13): readable only by the Loki container user
+  # (grafana/loki runs as UID 10001) and root.
+  chown 10001:10001 /opt/monitoring/loki/loki-config.yaml 2>/dev/null
+  chmod 400 /opt/monitoring/loki/loki-config.yaml
 }
 
 generate_prometheus_ext_config () {
@@ -993,6 +1511,7 @@ generate_monitoring_compose () {
     local grafana_image="$GRAFANA_IMAGE"
     local prometheus_image="$PROMETHEUS_EXT_IMAGE"
   fi
+  record_state LOADED_MONITORING_IMAGES "$loki_image $grafana_image $prometheus_image"
   cat > /opt/monitoring/docker-compose.yml <<EOF
 networks:
   seaweed_net:
@@ -1081,14 +1600,29 @@ EOF
 
 setup_monitoring () {
   mkdir -p /opt/monitoring/{loki/data,prometheus/data,grafana/data,grafana/provisioning/datasources}
-  chmod 777 /opt/monitoring/{loki/data,prometheus/data,grafana/data}
+  # Data dirs owned by each container's runtime user instead of world-writable (SW-23):
+  # loki=10001, prometheus=nobody(65534), grafana=472.
+  chown 10001:10001 /opt/monitoring/loki/data
+  chown 65534:65534 /opt/monitoring/prometheus/data
+  chown 472:472 /opt/monitoring/grafana/data
+  chmod 750 /opt/monitoring/loki/data /opt/monitoring/prometheus/data /opt/monitoring/grafana/data
+  local loki_before prom_before ds_before
+  loki_before=$(file_md5 /opt/monitoring/loki/loki-config.yaml)
+  prom_before=$(file_md5 /opt/monitoring/prometheus/prometheus.yml)
+  ds_before=$(file_md5 /opt/monitoring/grafana/provisioning/datasources/datasources.yaml)
   generate_loki_config
   generate_prometheus_ext_config
   generate_grafana_datasources
   generate_monitoring_compose
   write_monitoring_credentials
   echo "  Starting monitoring stack (Loki, Grafana, Prometheus)..."
-  docker compose -f /opt/monitoring/docker-compose.yml up -d
+  docker compose -f /opt/monitoring/docker-compose.yml up -d --remove-orphans \
+    || die "docker compose up failed for /opt/monitoring/docker-compose.yml."
+  record_state MONITORING_CONFIGURED "true"
+  # Apply regenerated bind-mounted configs to running containers (SW-8).
+  restart_if_changed loki "$loki_before" "$(file_md5 /opt/monitoring/loki/loki-config.yaml)"
+  restart_if_changed prometheus "$prom_before" "$(file_md5 /opt/monitoring/prometheus/prometheus.yml)"
+  restart_if_changed grafana "$ds_before" "$(file_md5 /opt/monitoring/grafana/provisioning/datasources/datasources.yaml)"
   echo "  Waiting for monitoring stack to become healthy..."
   local attempt=1
   while [[ $attempt -le 12 ]]; do
@@ -1101,6 +1635,9 @@ setup_monitoring () {
     ((attempt++))
     sleep 10
   done
+  if [[ $attempt -gt 12 ]]; then
+    echo "  WARNING: Loki did not report ready within 120s — monitoring may still be starting. Check 'docker logs loki'." | tee -a "$LOG_FILE"
+  fi
 }
 
 debug_run() {
@@ -1138,6 +1675,13 @@ os_check () {
     echo "Unknown or unsupported OS $OS_ID."
     exit 1
   fi
+  # NFS server package name is distro-specific (SW-1): 'nfs-kernel-server' does not
+  # exist on the RHEL family — requesting it there silently left NFS uninstalled and
+  # produced save bundles without NFS packages.
+  case "$OS_ID" in
+    rhel|centos|rocky|almalinux|fedora) NFS_PACKAGE="nfs-utils" ;;
+    *)                                  NFS_PACKAGE="nfs-kernel-server" ;;  # Debian/Ubuntu and SUSE both ship nfs-kernel-server
+  esac
 }
 
 # best-effort source fetch; never fails the save ($1=url $2=dest $3=label)
@@ -1174,7 +1718,7 @@ generate_bundle_licenses() {
     echo ""
     echo "OS distribution packages bundled via install-packages (each keeps its own license):"
     echo "  samba ............... GPL-3.0-or-later   (see WRITTEN_OFFER.txt)"
-    echo "  nfs-kernel-server ... GPL-2.0-or-later   (see WRITTEN_OFFER.txt)"
+    printf "  %-21s GPL-2.0-or-later   (see WRITTEN_OFFER.txt)\\n" "$NFS_PACKAGE ...."
     echo "The installer scripts themselves are Apache-2.0 (Chubtoad5)."
   } > "$dir/THIRD_PARTY_NOTICES.txt"
 
@@ -1188,7 +1732,7 @@ generate_bundle_licenses() {
     echo ""
     echo "OS distribution packages (bundled via install-packages):"
     echo "  samba ............... GPL-3.0-or-later"
-    echo "  nfs-kernel-server ... GPL-2.0-or-later"
+    printf "  %-21s GPL-2.0-or-later\\n" "$NFS_PACKAGE ...."
     echo "Their corresponding source is available from the OS distribution's own source"
     echo "archives ('apt-get source <pkg>' / the distro source mirrors for the bundled version)."
     if [[ "$mon" == "yes" ]]; then
@@ -1227,27 +1771,30 @@ run_save () {
   echo "  Preparing SeaweedFS offline archive..."
   debug_run download_image_pull_push
   debug_run download_install_packages
-  cat >$base_dir/utilities/images.txt <<EOF
+  cat >"$base_dir/utilities/images.txt" <<EOF
 $SWFS_IMAGE
 $CADDY_IMAGE
 EOF
   if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
-    cat >> $base_dir/utilities/images.txt <<EOF
+    cat >> "$base_dir/utilities/images.txt" <<EOF
 $LOKI_IMAGE
 $GRAFANA_IMAGE
 $PROMETHEUS_EXT_IMAGE
 EOF
   fi
-  cd $base_dir/utilities
-  debug_run ./image_pull_push.sh -f $base_dir/utilities/images.txt save
+  cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
+  debug_run ./image_pull_push.sh -f "$base_dir/utilities/images.txt" save \
+    || die "image_pull_push.sh save failed — container image archive was not produced."
   # Save Samba + NFS packages into ONE offline-packages.tar.gz. install_packages.sh 'save'
   # recreates the bundle on each call, so two separate calls left only the last package set
   # in the archive (samba was lost) and broke the air-gapped SMB install. One combined call
   # downloads both dependency trees into a single archive.
-  ./install_packages.sh save samba nfs-kernel-server
-  cd $base_dir
-  debug_run download_binaries
-  cat > $base_dir/swfs-save-version.txt <<EOF
+  # NFS server package name is distro-specific ($NFS_PACKAGE, set by os_check).
+  ./install_packages.sh save samba "$NFS_PACKAGE" \
+    || die "install_packages.sh save (samba $NFS_PACKAGE) failed — OS package bundle was not produced."
+  cd "$base_dir"
+  debug_run download_binaries || die "Artifact download failed."
+  cat > "$base_dir/swfs-save-version.txt" <<EOF
 # SeaweedFS Installer Save Archive
 # Created: $(date)
 #
@@ -1257,18 +1804,21 @@ $CADDY_IMAGE
 $(if [[ ${ENABLE_MONITORING,,} == "true" ]]; then printf "%s\n%s\n%s" "$LOKI_IMAGE" "$GRAFANA_IMAGE" "$PROMETHEUS_EXT_IMAGE"; fi)
 EOF
   generate_bundle_licenses
-  tar czf $base_dir/swfs-save.tar.gz utilities install-seaweedfs swfs-save-version.txt LICENSES
+  tar czf "$base_dir/swfs-save.tar.gz" utilities install-seaweedfs swfs-save-version.txt LICENSES \
+    || die "Failed to create swfs-save.tar.gz."
   echo "  created 'swfs-save.tar.gz' for air-gapped deployment."
 }
 
 run_join () {
-  echo "# -- SeaweedFS Volume Join Started - $(date) -- #" | tee -a seaweedfs-install.log
+  echo "# -- SeaweedFS Volume Join Started - $(date) -- #" | tee -a "$LOG_FILE"
   echo "  Joining control-plane master at $CLUSTER_MASTER as a volume node (ip=$MGMT_IP, dc=$CLUSTER_DC, rack=$CLUSTER_RACK)..."
   mkdir -p /opt/seaweedfs/volume
-  debug_run run_docker
+  debug_run run_docker || die "Docker/image preparation failed."
   generate_join_compose_file
   echo "  Starting SeaweedFS volume node..."
-  docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml up -d
+  docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml up -d --remove-orphans \
+    || die "docker compose up failed for /opt/seaweedfs/seaweedfs-volume-compose.yaml."
+  configure_firewall "$CLUSTER_VOLUME_PORT/tcp $CLUSTER_VOLUME_GRPC_PORT/tcp" "false" "false"
   generate_join_outputs
 }
 
@@ -1279,7 +1829,10 @@ generate_join_compose_file () {
   fi
   local VOL_TUNING=""
   [[ -n "$VOLUME_INDEX" ]] && VOL_TUNING+="      -index=$VOLUME_INDEX"$'\n'
-  echo "  Creating seaweedfs-volume-compose.yaml..." | tee -a seaweedfs-install.log
+  record_state STATE_VERSION "1"
+  record_state NODE_ROLE "volume"
+  record_state LOADED_IMAGES "$swfs_image_local"
+  echo "  Creating seaweedfs-volume-compose.yaml..." | tee -a "$LOG_FILE"
   cat > /opt/seaweedfs/seaweedfs-volume-compose.yaml <<EOF
 networks:
   seaweed_net:
@@ -1311,7 +1864,7 @@ EOF
 }
 
 generate_join_outputs () {
-  cat <<EOF | tee -a seaweedfs-install.log
+  cat <<EOF | tee -a "$LOG_FILE"
 
 # -- SeaweedFS Volume Node Joined - $(date) -- #
 
@@ -1338,53 +1891,180 @@ EOF
 }
 
 uninstall_swfs () {
+  LOG_FILE="seaweedfs-uninstall.log"
+  touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
+  # Read the recorded install state BEFORE anything is removed (SW-2). Cleanup
+  # decisions key on what was actually configured at install time — never on the
+  # ENABLE_* env present at uninstall time.
+  local st_smb="" st_nfs="" st_user_created="false" st_user_name="$SWFS_USER"
+  local st_smb_service="" st_nfs_service="" st_share_name="$DEFAULT_FILER_DIR_NAME"
+  local st_fuse_action="" st_registry_login="" st_images="" st_mon_images=""
+  local st_fwd_ports="" st_fwd_services="" st_ufw_ports="" st_selinux_prior=""
+  local have_state=0
+  if [[ -f "$STATE_FILE" ]]; then
+    have_state=1
+    st_smb=$(get_state SMB_CONFIGURED)
+    st_nfs=$(get_state NFS_CONFIGURED)
+    st_user_created=$(get_state SWFS_USER_CREATED)
+    st_user_name=$(get_state SWFS_USER_NAME); st_user_name=${st_user_name:-$SWFS_USER}
+    st_smb_service=$(get_state SMB_SERVICE_NAME)
+    st_nfs_service=$(get_state NFS_SERVICE_NAME)
+    st_share_name=$(get_state FILER_DIR_NAME); st_share_name=${st_share_name:-$DEFAULT_FILER_DIR_NAME}
+    st_fuse_action=$(get_state FUSE_CONF_ACTION)
+    st_registry_login=$(get_state REGISTRY_LOGIN)
+    st_images=$(get_state LOADED_IMAGES)
+    st_mon_images=$(get_state LOADED_MONITORING_IMAGES)
+    st_fwd_ports=$(get_state FIREWALLD_ADDED_PORTS)
+    st_fwd_services=$(get_state FIREWALLD_ADDED_SERVICES)
+    st_ufw_ports=$(get_state UFW_ADDED_PORTS)
+    st_selinux_prior=$(get_state SELINUX_SAMBA_FUSEFS_PRIOR)
+  else
+    echo "  NOTE: no install-state file found ($STATE_FILE) — pre-state-file install or already uninstalled." | tee -a "$LOG_FILE"
+    echo "  Falling back to ENABLE_* env plus on-disk evidence for SMB/NFS cleanup; user accounts will NOT be removed." | tee -a "$LOG_FILE"
+    st_smb="${ENABLE_SMB,,}"
+    st_nfs="${ENABLE_NFS,,}"
+  fi
+  # --- Volume (join) node --- #
   if [[ -f /opt/seaweedfs/seaweedfs-volume-compose.yaml ]]; then
-    echo "  Detected a SeaweedFS volume (join) node." | tee -a seaweedfs-uninstall.log
-    echo "  WARNING: replicate/evacuate this node's volumes to surviving nodes first (set replication, run" | tee -a seaweedfs-uninstall.log
-    echo "  'volume.fix.replication -apply' on node 1, confirm full replica counts) or data held only here is lost." | tee -a seaweedfs-uninstall.log
-    echo "  Stopping and removing the SeaweedFS volume container..." | tee -a seaweedfs-uninstall.log
-    docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml down
+    echo "  Detected a SeaweedFS volume (join) node." | tee -a "$LOG_FILE"
+    echo "  WARNING: replicate/evacuate this node's volumes to surviving nodes first (set replication, run" | tee -a "$LOG_FILE"
+    echo "  'volume.fix.replication -apply' on node 1, confirm full replica counts) or data held only here is lost." | tee -a "$LOG_FILE"
+    echo "  Stopping and removing the SeaweedFS volume container..." | tee -a "$LOG_FILE"
+    docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml down --remove-orphans
+    remove_firewall_rules "$st_fwd_ports" "$st_fwd_services" "$st_ufw_ports"
+    uninstall_docker_residue "$st_registry_login" "$st_images" "$st_mon_images"
     rm -rf /opt/seaweedfs
-    echo "# -- Volume node uninstall complete -- #" | tee -a seaweedfs-uninstall.log
+    echo "# -- Volume node uninstall complete -- #" | tee -a "$LOG_FILE"
     return
   fi
+  # --- Containers and data --- #
   if [[ -f /opt/monitoring/docker-compose.yml ]]; then
-    echo "  Stopping monitoring stack (Loki, Grafana, Prometheus)..." | tee -a seaweedfs-uninstall.log
-    docker compose -f /opt/monitoring/docker-compose.yml down
-    rm -rf /opt/monitoring
+    echo "  Stopping monitoring stack (Loki, Grafana, Prometheus)..." | tee -a "$LOG_FILE"
+    docker compose -f /opt/monitoring/docker-compose.yml down --remove-orphans
   fi
-  rm -f /opt/seaweedfs/monitoring-credentials.env
-  echo "  Stopping and removing SeaweedFS and Caddy containers..." | tee -a seaweedfs-uninstall.log
-  docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml down
-  echo "  Removing SeaweedFS and Caddy data and configuration..." | tee -a seaweedfs-uninstall.log
+  rm -rf /opt/monitoring
+  echo "  Stopping and removing SeaweedFS and Caddy containers..." | tee -a "$LOG_FILE"
+  if [[ -f /opt/seaweedfs/seaweedfs-compose.yaml ]]; then
+    docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml down --remove-orphans
+  fi
+  echo "  Removing SeaweedFS and Caddy data and configuration..." | tee -a "$LOG_FILE"
   rm -rf /opt/seaweedfs
   rm -rf /opt/caddy
-  if [[ ${ENABLE_SMB,,} == "true" ]]; then
-    if [[ $ID != "ubuntu" && $ID != "debian" ]]; then
-      SMB_SERVICE="smb"
-    fi
-    echo "  Reverting to default Samba configuration..." | tee -a seaweedfs-uninstall.log
-    rm -f /etc/samba/smb.conf
-    mv /etc/samba/smb.conf.bak /etc/samba/smb.conf
-    echo "  Removing Samba user..." | tee -a seaweedfs-uninstall.log
-    smbpasswd -x $SWFS_USER
-    userdel $SWFS_USER
-    systemctl restart $SMB_SERVICE
+  # FUSE mountpoint (SW-24): compose down should have unmounted it; lazy-unmount any
+  # leftover, and only remove the directory once it is no longer a mountpoint.
+  if mountpoint -q /mnt/seaweed 2>/dev/null; then
+    umount -l /mnt/seaweed 2>/dev/null
   fi
-  if [[ ${ENABLE_NFS,,} == "true" ]]; then
-    if [[ $ID == "ubuntu" || $ID == "debian" ]]; then
-      NFS_SERVICE="nfs-kernel-server"
-    fi
-    echo "  Removing SeaweedFS NFS export..." | tee -a seaweedfs-uninstall.log
-    sed -i '/ # seaweedfs-installer$/d' /etc/exports
-    exportfs -ra
-    systemctl restart $NFS_SERVICE
-    echo "  Removing NFS metadata refresh timer..." | tee -a seaweedfs-uninstall.log
-    systemctl disable --now seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
-    rm -f /etc/systemd/system/seaweedfs-nfs-meta-refresh.service /etc/systemd/system/seaweedfs-nfs-meta-refresh.timer
-    systemctl daemon-reload
+  if [[ -d /mnt/seaweed ]] && ! mountpoint -q /mnt/seaweed 2>/dev/null; then
+    rm -rf /mnt/seaweed
   fi
-  echo "# -- Uninstall tasks complete -- #" | tee -a seaweedfs-uninstall.log
+  # --- Samba (only if THIS tool configured it) --- #
+  if [[ "$st_smb" == "true" ]]; then
+    local smb_service="$st_smb_service"
+    if [[ -z "$smb_service" ]]; then
+      smb_service="$SMB_SERVICE"
+      [[ $ID != "ubuntu" && $ID != "debian" ]] && smb_service="smb"
+    fi
+    local do_smb=1
+    if [[ $have_state -eq 0 ]]; then
+      # Legacy fallback: only touch Samba when there is on-disk evidence of our share.
+      if ! grep -q "^${MARKER_BEGIN}\$" /etc/samba/smb.conf 2>/dev/null \
+         && ! grep -q "^\[${st_share_name}\]" /etc/samba/smb.conf 2>/dev/null; then
+        echo "  No seaweedfs share found in /etc/samba/smb.conf — skipping SMB cleanup." | tee -a "$LOG_FILE"
+        do_smb=0
+      fi
+    fi
+    if [[ $do_smb -eq 1 ]]; then
+      echo "  Removing seaweedfs share from the Samba configuration..." | tee -a "$LOG_FILE"
+      # Marker-based removal — never delete or wholesale-replace the host's smb.conf
+      # (SW-3: the old .bak-consumption semantics destroyed smb.conf on double-uninstall).
+      remove_marker_block /etc/samba/smb.conf
+      remove_legacy_smb_block "$st_share_name"
+      rm -f /etc/samba/smb.conf.bak
+      echo "  Removing Samba account for '$st_user_name'..." | tee -a "$LOG_FILE"
+      smbpasswd -x "$st_user_name" 2>/dev/null || true
+      if [[ "$st_user_created" == "true" ]] && id "$st_user_name" &>/dev/null; then
+        echo "  Removing system user '$st_user_name' (created by this installer)..." | tee -a "$LOG_FILE"
+        userdel "$st_user_name"
+      else
+        echo "  Keeping system user '$st_user_name' (not created by this installer)." | tee -a "$LOG_FILE"
+      fi
+      systemctl restart "$smb_service" 2>/dev/null \
+        || echo "  WARNING: could not restart Samba service '$smb_service'." | tee -a "$LOG_FILE"
+    fi
+  fi
+  # --- NFS (only if THIS tool configured it) --- #
+  if [[ "$st_nfs" == "true" ]]; then
+    local nfs_service="$st_nfs_service"
+    if [[ -z "$nfs_service" ]]; then
+      nfs_service="$NFS_SERVICE"
+      [[ $ID == "ubuntu" || $ID == "debian" ]] && nfs_service="nfs-kernel-server"
+    fi
+    if [[ $have_state -eq 1 ]] || grep -q ' # seaweedfs-installer$' /etc/exports 2>/dev/null; then
+      echo "  Removing SeaweedFS NFS export..." | tee -a "$LOG_FILE"
+      [[ -f /etc/exports ]] && sed -i '/ # seaweedfs-installer$/d' /etc/exports
+      exportfs -ra 2>/dev/null
+      systemctl restart "$nfs_service" 2>/dev/null \
+        || echo "  WARNING: could not restart NFS service '$nfs_service'." | tee -a "$LOG_FILE"
+      echo "  Removing NFS metadata refresh timer..." | tee -a "$LOG_FILE"
+      systemctl disable --now seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
+      rm -f /etc/systemd/system/seaweedfs-nfs-meta-refresh.service /etc/systemd/system/seaweedfs-nfs-meta-refresh.timer
+      systemctl daemon-reload
+    else
+      echo "  No seaweedfs export found in /etc/exports — skipping NFS cleanup." | tee -a "$LOG_FILE"
+    fi
+  fi
+  # --- /etc/fuse.conf restore (SW-12) --- #
+  case "$st_fuse_action" in
+    created)
+      remove_marker_block /etc/fuse.conf
+      [[ -s /etc/fuse.conf ]] || rm -f /etc/fuse.conf
+      ;;
+    backed_up)
+      if [[ -f /etc/fuse.conf.seaweedfs-bak ]]; then
+        echo "  Restoring /etc/fuse.conf from backup..." | tee -a "$LOG_FILE"
+        mv /etc/fuse.conf.seaweedfs-bak /etc/fuse.conf
+      else
+        remove_marker_block /etc/fuse.conf
+      fi
+      ;;
+    untouched)
+      : # we never modified it
+      ;;
+    *)
+      # No/unknown state: strip our marker block if present; never delete the file.
+      remove_marker_block /etc/fuse.conf
+      ;;
+  esac
+  remove_firewall_rules "$st_fwd_ports" "$st_fwd_services" "$st_ufw_ports"
+  # Restore the SELinux boolean only if THIS tool changed it (recorded prior value).
+  if [[ -n "$st_selinux_prior" && "$st_selinux_prior" != "on" ]] && command -v setsebool >/dev/null 2>&1; then
+    echo "  Restoring SELinux boolean samba_share_fusefs=$st_selinux_prior..." | tee -a "$LOG_FILE"
+    setsebool -P samba_share_fusefs "$st_selinux_prior" 2>/dev/null
+  fi
+  uninstall_docker_residue "$st_registry_login" "$st_images" "$st_mon_images"
+  # The install log contains credentials (SW-24) — remove it with the deployment.
+  if [[ -f "$base_dir/seaweedfs-install.log" ]]; then
+    echo "  Removing $base_dir/seaweedfs-install.log (contains credentials)..." | tee -a "$LOG_FILE"
+    rm -f "$base_dir/seaweedfs-install.log"
+  fi
+  echo "# -- Uninstall tasks complete -- #" | tee -a "$LOG_FILE"
+}
+
+# Registry logout + optional removal of the images this installer loaded (SW-24).
+# $1=recorded registry login, $2/$3=recorded image lists.
+uninstall_docker_residue () {
+  local registry_login="$1" images="$2 $3" img
+  if [[ -n "$registry_login" ]]; then
+    echo "  Logging out of registry $registry_login..." | tee -a "$LOG_FILE"
+    docker logout "$registry_login" >/dev/null 2>&1
+  fi
+  if [[ ${SWFS_REMOVE_IMAGES,,} == "true" ]]; then
+    echo "  Removing container images loaded by this installer (SWFS_REMOVE_IMAGES=true)..." | tee -a "$LOG_FILE"
+    for img in $images; do
+      docker rmi "$img" >/dev/null 2>&1 || true
+    done
+  fi
 }
 
 display_args() {
@@ -1401,7 +2081,7 @@ display_args() {
   echo "  REG_FQDN: $REG_FQDN"
   echo "  REG_PORT: $REG_PORT"
   echo "  REG_USER: $REG_USER"
-  echo "  REG_PASS: $REG_PASS"
+  echo "  REG_PASS: $([[ -n "$REG_PASS" ]] && echo '******')"
   echo "  OS: $OS_ID"
 }
 
@@ -1438,18 +2118,18 @@ Examples:
   $0 join -master 192.168.1.10:$SWFS_MASTER_PORT
 
 EOF
-  exit 1
 }
 
 # --- CLI Wrapper --- #
 if [[ "$#" -eq 0 ]]; then
   echo "Error: No arguments provided."
   help
+  exit 1
 fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    help|--help|-h) help ;;
+    help|--help|-h) help; exit 0 ;;
     install)
       INSTALL_MODE=1
       ;;
@@ -1487,8 +2167,9 @@ while [[ $# -gt 0 ]]; do
       shift 3
       ;;
     *)
-      echo "Invalid argument: $1"
-      echo
+      echo "Error: Invalid argument: $1"
+      echo "Use 'help' for usage."
+      exit 1
       ;;
   esac
   shift
@@ -1496,6 +2177,12 @@ done
 
 check_root_privileges
 os_check
+# Preflight for minimal images: these must exist before any real work starts.
+# Uninstall is exempt - teardown must keep working on air-gapped hosts that
+# never had curl/openssl (it only needs docker, systemctl, and coreutils).
+if [[ $UNINSTALL_MODE -ne 1 ]]; then
+  require_cmds curl tar openssl
+fi
 
 # -- Argument Validation -- #
 if [[ $INSTALL_MODE -eq 1 ]]; then
@@ -1521,19 +2208,21 @@ if [[ $SAVE_MODE -eq 1 ]]; then
   if [[ $PUSH_MODE -eq 1 || $REGISTRY_MODE -eq 1 ]]; then
     echo "Error: push or registry cannot be used with save."; exit 1; fi
 fi
-if [[ $PUSH_MODE -eq 1 ]]; then 
+if [[ $PUSH_MODE -eq 1 ]]; then
   if [[ $SAVE_MODE -eq 1 || $UNINSTALL_MODE -eq 1 ]]; then
     echo "Error: save or uninstall cannot be used with push."; exit 1; fi
+  if [[ $REGISTRY_MODE -eq 0 ]]; then
+    echo "Error: 'push' requires the -registry option. Format: push -registry <registry:port> <user> <pass>"; exit 1; fi
 fi
 if [[ "$REGISTRY_MODE" == "1" ]]; then
   if [[ "$REGISTRY_INFO" =~ ^https?:// ]]; then
-    echo "Error: registry info must be a valid FQDN or IPv4 format. i.e. 'my.regsitry.com:443'."
+    echo "Error: registry info must be a valid FQDN or IPv4 format. i.e. 'my.registry.com:443'."
     exit 1
   fi
   REG_FQDN=$(echo "$REGISTRY_INFO" | cut -d':' -f1)
   REG_PORT=$(echo "$REGISTRY_INFO" | cut -d':' -f2)
   if [[ ! ( "$REG_FQDN" =~ $fqdn_pattern || "$REG_FQDN" =~ $ipv4_pattern ) ]]; then
-    echo "Error: Registry url must be a valid FQDN or IPv4 format. i.e. 'my.regsitry.com' or '192.168.1.50'."
+    echo "Error: Registry url must be a valid FQDN or IPv4 format. i.e. 'my.registry.com' or '192.168.1.50'."
     exit 1
   fi
   if [[ "$REG_PORT" =~ ^[0-9]+$ ]]; then
@@ -1546,12 +2235,40 @@ if [[ "$REGISTRY_MODE" == "1" ]]; then
     exit 1
   fi
 fi
-[[ ! -f $base_dir/swfs-save-version.txt ]] || AIR_GAPPED_MODE=1
+# Air-gap auto-detection with sanity check + explicit override (SW-17). A stale
+# sentinel (e.g. a build host that ran 'save' earlier) used to flip later runs into
+# air-gapped mode silently.
+if [[ -f "$base_dir/swfs-save-version.txt" ]]; then
+  if [[ ${SWFS_FORCE_ONLINE,,} == "true" ]]; then
+    echo "NOTE: swfs-save-version.txt present but SWFS_FORCE_ONLINE=true — staying in online mode."
+  else
+    AIR_GAPPED_MODE=1
+    if [[ $INSTALL_MODE -eq 1 || $JOIN_MODE -eq 1 ]]; then
+      shopt -s nullglob
+      _swfs_archives=("$base_dir"/utilities/container_images_*.tar.gz)
+      shopt -u nullglob
+      if [[ ${#_swfs_archives[@]} -eq 0 ]]; then
+        echo "ERROR: swfs-save-version.txt found (air-gapped mode) but no container_images_*.tar.gz in $base_dir/utilities/."
+        echo "Either extract the full swfs-save.tar.gz here, delete the stale sentinel, or set SWFS_FORCE_ONLINE=true."
+        exit 1
+      fi
+    fi
+    if [[ $SAVE_MODE -eq 1 ]]; then
+      echo "WARNING: 'save' is running in a directory containing swfs-save-version.txt — this run is treated as"
+      echo "         air-gapped (AGPL source fetch is skipped). Set SWFS_FORCE_ONLINE=true to build a fresh bundle online."
+    fi
+  fi
+fi
 
 
 
 
 # -- Main Logic -- #
+
+# The install log receives credentials — restrict it before anything writes to it (SW-13).
+if [[ $UNINSTALL_MODE -eq 0 ]]; then
+  touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
+fi
 
 echo "### SeaweedFS Installer Started - $(date) ###"
 display_args

@@ -13,6 +13,11 @@ A bash automation script that deploys a self-contained, production-ready Seaweed
 - [Examples](#examples)
 - [Configuration Variables](#configuration-variables)
 - [Service Endpoints](#service-endpoints)
+- [Behavior Notes](#behavior-notes)
+  - [Exit codes](#exit-codes)
+  - [Install-state file](#install-state-file)
+  - [Firewall and SELinux handling](#firewall-and-selinux-handling)
+  - [Security notes](#security-notes)
 - [Known Issues](#known-issues)
 
 ---
@@ -62,15 +67,19 @@ After installation, a summary with all service URLs, credentials, and API exampl
 Usage: ./install-seaweedfs [command] [option]
 
 Commands:
-  help              | Display this help message
-  install           | Install and configure SeaweedFS and Caddy (Docker Compose)
+  help              | Display this help message (exit 0)
+  install           | Install and configure SeaweedFS and Caddy (Docker Compose). CLUSTER_MODE=cluster makes this a cluster-ready control plane.
+  join              | Join this host to an existing cluster as a discrete volume node (requires -master)
   save              | Prepare offline archive for air-gapped deployment
-  uninstall         | Uninstall SeaweedFS and Caddy including data and configuration
+  uninstall         | Uninstall SeaweedFS and Caddy including data and configuration (auto-detects a volume node)
 
 Options:
   push              | Push SeaweedFS and Caddy images to a local registry, must include -registry option
   -registry         | Registry credentials for pushing or pulling from local registry (Format: -registry [registry:port username password])
+  -master           | Control-plane master to join (join only). Format: -master <host-or-ip>:9333
 ```
+
+Unknown arguments are rejected with a usage error (exit 1). `push` without `-registry` is rejected.
 
 ### Commands
 
@@ -78,8 +87,11 @@ Options:
 
 Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and SeaweedMQ from the internet.
 
-- If `swfs-save-version.txt` is present in the same directory as `install-seaweedfs`, air-gapped install mode activates automatically (this file is bundled in the archive and extracted alongside the script)
+- If `swfs-save-version.txt` is present in the same directory as `install-seaweedfs`, air-gapped install mode activates automatically (this file is bundled in the archive and extracted alongside the script). The sentinel is sanity-checked: if it is present but the image archives are missing, install aborts with instructions; set `SWFS_FORCE_ONLINE=true` to ignore a stale sentinel.
 - If `-registry` is specified, containers are pulled from the local registry instead of Docker Hub
+- Re-running `install` reconciles instead of duplicating: Samba/NFS config blocks are marker-tagged and replaced (never appended twice), changed bind-mounted configs (Caddyfile, monitoring configs) trigger a restart of the affected container, and features toggled off since the previous install (`ENABLE_MQ`, `ENABLE_MONITORING`, `ENABLE_SMB`, `ENABLE_NFS`) are torn down (`--remove-orphans` plus recorded-state cleanup)
+- When **firewalld** (Rocky/RHEL, openSUSE Leap) or **UFW** (Ubuntu) is active, the ports for the enabled services are opened and recorded — see [Firewall and SELinux handling](#firewall-and-selinux-handling)
+- When **SELinux is enforcing** and SMB is enabled, the `samba_share_fusefs` boolean is set (prior value recorded for uninstall)
 
 **Configuration paths after installation:**
 
@@ -87,7 +99,8 @@ Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and Seawe
 |:-----|:---------|
 | `/opt/seaweedfs/seaweedfs-compose.yaml` | Docker Compose file for SeaweedFS, Caddy, SeaweedMQ, and FUSE mount |
 | `/opt/seaweedfs/mini/` | All SeaweedFS user data |
-| `/opt/seaweedfs/monitoring-credentials.env` | S3/Loki/Prometheus credentials for external agents (when monitoring is enabled) |
+| `/opt/seaweedfs/monitoring-credentials.env` | S3/Loki/Prometheus credentials for external agents (when monitoring is enabled; mode 600) |
+| `/opt/seaweedfs/.install-state` | Install-state record used by uninstall/re-install (mode 600) — see [Install-state file](#install-state-file) |
 | `/opt/caddy/Caddyfile` | Caddy reverse proxy configuration |
 | `/opt/caddy/srv/index.html` | Caddy web landing page |
 | `/opt/monitoring/docker-compose.yml` | Docker Compose file for the monitoring stack |
@@ -114,7 +127,16 @@ sudo ./install-seaweedfs install
 
 #### `uninstall`
 
-Stops and removes all containers, then deletes all configuration and data directories. Also reverts Samba and NFS configuration if those features were enabled during install.
+Stops and removes all containers, then deletes all configuration and data directories. Samba/NFS/user cleanup is driven by the **recorded install state** (`/opt/seaweedfs/.install-state`), not by the `ENABLE_*` environment at uninstall time:
+
+- The seaweedfs share block is removed from `/etc/samba/smb.conf` by its markers — the host's `smb.conf` is never deleted or wholesale-replaced, so running `uninstall` twice is a safe no-op
+- The system user is removed **only if this installer created it**; a pre-existing account is kept (its Samba password entry is still removed)
+- `/etc/fuse.conf` is restored according to what install actually did (created / backed up / untouched)
+- Firewall rules (firewalld/UFW) added by install are removed — exactly the recorded set, never pre-existing rules
+- A changed `samba_share_fusefs` SELinux boolean is restored to its recorded prior value
+- The installer logs out of the registry it logged into; set `SWFS_REMOVE_IMAGES=true` to also `docker rmi` the container images this installer loaded
+- The install log (contains credentials) is removed; the uninstall log is written mode 600
+- Installs made by versions **before** the state file existed fall back to `ENABLE_*` plus on-disk evidence (marker/share present) and never remove user accounts
 
 > **Warning:** Uninstall is destructive and permanently deletes all SeaweedFS user data.
 
@@ -210,6 +232,9 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `ARTIFACTS_TO_DOWNLOAD` | `""` | Space-separated list of URLs to download and upload to the default Filer path |
 | `VOLUME_INDEX` | `""` | Optional volume index mode `[memory\|leveldb\|leveldbMedium\|leveldbLarge]`. `leveldb` lowers volume-server RAM for many small files on edge hosts. Empty = `weed mini` default (`memory`). |
 | `VOLUME_SIZE_LIMIT_MB` | `""` | Optional cap (MB) after which the master stops directing writes to a volume. Empty = `weed mini` auto-sizing (64–1024 MB). |
+| `MGMT_IP` | *(first host IP)* | IP used as the Caddy `default_sni` fallback and cluster advertise address. Overridable (honored when passed by ap-tools or set explicitly). |
+| `SWFS_FORCE_ONLINE` | `false` | Ignore a `swfs-save-version.txt` sentinel in the working directory and stay in online mode (recover from a stale sentinel, e.g. on a build host that ran `save`). |
+| `SWFS_REMOVE_IMAGES` | `false` | `uninstall` only: also `docker rmi` the container images this installer loaded (recorded in the install-state file). |
 
 ### Monitoring Stack Variables
 
@@ -251,6 +276,53 @@ All browser-accessible services use self-signed TLS issued by Caddy. To retrieve
 ```bash
 docker exec -it seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
 ```
+
+## Behavior Notes
+
+### Exit codes
+
+The script exits `0` only when the requested operation actually succeeded. Critical-path failures — `docker compose up`, the Filer not becoming ready within 120 s, S3 credential/bucket configuration, package installation, image pull/push/load, save-archive creation, registry login — abort the run with a non-zero exit code and an `ERROR:` message (also appended to the log). Callers such as `ap-tools` can rely on the exit code. Non-critical issues (e.g. Loki slow to report ready, artifact upload failures) are logged as `WARNING` and do not fail the install.
+
+### Install-state file
+
+`install` records what it actually changed on the host in `/opt/seaweedfs/.install-state` (mode 600, `KEY=value` lines). Keys include:
+
+| Key | Meaning |
+|:----|:--------|
+| `STATE_VERSION`, `INSTALL_DATE`, `NODE_ROLE` | Bookkeeping; `NODE_ROLE` is `control` or `volume` (join) |
+| `SMB_CONFIGURED` / `NFS_CONFIGURED` / `MONITORING_CONFIGURED` / `MQ_CONFIGURED` | Which features this installer configured |
+| `SMB_SERVICE_NAME` / `NFS_SERVICE_NAME` / `SMB_SHARE_NAME` / `FILER_DIR_NAME` | Names resolved at install time, reused at uninstall |
+| `SWFS_USER_NAME` / `SWFS_USER_CREATED` | The SMB user and whether **this installer** created the account |
+| `FUSE_CONF_ACTION` | `created` / `backed_up` / `untouched` — how `/etc/fuse.conf` was handled |
+| `FIREWALLD_ADDED_PORTS` / `FIREWALLD_ADDED_SERVICES` / `UFW_ADDED_PORTS` | Exactly the firewall entries this installer added |
+| `SELINUX_SAMBA_FUSEFS_PRIOR` | Prior value of the boolean, if this installer changed it |
+| `REGISTRY_LOGIN` / `LOADED_IMAGES` / `LOADED_MONITORING_IMAGES` | Registry session and images for uninstall cleanup |
+
+Uninstall and re-install reconciliation read this file; deleting it degrades uninstall to the conservative legacy fallback (evidence-based, never removes user accounts).
+
+### Firewall and SELinux handling
+
+- **firewalld** active (default on Rocky/RHEL and openSUSE Leap 16): install opens the ports for enabled features (admin/master/filer/S3, MQ, monitoring, cluster ports) via `--permanent --add-port`, plus the `samba` and `nfs`/`rpc-bind`/`mountd` services. Only entries the installer actually **adds** are recorded; pre-existing rules are never claimed. Re-install closes recorded entries for features you toggled off; uninstall removes exactly the recorded set.
+- **UFW** active (Ubuntu): equivalent port rules are added with a `seaweedfs-installer` comment. Note UFW cannot model the NFSv3 dynamic `mountd` port — pin `mountd` or use firewalld if remote NFSv3 clients are blocked.
+- **Neither active:** no firewall changes are made (a notice is printed).
+- **SELinux enforcing** (Rocky/RHEL, Leap 16): with SMB enabled, `samba_share_fusefs` is set so `smbd` may serve the FUSE-mounted share (prior value recorded and restored at uninstall). If the boolean/policy is unavailable, a loud warning with the exact remediation is printed. With NFS enabled, a warning is printed if `nfs_export_all_rw` is `off`.
+
+### Security notes
+
+- The install log (`seaweedfs-install.log`) contains the full credentials and is written mode **600**; the console output masks passwords and S3 keys. Uninstall removes the install log.
+- The Caddy landing page is served **unauthenticated** and no longer embeds the SMB password — the Windows `net use` example uses `*` to prompt for it.
+- `docker login` uses `--password-stdin`; registry passwords are not echoed.
+- `/opt/monitoring/loki/loki-config.yaml` embeds the S3 keys and is readable only by the Loki container user (UID 10001) and root; monitoring data directories are owned per container user (Loki 10001, Prometheus 65534, Grafana 472, mode 750) instead of world-writable.
+
+### Per-distro service and package names
+
+| Distro family | SMB service | NFS service | NFS server package |
+|:--------------|:------------|:------------|:-------------------|
+| Ubuntu / Debian | `smbd` | `nfs-kernel-server` | `nfs-kernel-server` |
+| RHEL / CentOS / Rocky / AlmaLinux / Fedora | `smb` | `nfs-server` | `nfs-utils` |
+| SLES / openSUSE Leap | `smb` | `nfs-server` | `nfs-kernel-server` |
+
+The NFS server **package** is selected per distro in both the `install` and `save` paths (a save archive built on Rocky bundles `nfs-utils`).
 
 ## Known Issues
 
