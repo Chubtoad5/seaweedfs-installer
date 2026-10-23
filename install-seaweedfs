@@ -1483,7 +1483,7 @@ install_os_packages () {
     local last
     last=$(tail -n +"$start" "$LOG_FILE" | tail -n 15)
     echo "  install_packages.sh $mode $* exited $rc. Last output:" | tee -a "$LOG_FILE"
-    sed 's/^/    /' <<< "$last"
+    printf '    %s\n' "${last//$'\n'/$'\n'    }"
   fi
   return "$rc"
 }
