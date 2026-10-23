@@ -25,6 +25,7 @@ SWFS_MASTER_FQDN=${SWFS_MASTER_FQDN:-"master.$HOST_FQDN"}  # FQDN for SeaweedFS 
 SWFS_FILER_FQDN=${SWFS_FILER_FQDN:-"filer.$HOST_FQDN"}     # FQDN for SeaweedFS Filer UI/API
 SWFS_S3_FQDN=${SWFS_S3_FQDN:-"s3.$HOST_FQDN"}              # FQDN for SeaweedFS S3 API
 MGMT_IP=${MGMT_IP:-$(hostname -I | awk '{print $1}')}      # Used as default_sni fallback for TLS in non-DNS environments (overridable, e.g. by ap-tools)
+SPLASH_REQUIRE_LOGIN=${SPLASH_REQUIRE_LOGIN:-"true"}      # true = landing page sits behind the SeaweedFS Admin UI login (SWFS_USER/SWFS_PASSWORD); false = public landing page
 
 # - Service TCP Ports # Volume Server uses port 9340 on internal docker network
 SWFS_ADMIN_PORT=${SWFS_ADMIN_PORT:-"443"}
@@ -814,6 +815,17 @@ generate_caddyfile () {
   if [[ -z "$CADDY_HASHED_PASSWORD" ]]; then
     die "Failed to hash SWFS_PASSWORD with the Caddy image ($caddy_image_local). Is the image available?"
   fi
+  # Landing page gate: with SPLASH_REQUIRE_LOGIN=true, Caddy asks the Admin UI whether the
+  # request carries a valid session (GET /admin: 200 = logged in, 307 -> /login otherwise,
+  # which forward_auth hands straight back to the browser), and a successful login is sent
+  # to the landing page instead of the dashboard (the Admin UI always redirects to /admin).
+  local splash_gate="" login_location=""
+  if [[ ${SPLASH_REQUIRE_LOGIN,,} == "true" ]]; then
+    splash_gate="forward_auth seaweed-mini:23646 {
+                        uri /admin
+                }"
+    login_location='header_down Location "^(https?://[^/]+)?/admin$" "/"'
+  fi
   echo "  Creating Caddyfile..." | tee -a "$LOG_FILE"
   cat > /opt/caddy/Caddyfile <<EOF
 {
@@ -822,53 +834,38 @@ generate_caddyfile () {
 }
 $SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT, https://$MGMT_IP:$SWFS_ADMIN_PORT {
         tls internal
-        handle {
+        # Caddy's local root CA certificate (public). The rewrite pins this one file, so
+        # nothing else under the pki directory (e.g. the private key) is reachable.
+        handle /ca.crt {
+                root * /data/caddy/pki/authorities/local
+                rewrite * /root.crt
+                header Content-Type application/x-pem-file
+                header Content-Disposition "attachment; filename=\"$HOST_FQDN-ca.crt\""
+                file_server
+        }
+        @splash path / /index.html
+        handle @splash {
+                $splash_gate
                 root * /srv
                 file_server
         }
-        handle /static* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /login* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /logout* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /admin* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /cluster* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /storage* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /files* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /object-store* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /mq* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /metrics* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /logs* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /maintenance* {
-                reverse_proxy seaweed-mini:23646
-        }
-        handle /api* {
-                reverse_proxy seaweed-mini:23646
+        handle /login {
+                reverse_proxy seaweed-mini:23646 {
+                        $login_location
+                        header_down Set-Cookie "^(.+)$" "\$1; Secure"
+                }
         }
         handle /$DEFAULT_FILER_DIR_NAME* {
                 @isDomain host $SWFS_ADMIN_FQDN
                 redir @isDomain https://$SWFS_FILER_FQDN:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME permanent
                 redir https://{host}:$SWFS_FILER_PORT/$DEFAULT_FILER_DIR_NAME permanent
+        }
+        # Everything else is the SeaweedFS Admin UI. A catch-all (not a per-path list) so
+        # sections added by newer SeaweedFS releases (e.g. /plugin in 4.30) work unchanged.
+        handle {
+                reverse_proxy seaweed-mini:23646 {
+                        header_down Set-Cookie "^(.+)$" "\$1; Secure"
+                }
         }
 }
 $SWFS_FILER_FQDN:$SWFS_FILER_PORT, https://$MGMT_IP:$SWFS_FILER_PORT {
@@ -1026,13 +1023,32 @@ fi
 
 generate_index_html () {
   echo "  Creating index.html files..." | tee -a "$LOG_FILE"
+  # Values baked in at install time. Image refs may carry a registry prefix by now
+  # (generate_compose_file runs first), so only the tag is shown.
+  local swfs_version="${SWFS_IMAGE##*:}" caddy_version="${CADDY_IMAGE##*:}"
+  local node_mode="single-node"
+  [[ ${CLUSTER_MODE,,} == "cluster" ]] && node_mode="cluster-ready control plane"
+  local configured_buckets="$S3_BUCKET"
+  if [[ ${ENABLE_MONITORING,,} == "true" ]] && ! list_contains "$LOKI_BUCKET" "$configured_buckets"; then
+    configured_buckets="$configured_buckets $LOKI_BUCKET"
+  fi
+  local extra
+  for extra in $EXTRA_BUCKETS; do
+    list_contains "$extra" "$configured_buckets" || configured_buckets="$configured_buckets $extra"
+  done
+  local access_note="Public page - the Admin Console has its own login."
+  local page_access="the Admin Console uses the SeaweedFS Admin UI login (this page is public)"
+  if [[ ${SPLASH_REQUIRE_LOGIN,,} == "true" ]]; then
+    access_note='Signed in with the SeaweedFS Admin UI login. <a href="/logout">Sign out</a>'
+    page_access="this page and the Admin Console use the SeaweedFS Admin UI login"
+  fi
   cat > /opt/caddy/srv/index.html <<EOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SeaweedFS Admin Page</title>
+    <title>SeaweedFS - $HOST_FQDN</title>
     <style>
         body {
             box-sizing: border-box;
@@ -1040,7 +1056,7 @@ generate_index_html () {
             color: #e0e0e0;
             font-family: 'Google Sans', 'Arial', sans-serif;
             margin: 0;
-            padding: 40px 20px;
+            padding: 40px 16px;
             min-height: 100vh;
             display: flex;
             flex-direction: column;
@@ -1054,17 +1070,25 @@ generate_index_html () {
             align-items: center;
         }
         .title {
-            font-size: 48px;
+            font-size: 40px;
             color: #8ab4f8;
-            margin-bottom: 30px;
+            margin: 0 0 8px 0;
             font-weight: 500;
             letter-spacing: -0.5px;
             text-align: center;
+            overflow-wrap: anywhere;
         }
+        .meta {
+            color: #9a9a9a;
+            font-size: 15px;
+            margin-bottom: 28px;
+            text-align: center;
+        }
+        .meta a { color: #9a9a9a; }
         .main-nav {
             list-style: none;
             padding: 0;
-            margin: 0 0 40px 0;
+            margin: 0 0 32px 0;
             text-align: center;
             width: 100%;
         }
@@ -1083,44 +1107,26 @@ generate_index_html () {
             color: #c5e1a5;
             text-decoration: underline;
         }
-        .endpoint-label {
-            font-size: 18px;
-            color: #b0b0b0;
-            font-family: 'Courier New', monospace;
-            background: #2a2a2a;
-            padding: 4px 12px;
-            border-radius: 6px;
-            border: 1px solid #333;
-            display: inline-block;
-            margin-top: 5px;
-        }
-        .endpoint-tag {
-            font-size: 14px;
-            color: #8ab4f8;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            display: block;
-            margin-bottom: 2px;
-        }
         .doc-card {
             background-color: #252525;
             border: 1px solid #333;
             border-radius: 12px;
-            padding: 40px;
+            padding: 32px;
             width: 100%;
             box-sizing: border-box;
             box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            margin-bottom: 24px;
         }
         .note {
-            font-size: 18px;
+            font-size: 17px;
             color: #a8dadc;
             margin-top: 0;
-            margin-bottom: 30px;
+            margin-bottom: 20px;
             border-left: 4px solid #8ab4f8;
             padding-left: 15px;
         }
         .subtitle {
-            font-size: 22px;
+            font-size: 21px;
             color: #e0e0e0;
             margin-top: 25px;
             margin-bottom: 12px;
@@ -1141,16 +1147,33 @@ generate_index_html () {
             font-family: 'Courier New', monospace;
             background-color: #121212;
             color: #c5e1a5;
-            padding: 20px;
+            padding: 16px 20px;
             border-radius: 8px;
             line-height: 1.6;
             text-align: left;
             display: block;
             border: 1px solid #333;
             white-space: pre;
-            word-wrap: break-word;
             overflow-x: auto;
         }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+        }
+        .stat {
+            background: #1c1c1c;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 12px 14px;
+        }
+        .stat .k { color: #9a9a9a; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; }
+        .stat .v { color: #e0e0e0; font-size: 22px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 15px; }
+        th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #333; }
+        th { color: #9a9a9a; font-weight: 500; }
+        td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+        .muted { color: #9a9a9a; font-size: 15px; }
         footer {
             margin-top: auto;
             padding-top: 40px;
@@ -1162,28 +1185,55 @@ generate_index_html () {
 </head>
 <body>
     <div class="content-wrapper">
-        <h1 class="title">SeaweedFS Admin Page</h1>
+        <h1 class="title">SeaweedFS - $HOST_FQDN</h1>
+        <div class="meta">SeaweedFS $swfs_version &middot; Caddy $caddy_version &middot; $node_mode &middot; installed $(date +%Y-%m-%d)<br>$access_note</div>
         <ul class="main-nav">
-            <li><a id="admin-link" class="link" href="/login">Admin Console →</a></li>
-            <li><a id="master-link" class="link" target="_blank" rel="noopener noreferrer" href="#">Master Console →</a></li>
-            <li><a id="artifacts-link" class="link" target="_blank" rel="noopener noreferrer" href="#">File Browser →</a></li>
-            <li><a id="grafana-link" class="link" target="_blank" rel="noopener noreferrer" href="#" style="display:none">Grafana Dashboards →</a></li>
+            <li><a id="admin-link" class="link" href="/admin">Admin Console &rarr;</a></li>
+            <li><a id="master-link" class="link" target="_blank" rel="noopener noreferrer" href="#">Master Console &rarr;</a></li>
+            <li><a id="artifacts-link" class="link" target="_blank" rel="noopener noreferrer" href="#">File Browser &rarr;</a></li>
+            <li><a id="grafana-link" class="link" target="_blank" rel="noopener noreferrer" href="#" style="display:none">Grafana Dashboards &rarr;</a></li>
         </ul>
+        <div class="doc-card" id="status-card" style="display:none">
+            <div class="subtitle" style="margin-top:0">Live status</div>
+            <div class="stats">
+                <div class="stat"><div class="k">Files</div><div class="v" id="st-files">-</div></div>
+                <div class="stat"><div class="k">Stored</div><div class="v" id="st-size">-</div></div>
+                <div class="stat"><div class="k">Volumes</div><div class="v" id="st-volumes">-</div></div>
+                <div class="stat"><div class="k">Disk used</div><div class="v" id="st-disk">-</div></div>
+            </div>
+            <table id="bucket-table">
+                <thead><tr><th>S3 bucket</th><th>Owner</th><th class="num">Size</th></tr></thead>
+                <tbody id="bucket-rows"></tbody>
+            </table>
+            <p class="muted" id="status-time"></p>
+        </div>
         <div class="doc-card">
-            <p class="note">This server uses the all-in-one 'weed mini' command to deploy the following single-node optimized SeaweedFS services: Master, Volume, &amp; Filer server, Maintenance Worker, Admin UI, and S3 Gateway</p>
-            <p class="note">Caddy is deployed on the front end to serve this landing page, provide local TLS with auto-renewing certificates, basic authentication, and a reverse proxy to security harden the SeaweedFS services</p>
+            <p class="note">This server runs the all-in-one 'weed mini' command ($node_mode): Master, Volume and Filer server, Maintenance Worker, Admin UI and S3 Gateway.</p>
+            <p class="note">Caddy sits in front with TLS from its own local CA. Access: $page_access; the Filer and Master use HTTP basic auth (same user, $SWFS_USER); S3 uses access keys.</p>
+            <div class="subtitle">TLS certificate</div>
+            <pre class="code-block" id="ca-cmd">loading...</pre>
             <div id="monitoring-section" style="display:none">
-              <p class="note">Monitoring stack is deployed as a separate Docker Compose project: Grafana (dashboards), Loki (log aggregation → SeaweedFS S3), and Prometheus (metrics remote-write receiver)</p>
+              <p class="note">Monitoring stack is deployed as a separate Docker Compose project: Grafana (dashboards), Loki (log aggregation &rarr; SeaweedFS S3), and Prometheus (metrics remote-write receiver)</p>
               <div class="subtitle">Monitoring Endpoints</div>
               <pre class="code-block" id="monitoring-urls">loading...</pre>
             </div>
-            <div class="subtitle">S3 endpoint</div>
+            <div class="subtitle">S3</div>
             <pre class="code-block" id="s3-url">loading...</pre>
-            <div class="subtitle">SMB Share - Enabled: $ENABLE_SMB</div>
-            <pre class="code-block" id="smb-url">loading...</pre>
-            <div class="subtitle">NFS Share - Enabled: $ENABLE_NFS</div>
-            <pre class="code-block" id="nfs-url">loading...</pre>
-            <p class="note">Manage files using the browser UI (link above) or use the following API commands</p>
+            <div id="mq-section" style="display:none">
+              <div class="subtitle">Message broker (SeaweedMQ)</div>
+              <pre class="code-block" id="mq-url">loading...</pre>
+            </div>
+            <div id="smb-section" style="display:none">
+              <div class="subtitle">SMB share</div>
+              <pre class="code-block" id="smb-url">loading...</pre>
+            </div>
+            <div id="nfs-section" style="display:none">
+              <div class="subtitle">NFS export (NFSv3)</div>
+              <pre class="code-block" id="nfs-url">loading...</pre>
+            </div>
+        </div>
+        <div class="doc-card">
+            <p class="note">Manage files with the File Browser (link above) or the Filer HTTP API:</p>
             <div class="subtitle">Create Directory</div>
             <pre class="code-block" id="curl-mkdir">loading...</pre>
             <div class="subtitle">Upload File</div>
@@ -1194,55 +1244,141 @@ generate_index_html () {
             <pre class="code-block" id="curl-delete">loading...</pre>
         </div>
         <footer>
-            Powered by Caddy & SeaweedFS
+            Powered by Caddy &amp; SeaweedFS
         </footer>
     </div>
         <script>
             (function() {
-                const currentHost = window.location.hostname;
-                const isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}\$/.test(currentHost);
+                // Install-time settings (seaweedfs-installer). No passwords or keys are embedded.
+                var cfg = {
+                    hostFqdn: '$HOST_FQDN',
+                    fqdn: { filer: '$SWFS_FILER_FQDN', master: '$SWFS_MASTER_FQDN', s3: '$SWFS_S3_FQDN', grafana: '$GRAFANA_FQDN' },
+                    port: { filer: '$SWFS_FILER_PORT', master: '$SWFS_MASTER_PORT', s3: '$SWFS_S3_PORT', grafana: '$GRAFANA_PORT', mq: '$MQ_BROKER_PORT', loki: '$LOKI_PORT', prom: '$PROMETHEUS_EXT_PORT' },
+                    share: '$DEFAULT_FILER_DIR_NAME',
+                    user: '$SWFS_USER',
+                    s3User: '$S3_USER',
+                    buckets: '$configured_buckets',
+                    smb: '${ENABLE_SMB,,}' === 'true',
+                    nfs: '${ENABLE_NFS,,}' === 'true',
+                    mq: '${ENABLE_MQ,,}' === 'true',
+                    monitoring: '${ENABLE_MONITORING,,}' === 'true',
+                    nfsRefresh: '$NFS_META_REFRESH_SEC'
+                };
+                var BS = String.fromCharCode(92);
+                var CONT = ' ' + BS + '\n   ';
+                // The host the browser used for this page always resolves. Reached by IP (no DNS):
+                // every service is on that IP. Otherwise use the configured per-service FQDNs.
+                var currentHost = window.location.hostname;
+                var isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}\$/.test(currentHost);
+                function svcUrl(kind, path) {
+                    var h = isIP ? currentHost : cfg.fqdn[kind];
+                    var p = cfg.port[kind];
+                    return 'https://' + h + (p === '443' ? '' : ':' + p) + (path || '');
+                }
+                function setText(id, text) { document.getElementById(id).textContent = text; }
+                function show(id) { document.getElementById(id).style.display = ''; }
 
-                function getUrl(subdomain, port, path = "", protocol = "https") {
-                        if (isIP) {
-                                return \`\${protocol}://\${currentHost}:\${port}\${path}\`;
-                        }
-                        const newHost = currentHost.replace('admin', subdomain);
-                        return \`\${protocol}://\${newHost}:\${port}\${path}\`;
-                }
-                const artifactsBase = getUrl('filer', '$SWFS_FILER_PORT', '/$DEFAULT_FILER_DIR_NAME');
-                document.getElementById('master-link').href = getUrl('master', '$SWFS_MASTER_PORT');
+                var caFile = cfg.hostFqdn + '-ca.crt';
+                var caUrl = window.location.origin + '/ca.crt';
+                var artifactsBase = svcUrl('filer', '/' + cfg.share);
+                document.getElementById('master-link').href = svcUrl('master');
                 document.getElementById('artifacts-link').href = artifactsBase;
-                const monitoringEnabled = '${ENABLE_MONITORING,,}' === 'true';
-                if (monitoringEnabled) {
-                  const grafanaEl = document.getElementById('grafana-link');
-                  const grafanaUrl = getUrl('grafana', '$GRAFANA_PORT');
-                  grafanaEl.href = grafanaUrl;
-                  grafanaEl.style.display = '';
-                  document.getElementById('monitoring-section').style.display = '';
-                  document.getElementById('monitoring-urls').textContent =
-                    'Grafana:    ' + grafanaUrl + '\n' +
-                    'Loki:       http://' + currentHost + ':$LOKI_PORT\n' +
-                    'Prometheus: http://' + currentHost + ':$PROMETHEUS_EXT_PORT';
+
+                setText('ca-cmd',
+                    '# Download the root CA once (or use the link: ' + caUrl + ')' + '\n' +
+                    'curl -k ' + caUrl + ' -o ' + caFile + '\n' +
+                    '# then trust it: --cacert ' + caFile + ' (curl), or import it into the browser / OS store');
+
+                if (cfg.monitoring) {
+                    var grafanaUrl = svcUrl('grafana');
+                    var grafanaEl = document.getElementById('grafana-link');
+                    grafanaEl.href = grafanaUrl;
+                    grafanaEl.style.display = '';
+                    show('monitoring-section');
+                    setText('monitoring-urls',
+                        'Grafana:    ' + grafanaUrl + '\n' +
+                        'Loki:       http://' + currentHost + ':' + cfg.port.loki + '\n' +
+                        'Prometheus: http://' + currentHost + ':' + cfg.port.prom);
                 }
-                document.getElementById('s3-url').textContent = getUrl('s3', '$SWFS_S3_PORT');
-                // SW-4: never embed the real password in this unauthenticated page.
-                // '*' makes 'net use' prompt for the password interactively.
-                document.getElementById('smb-url').textContent = \`net use Z: \\\\\\\\\${currentHost}\\\\$DEFAULT_FILER_DIR_NAME * /USER:$SWFS_USER /PERSISTENT:YES\`;
-                document.getElementById('nfs-url').textContent = \`sudo mount -t nfs -o vers=3 \${currentHost}:/mnt/seaweed /mnt/seaweed\`;
-                document.getElementById('curl-mkdir').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
-   -X POST \${artifactsBase}/\`;
-                document.getElementById('curl-upload').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
-   -X POST \${artifactsBase}/file.txt \\\\\\  
-   -F file=@/path/to/localfile.txt\`;
-                document.getElementById('curl-download').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
-   \${artifactsBase}/file.txt \\\\\\  
-   -o localfile.txt\`;
-                document.getElementById('curl-delete').textContent =
-\`curl -ku SWFS_USER:SWFS_PASSWORD \\\\\\  
-   -X DELETE \${artifactsBase}/file.txt\`;
+
+                setText('s3-url',
+                    'Endpoint:  ' + svcUrl('s3') + '\n' +
+                    'User:      ' + cfg.s3User + '   (access key / secret: see the installer log)' + '\n' +
+                    'Buckets:   ' + cfg.buckets + '   (created at install)' + '\n' +
+                    'Example:   aws --endpoint-url ' + svcUrl('s3') + ' --ca-bundle ' + caFile + ' s3 ls');
+
+                if (cfg.mq) {
+                    show('mq-section');
+                    setText('mq-url', 'Broker:    ' + currentHost + ':' + cfg.port.mq + '   (gRPC, no TLS)');
+                }
+
+                // SW-4: never embed the real password in this page. '*' makes 'net use' prompt for it.
+                if (cfg.smb) {
+                    show('smb-section');
+                    setText('smb-url',
+                        '# Windows' + '\n' +
+                        'net use Z: ' + BS + BS + currentHost + BS + cfg.share + ' * /USER:' + cfg.user + ' /PERSISTENT:YES' + '\n' +
+                        '# Linux (cifs-utils)' + '\n' +
+                        'sudo mount -t cifs //' + currentHost + '/' + cfg.share + ' /mnt/' + cfg.share + ' -o username=' + cfg.user + ',vers=3.0' + '\n' +
+                        '# macOS Finder: Go > Connect to Server' + '\n' +
+                        'smb://' + cfg.user + '@' + currentHost + '/' + cfg.share);
+                }
+                if (cfg.nfs) {
+                    show('nfs-section');
+                    var refresh = (cfg.nfsRefresh === '0')
+                        ? '# Writes made outside NFS (Filer API, S3, web uploads) may stay hidden from NFS clients until a remount.'
+                        : '# Writes made outside NFS (Filer API, S3, web uploads) show up on NFS clients within ~' + cfg.nfsRefresh + 's.';
+                    setText('nfs-url',
+                        'sudo mount -t nfs -o vers=3 ' + currentHost + ':/mnt/seaweed /mnt/seaweed' + '\n' +
+                        '# /etc/fstab (client needs nfs-common / nfs-utils)' + '\n' +
+                        currentHost + ':/mnt/seaweed  /mnt/seaweed  nfs  vers=3,_netdev,nofail,noatime  0  0' + '\n' +
+                        refresh);
+                }
+
+                var auth = 'curl --cacert ' + caFile + ' -u ' + cfg.user + ':PASSWORD';
+                setText('curl-mkdir', auth + CONT + '-X POST ' + artifactsBase + '/new-folder/');
+                setText('curl-upload', auth + CONT + '-X POST ' + artifactsBase + '/file.txt' + CONT + '-F file=@/path/to/localfile.txt');
+                setText('curl-download', auth + CONT + artifactsBase + '/file.txt' + CONT + '-o localfile.txt');
+                setText('curl-delete', auth + CONT + '-X DELETE ' + artifactsBase + '/file.txt');
+
+                // Live status from the Admin UI's own JSON API (same origin, uses the login session).
+                // These are internal SeaweedFS endpoints: anything missing just hides the panel.
+                function fmtBytes(n) {
+                    if (typeof n !== 'number' || !isFinite(n)) { return '-'; }
+                    var u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'], i = 0;
+                    while (n >= 1000 && i < u.length - 1) { n = n / 1000; i++; }
+                    return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
+                }
+                function getJson(path) {
+                    return fetch(path, { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
+                        .then(function(r) { if (!r.ok) { throw new Error(path + ' ' + r.status); } return r.json(); });
+                }
+                getJson('/api/admin').then(function(a) {
+                    setText('st-files', typeof a.total_files === 'number' ? a.total_files.toLocaleString() : '-');
+                    setText('st-size', fmtBytes(a.total_size));
+                    setText('st-volumes', typeof a.total_volumes === 'number' ? a.total_volumes.toLocaleString() : '-');
+                    var used = 0, cap = 0;
+                    (a.volume_servers || []).forEach(function(v) { used += v.disk_usage || 0; cap += v.disk_capacity || 0; });
+                    setText('st-disk', cap > 0 ? Math.round(100 * used / cap) + '% of ' + fmtBytes(cap) : '-');
+                    setText('status-time', 'Updated ' + new Date().toLocaleString() + ' - ' + (a.volume_servers || []).length + ' volume server(s)');
+                    show('status-card');
+                    return getJson('/api/s3/buckets');
+                }).then(function(b) {
+                    var rows = document.getElementById('bucket-rows');
+                    (b.buckets || []).forEach(function(k) {
+                        var tr = document.createElement('tr');
+                        [k.name, k.owner || '', fmtBytes(k.logical_size)].forEach(function(val, idx) {
+                            var td = document.createElement('td');
+                            td.textContent = val;
+                            if (idx === 2) { td.className = 'num'; }
+                            tr.appendChild(td);
+                        });
+                        rows.appendChild(tr);
+                    });
+                    if (!(b.buckets || []).length) { document.getElementById('bucket-table').style.display = 'none'; }
+                }).catch(function() {
+                    document.getElementById('bucket-table').style.display = 'none';
+                });
             })();
         </script>
 </body>
