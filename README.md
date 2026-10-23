@@ -93,6 +93,7 @@ Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and Seawe
 - Re-running `install` reconciles instead of duplicating: Samba/NFS config blocks are marker-tagged and replaced (never appended twice), changed bind-mounted configs (Caddyfile, monitoring configs) trigger a restart of the affected container, and features toggled off since the previous install (`ENABLE_MQ`, `ENABLE_MONITORING`, `ENABLE_SMB`, `ENABLE_NFS`) are torn down (`--remove-orphans` plus recorded-state cleanup)
 - When **firewalld** (Rocky/RHEL, openSUSE Leap) or **UFW** (Ubuntu) is active, the ports for the enabled services are opened and recorded — see [Firewall and SELinux handling](#firewall-and-selinux-handling)
 - When **SELinux is enforcing** and SMB is enabled, the `samba_share_fusefs` boolean is set (prior value recorded for uninstall)
+- Samba and NFS server package installs log their output to `seaweedfs-install.log` (and the console with `DEBUG=1`); a failed install stops the run and prints the last lines of that output. With SMB enabled, `install` validates the generated `smb.conf` with `testparm -s` **before** restarting Samba (a bad config never takes down a running `smbd`), checks that the share was loaded, and fails unless the Samba service is active and listening on 445 after the restart
 
 **Configuration paths after installation:**
 

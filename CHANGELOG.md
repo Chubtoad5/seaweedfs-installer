@@ -1,5 +1,16 @@
 # Changelog — seaweedfs-installer
 
+## 2026-10-23 — Samba setup is verified; package failures show their reason (fix/samba-verify-package-output)
+
+### Fixed
+- **Samba could end up broken without the install saying so.** After writing the share,
+  `install` now runs `testparm -s` before restarting Samba (stopping with a clear error if the
+  config is rejected or the share was not loaded, and leaving the running `smbd` untouched), then
+  waits up to 10 s for the service to be active and listening on 445, and fails if it is not.
+- **Samba/NFS package failures were reported without a reason when `DEBUG=0`.** The
+  `install_packages.sh` output is now appended to `seaweedfs-install.log` (and shown with
+  `DEBUG=1`); on failure the last 15 lines are printed before the run stops.
+
 ## 2026-10-23 — Caddy CA persists; NFS_CLIENTS; upgrades of older installs (feature/persist-caddy-data-nfs-clients)
 
 ### Fixed

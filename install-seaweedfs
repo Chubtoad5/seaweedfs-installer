@@ -691,15 +691,16 @@ run_smb () {
   fi
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_install_packages
-    cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
-    debug_run ./install_packages.sh online samba || die "Samba package installation failed."
-    cd "$base_dir"
+    install_os_packages online samba || die "Samba package installation failed (output above and in $LOG_FILE)."
   else
-    cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
-    debug_run ./install_packages.sh offline samba || die "Samba package installation (offline) failed."
-    cd "$base_dir"
+    install_os_packages offline samba || die "Samba package installation (offline) failed (output above and in $LOG_FILE)."
   fi
   echo "  Configuring Samba..."
+  # smbpasswd below parses the host's smb.conf: reject a broken one up front with a clear error
+  if command -v testparm >/dev/null 2>&1 && [[ -f /etc/samba/smb.conf ]]; then
+    testparm -s /etc/samba/smb.conf > /dev/null 2>> "$LOG_FILE" \
+      || die "The existing /etc/samba/smb.conf is rejected by Samba (testparm -s; details in $LOG_FILE). Fix it and re-run."
+  fi
   # Create the SMB user idempotently. If a group of the same name already exists
   # (e.g. Ubuntu ships a pre-existing 'admin' group and SWFS_USER defaults to 'admin'),
   # attach to it with -g; otherwise useradd would abort and the SMB user is never created.
@@ -742,8 +743,24 @@ ${MARKER_BEGIN}
    force group = root
 ${MARKER_END}
 EOF
+  # Validate before restarting, so a bad config never takes down a running smbd
+  if command -v testparm >/dev/null 2>&1; then
+    testparm -s /etc/samba/smb.conf > /dev/null 2>> "$LOG_FILE" \
+      || die "Samba rejected /etc/samba/smb.conf (testparm -s failed; details in $LOG_FILE)."
+    testparm -s /etc/samba/smb.conf 2>/dev/null | grep -qxF "[$DEFAULT_FILER_DIR_NAME]" \
+      || die "Samba did not load the [$DEFAULT_FILER_DIR_NAME] share from /etc/samba/smb.conf (check with: testparm -s)."
+  fi
   echo "  Restarting Samba..."
   systemctl restart "$SMB_SERVICE" || die "Failed to restart Samba service '$SMB_SERVICE'."
+  local smb_up=0 attempt
+  for attempt in {1..10}; do
+    [[ $attempt -gt 1 ]] && sleep 1
+    if systemctl is-active --quiet "$SMB_SERVICE" && ss -Hltn 'sport = :445' 2>/dev/null | grep -q .; then
+      smb_up=1
+      break
+    fi
+  done
+  [[ $smb_up -eq 1 ]] || die "Samba service '$SMB_SERVICE' is not running or not listening on 445 after restart (check: journalctl -u $SMB_SERVICE)."
   record_state SMB_CONFIGURED "true"
   record_state SMB_SERVICE_NAME "$SMB_SERVICE"
   record_state SMB_SHARE_NAME "$DEFAULT_FILER_DIR_NAME"
@@ -755,13 +772,9 @@ run_nfs () {
   fi
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_install_packages
-    cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
-    debug_run ./install_packages.sh online "$NFS_PACKAGE" || die "NFS server package ($NFS_PACKAGE) installation failed."
-    cd "$base_dir"
+    install_os_packages online "$NFS_PACKAGE" || die "NFS server package ($NFS_PACKAGE) installation failed (output above and in $LOG_FILE)."
   else
-    cd "$base_dir/utilities" || die "Cannot enter $base_dir/utilities."
-    debug_run ./install_packages.sh offline "$NFS_PACKAGE" || die "NFS server package ($NFS_PACKAGE) installation (offline) failed."
-    cd "$base_dir"
+    install_os_packages offline "$NFS_PACKAGE" || die "NFS server package ($NFS_PACKAGE) installation (offline) failed (output above and in $LOG_FILE)."
   fi
   echo "  Configuring NFS export..."
   # Reconcile: drop any previously-appended seaweedfs-installer export line first so
@@ -1450,6 +1463,29 @@ download_image_pull_push () {
       || die "Failed to download image_pull_push.sh (check network access, or use the air-gap bundle)."
     chmod +x "$base_dir/utilities/image_pull_push.sh"
   fi
+}
+
+# install_os_packages <online|offline> <package>... — runs install_packages.sh with its
+# output appended to the install log (and shown when DEBUG=1). On failure the tail of
+# that output is printed, so a package failure is never reported without its reason.
+install_os_packages () {
+  local mode=$1 start rc
+  shift
+  start=$(( $(wc -l < "$LOG_FILE") + 1 ))
+  if [[ "$DEBUG" -eq 1 ]]; then
+    (cd "$base_dir/utilities" && ./install_packages.sh "$mode" "$@") 2>&1 | tee -a "$LOG_FILE"
+    rc=${PIPESTATUS[0]}
+  else
+    (cd "$base_dir/utilities" && ./install_packages.sh "$mode" "$@") >> "$LOG_FILE" 2>&1
+    rc=$?
+  fi
+  if [[ $rc -ne 0 ]]; then
+    local last
+    last=$(tail -n +"$start" "$LOG_FILE" | tail -n 15)
+    echo "  install_packages.sh $mode $* exited $rc. Last output:" | tee -a "$LOG_FILE"
+    printf '    %s\n' "${last//$'\n'/$'\n'    }"
+  fi
+  return "$rc"
 }
 
 download_install_packages () {
