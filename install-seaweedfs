@@ -38,6 +38,7 @@ MQ_BROKER_PORT=${MQ_BROKER_PORT:-"17777"}
 DEFAULT_FILER_DIR_NAME=${DEFAULT_FILER_DIR_NAME:-"artifacts"}  # Default directory on SeaweedFS Filer for artifacts
 ENABLE_SMB=${ENABLE_SMB:-"true"}                               # Enable Samba smb share with basic authentication
 ENABLE_NFS=${ENABLE_NFS:-"true"}                              # Enable NFS export with NFSv3, no authentication
+NFS_CLIENTS=${NFS_CLIENTS:-"*"}                               # NFS export client list (space/comma separated): hosts, IPs, CIDRs (192.168.10.0/24), wildcards (*.lab), @netgroups. Default "*" = any client
 NFS_META_REFRESH_SEC=${NFS_META_REFRESH_SEC:-"30"}            # NFS re-export cache coherence: server drops its dentry/inode cache every N sec so out-of-band writes (filer HTTP API, S3, web uploader) become visible to NFS clients within ~N sec. 0 = disable. See README "NFS consistency model".
 ARTIFACTS_TO_DOWNLOAD=${ARTIFACTS_TO_DOWNLOAD:-""}             # List of artifact URLS to auto download with 'curl -k' and upload to SeaweedFS filer
 S3_BUCKET=${S3_BUCKET:-"charlie"}                              # S3 bucket name
@@ -451,11 +452,28 @@ configure_selinux() {
   fi
 }
 
+# NFS_CLIENTS split on commas/whitespace into NFS_CLIENT_LIST (read -a: no glob expansion of '*')
+nfs_client_list () {
+  read -r -a NFS_CLIENT_LIST <<< "${NFS_CLIENTS//,/ }"
+}
+
 preflight_nfs_check () {
   # P4-07: the kernel NFS server needs the nfsd module; Ubuntu's 'linux-kvm'
   # kernel flavor (22.04 minimal images) does not ship it at all. Fail before
   # any changes are made, with the real remediation, instead of dying mid-install.
   [[ ${ENABLE_NFS,,} == "true" ]] || return 0
+  local client
+  nfs_client_list
+  if [[ ${#NFS_CLIENT_LIST[@]} -eq 0 ]]; then
+    echo "Error: NFS_CLIENTS is empty — set it to '*' or a list of hosts/CIDRs (or ENABLE_NFS=false)." | tee -a "$LOG_FILE"
+    exit 1
+  fi
+  for client in "${NFS_CLIENT_LIST[@]}"; do
+    if [[ ! "$client" =~ ^[A-Za-z0-9.*?:/@_-]+$ ]]; then
+      echo "Error: NFS_CLIENTS entry '$client' is not a valid /etc/exports client (host, IP, CIDR, wildcard or @netgroup)." | tee -a "$LOG_FILE"
+      exit 1
+    fi
+  done
   if modprobe -n nfsd >/dev/null 2>&1; then
     return 0
   fi
@@ -475,9 +493,18 @@ preflight_port_check () {
     echo "  Existing install state found — port preflight skipped (converge re-run)."
     return 0
   fi
-  local conflicts="" entry port proc
+  local conflicts="" entry port proc own_ports="" own_hits=""
+  # An install that predates the state file still has its own seaweed-* containers
+  # publishing these ports; those are ours to reconcile, not foreign conflicts.
+  if command -v docker >/dev/null 2>&1; then
+    own_ports=$(docker ps --filter 'name=^seaweed-' --format '{{.Ports}}' 2>/dev/null | grep -oE ':[0-9]+->' | tr -d ':>-' | sort -u)
+  fi
   for entry in $(firewall_collect_ports); do
     port="${entry%%/*}"
+    if grep -qx "$port" <<< "$own_ports"; then
+      own_hits+=" $port"
+      continue
+    fi
     proc=$(ss -Hltnp "sport = :$port" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n1)
     if [[ -z "$proc" ]] && ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
       proc="unknown"
@@ -492,6 +519,9 @@ preflight_port_check () {
     echo "  Free the port(s) (or change the corresponding *_PORT variable) and re-run." | tee -a "$LOG_FILE"
     echo "  (Rocky 10 example: 'systemctl disable --now cockpit.socket' frees 9090.)" | tee -a "$LOG_FILE"
     exit 1
+  fi
+  if [[ -n "$own_hits" ]]; then
+    echo "  Existing SeaweedFS containers (install without a state file) hold port(s)$own_hits — treated as an upgrade, not a conflict." | tee -a "$LOG_FILE"
   fi
   echo "  Port preflight passed — all required host ports are free."
 }
@@ -518,6 +548,7 @@ install_swfs () {
   generate_compose_file
   record_state LOADED_IMAGES "$SWFS_IMAGE $CADDY_IMAGE"
   generate_index_html
+  persist_caddy_data
   echo "  Starting SeaweedFS and Caddy containers..."
   docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
@@ -740,9 +771,12 @@ run_nfs () {
   # has no stable device UUID for knfsd to derive filehandles from. Without an
   # explicit fsid, exportfs warns/refuses and clients hit ESTALE after a weed
   # mount or server restart. fsid=1 (never 0 — 0 is the NFSv4 pseudo-root).
-  cat >> /etc/exports <<EOF
-/mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=1) # seaweedfs-installer
-EOF
+  local export_line="/mnt/seaweed" client
+  nfs_client_list
+  for client in "${NFS_CLIENT_LIST[@]}"; do
+    export_line+=" ${client}(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=1)"
+  done
+  echo "$export_line # seaweedfs-installer" >> /etc/exports
   echo "  Exporting NFS filesystem..."
   exportfs -ra || die "exportfs -ra failed."
   echo "  Restarting NFS service..."
@@ -803,6 +837,25 @@ EOF
   systemctl enable seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
   # restart (not 'enable --now') so a CHANGED interval takes effect on a running timer (SW-16)
   systemctl restart seaweedfs-nfs-meta-refresh.timer || die "Failed to start the NFS metadata refresh timer."
+}
+
+# Caddy keeps its internal CA (pki/authorities/local) and issued certs under /data.
+# They are bind-mounted from /opt/caddy/{data,config} so the CA survives container
+# recreates. A container from an older install keeps them in its writable layer:
+# copy them out before compose recreates it, so clients that trust the CA keep working.
+persist_caddy_data () {
+  mkdir -p /opt/caddy/data /opt/caddy/config
+  chmod 700 /opt/caddy/data
+  [[ -d /opt/caddy/data/caddy/pki ]] && return 0
+  docker container inspect seaweed-caddy >/dev/null 2>&1 || return 0
+  echo "  Migrating the existing Caddy CA and certificates to /opt/caddy/data..." | tee -a "$LOG_FILE"
+  if docker cp seaweed-caddy:/data/. /opt/caddy/data/ >> "$LOG_FILE" 2>&1 \
+     && [[ -f /opt/caddy/data/caddy/pki/authorities/local/root.crt ]]; then
+    docker cp seaweed-caddy:/config/. /opt/caddy/config/ >> "$LOG_FILE" 2>&1
+    echo "  Caddy root CA kept: $(openssl x509 -in /opt/caddy/data/caddy/pki/authorities/local/root.crt -noout -fingerprint -sha256 2>/dev/null)" | tee -a "$LOG_FILE"
+  else
+    echo "  WARNING: could not copy the Caddy CA out of seaweed-caddy — Caddy will create a new CA; clients must re-trust it (/ca.crt)." | tee -a "$LOG_FILE"
+  fi
 }
 
 generate_caddyfile () {
@@ -974,6 +1027,8 @@ $CADDY_MONITORING_PORT
     volumes:
       - /opt/caddy/Caddyfile:/etc/caddy/Caddyfile
       - /opt/caddy/srv/index.html:/srv/index.html
+      - /opt/caddy/data:/data
+      - /opt/caddy/config:/config
     networks:
       - seaweed_net
     restart: unless-stopped
@@ -1414,6 +1469,7 @@ Docker compose file:   /opt/seaweedfs/seaweedfs-compose.yaml
 SeaweedFS data dir:    /opt/seaweedfs/mini
 Caddyfile:             /opt/caddy/Caddyfile
 Caddy web root:        /opt/caddy/srv/
+Caddy CA and certs:    /opt/caddy/data/ (persists across container recreates)
  
 The following services are accessible by IP or FQDN if DNS is configured:
   Master UI:    https://$SWFS_MASTER_FQDN:$SWFS_MASTER_PORT
@@ -1424,7 +1480,7 @@ The following services are accessible by IP or FQDN if DNS is configured:
 
 To run weed commands:  docker exec -it seaweed-mini weed <command>
 To run caddy commands: docker exec -it seaweed-caddy caddy <command>
-To download the Root CA (if required): docker exec -it seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
+To download the Root CA (if required): curl -k https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT/ca.crt -o seaweedfs-root-ca.crt (on the host: /opt/caddy/data/caddy/pki/authorities/local/root.crt)
 To mount SMB share from Windows: 'net use Z: \\\\$HOST_FQDN\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES'
 To mount NFS share: 'sudo mount -t nfs -o vers=3 $HOST_FQDN:/mnt/seaweed /mnt/nfs'
 
