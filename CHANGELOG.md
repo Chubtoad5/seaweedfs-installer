@@ -1,5 +1,34 @@
 # Changelog — seaweedfs-installer
 
+## 2026-10-23 — Landing page behind the Admin UI login; Admin UI catch-all route (feature/admin-splash-login)
+
+### Fixed
+- **Admin UI pages added by newer SeaweedFS releases returned 404.** The admin site proxied an
+  explicit list of Admin UI paths; SeaweedFS 4.30 added **Plugin** (`/plugin/lanes/…`), which fell
+  through to the landing page's file server. The admin site now proxies every path except the
+  landing page, `/ca.crt` and the `/<DEFAULT_FILER_DIR_NAME>` redirect to the Admin UI.
+
+### Added
+- **`SPLASH_REQUIRE_LOGIN`** (default `true`): the landing page is served only to a browser with a
+  valid Admin UI session (Caddy `forward_auth` on `/admin`); signed-out browsers get the Admin UI's
+  own sign-in page, and a successful sign-in lands on the landing page instead of the dashboard.
+  `false` keeps the previous public landing page. Re-runs converge in both directions.
+- **`/ca.crt`** downloads Caddy's local root CA (only that one file is reachable).
+- The Admin UI session cookie (`admin-session`) gets the `Secure` flag.
+- **Landing page refresh:** host, SeaweedFS/Caddy versions and mode; per-service FQDNs baked in at
+  install (no more rewriting the `admin` label of the browser's hostname); MQ broker; S3 user and
+  install-time buckets with an `aws` example; Linux/macOS SMB and an NFS `/etc/fstab` line plus the
+  `NFS_META_REFRESH_SEC` visibility note; the CA download and `curl --cacert` Filer API examples
+  instead of `curl -k`; and, when signed in, a live status panel (stored chunks, size, volumes, disk use,
+  S3 buckets) from the Admin UI JSON API, which hides itself if those internal endpoints change.
+
+### Upgrade notes
+- Re-running `install` regenerates the Caddyfile and landing page and restarts (does not recreate)
+  `seaweed-caddy`; data, credentials and the Caddy CA are untouched.
+- Anything that fetched the landing page anonymously and expected `200` now gets `307 /login`
+  (set `SPLASH_REQUIRE_LOGIN=false` to keep it public). The Filer, Master and S3 endpoints are
+  unchanged.
+
 ## 2026-09-09 — Idempotence release (feature/idempotence-phase2)
 
 Idempotence, distro-correctness and uninstall-fidelity pass. Re-running `install` now
