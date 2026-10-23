@@ -696,6 +696,11 @@ run_smb () {
     install_os_packages offline samba || die "Samba package installation (offline) failed (output above and in $LOG_FILE)."
   fi
   echo "  Configuring Samba..."
+  # smbpasswd below parses the host's smb.conf: reject a broken one up front with a clear error
+  if command -v testparm >/dev/null 2>&1 && [[ -f /etc/samba/smb.conf ]]; then
+    testparm -s /etc/samba/smb.conf > /dev/null 2>> "$LOG_FILE" \
+      || die "The existing /etc/samba/smb.conf is rejected by Samba (testparm -s; details in $LOG_FILE). Fix it and re-run."
+  fi
   # Create the SMB user idempotently. If a group of the same name already exists
   # (e.g. Ubuntu ships a pre-existing 'admin' group and SWFS_USER defaults to 'admin'),
   # attach to it with -g; otherwise useradd would abort and the SMB user is never created.
@@ -1475,8 +1480,10 @@ install_os_packages () {
     rc=$?
   fi
   if [[ $rc -ne 0 ]]; then
+    local last
+    last=$(tail -n +"$start" "$LOG_FILE" | tail -n 15)
     echo "  install_packages.sh $mode $* exited $rc. Last output:" | tee -a "$LOG_FILE"
-    tail -n +"$start" "$LOG_FILE" | tail -n 15 | sed 's/^/    /'
+    sed 's/^/    /' <<< "$last"
   fi
   return "$rc"
 }
