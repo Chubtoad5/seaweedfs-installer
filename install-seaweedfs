@@ -1196,7 +1196,7 @@ generate_index_html () {
         <div class="doc-card" id="status-card" style="display:none">
             <div class="subtitle" style="margin-top:0">Live status</div>
             <div class="stats">
-                <div class="stat"><div class="k">Files</div><div class="v" id="st-files">-</div></div>
+                <div class="stat"><div class="k">Stored chunks</div><div class="v" id="st-files">-</div></div>
                 <div class="stat"><div class="k">Stored</div><div class="v" id="st-size">-</div></div>
                 <div class="stat"><div class="k">Volumes</div><div class="v" id="st-volumes">-</div></div>
                 <div class="stat"><div class="k">Disk used</div><div class="v" id="st-disk">-</div></div>
@@ -1354,7 +1354,9 @@ generate_index_html () {
                         .then(function(r) { if (!r.ok) { throw new Error(path + ' ' + r.status); } return r.json(); });
                 }
                 getJson('/api/admin').then(function(a) {
-                    setText('st-files', typeof a.total_files === 'number' ? a.total_files.toLocaleString() : '-');
+                    // Needle (chunk) count, not a file count: 4.30 calls it total_files, 4.48+ total_chunks.
+                    var chunks = typeof a.total_chunks === 'number' ? a.total_chunks : a.total_files;
+                    setText('st-files', typeof chunks === 'number' ? chunks.toLocaleString() : '-');
                     setText('st-size', fmtBytes(a.total_size));
                     setText('st-volumes', typeof a.total_volumes === 'number' ? a.total_volumes.toLocaleString() : '-');
                     var used = 0, cap = 0;

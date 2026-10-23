@@ -19,7 +19,7 @@
   install (no more rewriting the `admin` label of the browser's hostname); MQ broker; S3 user and
   install-time buckets with an `aws` example; Linux/macOS SMB and an NFS `/etc/fstab` line plus the
   `NFS_META_REFRESH_SEC` visibility note; the CA download and `curl --cacert` Filer API examples
-  instead of `curl -k`; and, when signed in, a live status panel (files, size, volumes, disk use,
+  instead of `curl -k`; and, when signed in, a live status panel (stored chunks, size, volumes, disk use,
   S3 buckets) from the Admin UI JSON API, which hides itself if those internal endpoints change.
 
 ### Upgrade notes
