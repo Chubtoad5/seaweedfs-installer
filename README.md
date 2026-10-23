@@ -40,7 +40,7 @@ The installer sets up the following services depending on configuration:
 
 - Automates Docker runtime installation based on detected OS release
 - Deploys SeaweedFS `weed mini` with Admin UI, Master, Volume, Filer, S3 Gateway, and optional SMB/NFS shares
-- Caddy provides self-signed TLS with auto-renewing certificates, basic authentication, and a web landing page
+- Caddy provides self-signed TLS with auto-renewing certificates, basic authentication for the Filer and Master, and a web landing page behind the Admin UI login
 - Optional SeaweedMQ message broker for event streaming
 - Optional monitoring stack: Grafana, Loki (log aggregation backed by SeaweedFS S3), and Prometheus (metrics remote-write receiver)
 - Supports air-gapped deployments via a self-contained offline archive (`swfs-save.tar.gz`)
@@ -232,6 +232,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `ARTIFACTS_TO_DOWNLOAD` | `""` | Space-separated list of URLs to download and upload to the default Filer path |
 | `VOLUME_INDEX` | `""` | Optional volume index mode `[memory\|leveldb\|leveldbMedium\|leveldbLarge]`. `leveldb` lowers volume-server RAM for many small files on edge hosts. Empty = `weed mini` default (`memory`). |
 | `VOLUME_SIZE_LIMIT_MB` | `""` | Optional cap (MB) after which the master stops directing writes to a volume. Empty = `weed mini` auto-sizing (64–1024 MB). |
+| `SPLASH_REQUIRE_LOGIN` | `true` | `true` = the landing page sits behind the SeaweedFS Admin UI login (`SWFS_USER` / `SWFS_PASSWORD`); after signing in you land on it, with a link to the Admin Console. `false` = public landing page (the previous behaviour). See [Landing page and Admin UI access](#landing-page-and-admin-ui-access). |
 | `MGMT_IP` | *(first host IP)* | IP used as the Caddy `default_sni` fallback and cluster advertise address. Overridable (honored when passed by ap-tools or set explicitly). |
 | `SWFS_FORCE_ONLINE` | `false` | Ignore a `swfs-save-version.txt` sentinel in the working directory and stay in online mode (recover from a stale sentinel, e.g. on a build host that ran `save`). |
 | `SWFS_REMOVE_IMAGES` | `false` | `uninstall` only: also `docker rmi` the container images this installer loaded (recorded in the install-state file). |
@@ -261,8 +262,9 @@ After a successful install, the following endpoints are available by IP address 
 
 | Service | Default URL | Auth Required |
 |:--------|:-----------|:--------------|
-| Landing Page | `https://<host-ip>:443` | No |
-| Admin UI | `https://admin.<HOST_FQDN>:443` | Yes |
+| Landing Page | `https://admin.<HOST_FQDN>:443` (or `https://<host-ip>:443`) | Yes — Admin UI login (`SPLASH_REQUIRE_LOGIN=false`: No) |
+| Admin UI | `https://admin.<HOST_FQDN>:443/admin` | Yes — Admin UI login |
+| Caddy root CA | `https://admin.<HOST_FQDN>:443/ca.crt` | No (public certificate) |
 | Master UI | `https://master.<HOST_FQDN>:9333` | Yes |
 | Filer UI / Browser | `https://filer.<HOST_FQDN>:8888/artifacts` | Yes |
 | S3 Endpoint | `https://s3.<HOST_FQDN>:8333` | S3 key/secret |
@@ -271,11 +273,24 @@ After a successful install, the following endpoints are available by IP address 
 | Loki | `http://<host-ip>:3100` *(monitoring only)* | No |
 | Prometheus | `http://<host-ip>:9090` *(monitoring only)* | No |
 
-All browser-accessible services use self-signed TLS issued by Caddy. To retrieve the Caddy root CA certificate for import into browsers or OS trust stores:
+All browser-accessible services use self-signed TLS issued by Caddy. To retrieve the Caddy root CA certificate for import into browsers or OS trust stores (then use `curl --cacert` instead of `curl -k`):
 
 ```bash
-docker exec -it seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
+# From any client (first download is trust-on-first-use, hence -k once)
+curl -k https://admin.<HOST_FQDN>/ca.crt -o seaweedfs-root-ca.crt
+# Or on the host
+docker exec seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
 ```
+
+### Landing page and Admin UI access
+
+The `admin.<HOST_FQDN>` site serves two things: the generated landing page at `/` and the SeaweedFS Admin UI (every other path, through a single catch-all route, so sections added by newer SeaweedFS releases — e.g. **Plugin** at `/plugin/…` in 4.30 — work without a Caddyfile change).
+
+With `SPLASH_REQUIRE_LOGIN=true` (default) there is one login for both: Caddy checks the Admin UI session (`forward_auth` on `/admin`) before serving the landing page, so a signed-out browser is sent to the Admin UI's own sign-in page, and a successful sign-in lands on the landing page instead of the dashboard. Sign out from either page. The Admin UI session cookie gets the `Secure` flag. The Filer and Master keep HTTP basic auth (they are separate host/port sites used by `curl` clients), and S3 uses its keys.
+
+The landing page shows the host, SeaweedFS/Caddy versions and mode, links to the Admin Console / Master / File Browser (/ Grafana), the S3 endpoint, user and install-time buckets, the MQ broker, Windows/Linux/macOS SMB and NFS (`mount` + `/etc/fstab`) examples, the CA download, and Filer API `curl --cacert` examples. When signed in it also shows a **live status** panel (files, stored size, volumes, disk use, S3 buckets with sizes) read from the Admin UI's JSON API (`/api/admin`, `/api/s3/buckets`). These are internal SeaweedFS endpoints; if a future release changes them the panel hides itself and the rest of the page is unaffected. No password or S3 key is ever embedded in the page.
+
+Known SeaweedFS behaviour: Admin UI sessions are self-contained 24-hour cookies, so signing out clears the browser's cookie but does not revoke a copy of it. Because SeaweedFS advertises its in-container address, the Admin UI's own links to the master/filer/volume UIs (`//172.x.x.x:9333/…`) are not reachable from a browser — use the landing page links instead.
 
 ## Behavior Notes
 
@@ -310,7 +325,7 @@ Uninstall and re-install reconciliation read this file; deleting it degrades uni
 ### Security notes
 
 - The install log (`seaweedfs-install.log`) contains the full credentials and is written mode **600**; the console output masks passwords and S3 keys. Uninstall removes the install log.
-- The Caddy landing page is served **unauthenticated** and no longer embeds the SMB password — the Windows `net use` example uses `*` to prompt for it.
+- The Caddy landing page sits behind the Admin UI login by default (`SPLASH_REQUIRE_LOGIN=true`) and never embeds a password or S3 key — the Windows `net use` example uses `*` to prompt for it. `/ca.crt` serves only Caddy's public root certificate (the route is pinned to that one file; the CA private key is not reachable).
 - `docker login` uses `--password-stdin`; registry passwords are not echoed.
 - `/opt/monitoring/loki/loki-config.yaml` embeds the S3 keys and is readable only by the Loki container user (UID 10001) and root; monitoring data directories are owned per container user (Loki 10001, Prometheus 65534, Grafana 472, mode 750) instead of world-writable.
 
