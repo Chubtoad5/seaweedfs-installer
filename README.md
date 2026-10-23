@@ -11,6 +11,7 @@ A bash automation script that deploys a self-contained, production-ready Seaweed
 - [Usage](#usage)
   - [Quick Start](#quick-start)
   - [Upgrading an existing install](#upgrading-an-existing-install)
+  - [Manual installation](#manual-installation)
 - [Examples](#examples)
 - [Configuration Variables](#configuration-variables)
 - [Service Endpoints](#service-endpoints)
@@ -61,6 +62,10 @@ sudo ./install-seaweedfs install
 ```
 
 After installation, a summary with all service URLs, credentials, and API examples is printed to the console and saved to `seaweedfs-install.log`.
+
+### Manual installation
+
+[`swfs-manual.md`](swfs-manual.md) deploys the same stack step by step without the script, including an air-gapped and a local-registry path. It covers the services, TLS, the Admin UI sign-in, `/ca.crt`, the persisted Caddy CA, SMB, NFS and monitoring. It does **not** create the landing page, the install-state file, firewall/SELinux handling or the converge/uninstall behaviour; on a manual install `https://admin.<HOST_FQDN>/` opens the Admin UI directly.
 
 ### Syntax
 
@@ -232,7 +237,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 
 | Variable | Default Value | Description |
 |:---------|:-------------|:------------|
-| `DEBUG` | `1` | When disabled (`0`), script runs in silent mode |
+| `DEBUG` | `1` | When disabled (`0`), sub-step output (Docker setup, package installs) is kept off the console; package-install output still goes to `seaweedfs-install.log` |
 | `SWFS_IMAGE` | `chrislusf/seaweedfs:4.30` | Container image for SeaweedFS (pinned for reproducible online/air-gapped installs; override to track a newer release) |
 | `CADDY_IMAGE` | `caddy:2.11.3` | Container image for Caddy (pinned; override to track a newer release) |
 | `SWFS_USER` | `admin` | Username for Admin UI, Filer, Master, and Caddy basic auth |

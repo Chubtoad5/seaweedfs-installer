@@ -1,5 +1,28 @@
 # Changelog — seaweedfs-installer
 
+## 2026-10-23 — Manual install guide brought in line with the script (docs/manual-sync)
+
+### Changed (docs only)
+- **`swfs-manual.md`:**
+  - images pinned to the script defaults (`seaweedfs:4.30`, `caddy:2.11.3`) instead of `:latest`
+  - new "What this guide does not set up" table: the landing page, install state / converge /
+    uninstall, firewall and SELinux handling. A manual install opens the Admin UI and its sign-in
+    directly at `/`, which is fine because nothing depends on the landing page
+  - the admin site gets `/ca.crt` and the `Secure` session cookie
+  - Caddy `/data` and `/config` are persisted, so the CA survives recreates (the monitoring step's
+    `--force-recreate caddy` used to replace it)
+  - the unused `AWS_*` environment on `seaweed-mini` is dropped (it exposed the admin password); MQ
+    gets `depends_on`
+  - `fuse.conf` is appended to, not overwritten
+  - the SMB user is created safely when a group of the same name exists
+  - `testparm` and a :445 check before and after the Samba restart; the SELinux
+    `samba_share_fusefs` note added; Windows `net use` prompts for the password (`*`)
+  - the NFS export gets the required `fsid=1` and a note on limiting clients; new optional
+    NFS refresh-timer step
+  - CA download via `/ca.crt` or the host path
+- **README:** a "Manual installation" pointer (what the guide covers and leaves out), and the
+  `DEBUG` description matches the new package-output logging.
+
 ## 2026-10-23 — Samba setup is verified; package failures show their reason (fix/samba-verify-package-output)
 
 ### Fixed

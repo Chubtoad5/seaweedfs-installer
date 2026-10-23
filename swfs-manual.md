@@ -6,10 +6,21 @@ This guide walks through manually deploying the SeaweedFS stack without the auto
 
 | Container | Image | Purpose |
 |:----------|:------|:--------|
-| `seaweed-mini` | `chrislusf/seaweedfs:latest` | All-in-one: Master, Volume, Filer, Admin UI, S3 Gateway |
-| `seaweed-caddy` | `caddy:latest` | Reverse proxy with self-signed TLS and basic auth |
+| `seaweed-mini` | `chrislusf/seaweedfs:4.30` | All-in-one: Master, Volume, Filer, Admin UI, S3 Gateway |
+| `seaweed-caddy` | `caddy:2.11.3` | Reverse proxy with self-signed TLS and basic auth |
 
-Optional add-ons are covered in their own sections below.
+Optional add-ons are covered in their own sections below. Image versions match the script's pinned defaults (`SWFS_IMAGE` / `CADDY_IMAGE`); change them in every step if you track a newer release.
+
+**What this guide does not set up** (the script adds these on top of the same stack):
+
+| Script feature | Manual equivalent |
+|:---------------|:------------------|
+| Landing page at `https://admin.<HOST_FQDN>/` (behind the Admin UI login, with service links, mount examples and a live status panel) | None. `/` goes straight to the SeaweedFS Admin UI, which sends a signed-out browser to its own sign-in page. Every service is reachable at the URLs in the step 7 summary; the page is a convenience the script generates and nothing depends on it |
+| Install-state file, converge re-runs, `uninstall` | Re-run the steps by hand; remove with `docker compose down` plus the files and config lines you added |
+| Firewall (firewalld/UFW) and SELinux handling | Open the ports and set `samba_share_fusefs` yourself (see the README "Firewall and SELinux handling") |
+| Pre-flight checks (ports, kernel `nfsd`, `smb.conf` validation) | The checks that matter are shown inline |
+
+The Admin UI sign-in, the `/ca.crt` download, the `Secure` session cookie and the persisted Caddy CA **are** included below, so a manual install is protected the same way as a scripted one.
 
 ---
 
@@ -71,7 +82,8 @@ S3_SECRET_KEY="$(openssl rand -hex 16)"
 ## 2. Create Directories
 
 ```bash
-sudo mkdir -p /opt/caddy
+sudo mkdir -p /opt/caddy/data /opt/caddy/config
+sudo chmod 700 /opt/caddy/data   # holds the Caddy CA private key
 sudo mkdir -p /opt/seaweedfs/mini
 ```
 
@@ -82,7 +94,7 @@ sudo mkdir -p /opt/seaweedfs/mini
 Caddy requires its own bcrypt-hashed password format. Use a temporary Caddy container to generate it:
 
 ```bash
-CADDY_HASHED_PASSWORD=$(docker run --rm caddy:latest caddy hash-password --plaintext "${SWFS_PASSWORD}")
+CADDY_HASHED_PASSWORD=$(docker run --rm caddy:2.11.3 caddy hash-password --plaintext "${SWFS_PASSWORD}")
 echo "Hashed password: ${CADDY_HASHED_PASSWORD}"
 ```
 
@@ -90,7 +102,7 @@ echo "Hashed password: ${CADDY_HASHED_PASSWORD}"
 
 ## 4. Create the Caddyfile
 
-This is a simplified Caddyfile with no landing page. All four service endpoints are proxied with self-signed TLS. The filer directory and master require basic auth; S3 uses its own SigV4 key authentication.
+This Caddyfile has no landing page: everything on the admin site except `/ca.crt` goes to the SeaweedFS Admin UI, which handles its own sign-in (and serves newer sections such as `/plugin/...` without changes here). `/ca.crt` downloads Caddy's root certificate (only that file; the CA private key is not reachable), and the Admin UI session cookie gets the `Secure` flag. All four service endpoints are proxied with self-signed TLS. The filer directory and master require basic auth; S3 uses its own SigV4 key authentication.
 
 ```bash
 sudo tee /opt/caddy/Caddyfile > /dev/null <<EOF
@@ -100,7 +112,18 @@ sudo tee /opt/caddy/Caddyfile > /dev/null <<EOF
 
 ${SWFS_ADMIN_FQDN}:443, https://${HOST_IP}:443 {
     tls internal
-    reverse_proxy seaweed-mini:23646
+    handle /ca.crt {
+        root * /data/caddy/pki/authorities/local
+        rewrite * /root.crt
+        header Content-Type application/x-pem-file
+        header Content-Disposition "attachment; filename=\"${HOST_FQDN}-ca.crt\""
+        file_server
+    }
+    handle {
+        reverse_proxy seaweed-mini:23646 {
+            header_down Set-Cookie "^(.+)\$" "\$1; Secure"
+        }
+    }
 }
 
 ${SWFS_FILER_FQDN}:8888, https://${HOST_IP}:8888 {
@@ -143,11 +166,8 @@ networks:
 
 services:
   seaweed-mini:
-    image: chrislusf/seaweedfs:latest
+    image: chrislusf/seaweedfs:4.30
     container_name: seaweed-mini
-    environment:
-      - AWS_ACCESS_KEY_ID=${SWFS_USER}
-      - AWS_SECRET_ACCESS_KEY=${SWFS_PASSWORD}
     command: >
       mini
       -admin.user "${SWFS_USER}"
@@ -161,7 +181,7 @@ services:
     restart: unless-stopped
 
   caddy:
-    image: caddy:latest
+    image: caddy:2.11.3
     container_name: seaweed-caddy
     ports:
       - "443:443"
@@ -170,6 +190,8 @@ services:
       - "8333:8333"
     volumes:
       - /opt/caddy/Caddyfile:/etc/caddy/Caddyfile
+      - /opt/caddy/data:/data
+      - /opt/caddy/config:/config
     networks:
       - seaweed_net
     restart: unless-stopped
@@ -177,6 +199,10 @@ services:
       - seaweed-mini
 EOF
 ```
+
+---
+
+> **Keep the `/opt/caddy/data` mount.** Caddy stores its internal CA and certificates under `/data`. Without the mount they live inside the container, and every recreate (image update, compose change, `--force-recreate`) creates a new CA that every client has to trust again.
 
 ---
 
@@ -240,10 +266,13 @@ S3 credentials:
 "
 ```
 
-To retrieve the Caddy root CA certificate (for trusting the self-signed cert in browsers or tools):
+To retrieve the Caddy root CA certificate (for trusting the self-signed cert in browsers or tools, then `curl --cacert seaweedfs-root-ca.crt` instead of `curl -k`):
 
 ```bash
-docker exec seaweed-caddy cat /data/caddy/pki/authorities/local/root.crt > seaweedfs-root-ca.crt
+# From any client (trust on first use, hence -k once)
+curl -k https://${SWFS_ADMIN_FQDN}/ca.crt -o seaweedfs-root-ca.crt
+# Or on the host
+sudo cp /opt/caddy/data/caddy/pki/authorities/local/root.crt seaweedfs-root-ca.crt
 ```
 
 ---
@@ -257,7 +286,7 @@ Append the `seaweed-mq` service to the existing compose file, then restart the s
 sudo tee -a /opt/seaweedfs/seaweedfs-compose.yaml > /dev/null <<EOF
 
   seaweed-mq:
-    image: chrislusf/seaweedfs:latest
+    image: chrislusf/seaweedfs:4.30
     container_name: seaweed-mq
     command: >
       mq.broker
@@ -268,6 +297,8 @@ sudo tee -a /opt/seaweedfs/seaweedfs-compose.yaml > /dev/null <<EOF
     networks:
       - seaweed_net
     restart: unless-stopped
+    depends_on:
+      - seaweed-mini
 EOF
 
 sudo docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
@@ -301,10 +332,11 @@ sudo zypper install -y samba
 ```bash
 # Allow non-root FUSE mounts
 sudo mkdir -p /mnt/seaweed
-echo "user_allow_other" | sudo tee /etc/fuse.conf
+grep -qx 'user_allow_other' /etc/fuse.conf 2>/dev/null || echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 
-# Create a system user for the SMB share
-sudo useradd -M -s /sbin/nologin ${SWFS_USER}
+# Create a system user for the SMB share; joins an existing group of the same name
+# (e.g. Ubuntu's 'admin' group), which would otherwise make useradd fail
+id ${SWFS_USER} &>/dev/null || sudo useradd -M -s /sbin/nologin $(getent group ${SWFS_USER} >/dev/null && echo "-g ${SWFS_USER}") ${SWFS_USER}
 (echo "${SWFS_PASSWORD}"; echo "${SWFS_PASSWORD}") | sudo smbpasswd -a -s ${SWFS_USER}
 ```
 
@@ -340,7 +372,7 @@ EOF
 sudo tee -a /opt/seaweedfs/seaweedfs-compose.yaml > /dev/null <<EOF
 
   seaweed-mount:
-    image: chrislusf/seaweedfs:latest
+    image: chrislusf/seaweedfs:4.30
     container_name: seaweed-mount
     privileged: true
     command:
@@ -358,6 +390,12 @@ EOF
 
 ### 5. Restart the Stack and Samba
 
+Check the configuration first; a broken `smb.conf` would stop Samba on restart:
+
+```bash
+sudo testparm -s 2>/dev/null | grep -xF "[${FILER_DIR}]"   # must print the share name
+```
+
 ```bash
 sudo docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
 
@@ -366,11 +404,16 @@ sudo systemctl restart smbd
 
 # RHEL / Rocky / SLES
 sudo systemctl restart smb
+
+# Samba must be listening on 445
+sudo ss -ltn 'sport = :445'
 ```
 
-**Mount from Windows:**
+With SELinux enforcing (RHEL/Rocky), also run `sudo setsebool -P samba_share_fusefs on` so Samba may serve the FUSE mount.
+
+**Mount from Windows** (`*` prompts for the password, so it is not left in the command history):
 ```
-net use Z: \\<HOST_IP>\artifacts <SWFS_PASSWORD> /USER:<SWFS_USER> /PERSISTENT:YES
+net use Z: \\<HOST_IP>\artifacts * /USER:<SWFS_USER> /PERSISTENT:YES
 ```
 
 ---
@@ -385,7 +428,7 @@ NFS shares the same FUSE mount at `/mnt/seaweed` over NFSv3 with no authenticati
 
 ```bash
 sudo mkdir -p /mnt/seaweed
-echo "user_allow_other" | sudo tee /etc/fuse.conf
+grep -qx 'user_allow_other' /etc/fuse.conf 2>/dev/null || echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 ```
 
 ### 2. Install NFS Server
@@ -411,7 +454,7 @@ sudo zypper install -y nfs-kernel-server
 sudo tee -a /opt/seaweedfs/seaweedfs-compose.yaml > /dev/null <<EOF
 
   seaweed-mount:
-    image: chrislusf/seaweedfs:latest
+    image: chrislusf/seaweedfs:4.30
     container_name: seaweed-mount
     privileged: true
     command:
@@ -430,7 +473,10 @@ EOF
 ### 4. Configure and Start NFS
 
 ```bash
-echo "/mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure) # seaweedfs-installer" \
+# fsid=1 is required: a FUSE filesystem has no stable device ID, so without it clients
+# get "stale file handle" errors after a restart. Replace '*' with a host, IP or CIDR
+# (e.g. 192.168.10.0/24) to limit who can mount (the script's NFS_CLIENTS setting).
+echo "/mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=1) # seaweedfs-installer" \
   | sudo tee -a /etc/exports
 
 sudo exportfs -ra
@@ -451,6 +497,38 @@ sudo docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
 **Mount from a Linux client:**
 ```bash
 sudo mount -t nfs -o vers=3 <HOST_IP>:/mnt/seaweed /mnt/seaweed
+```
+
+### 6. Optional: Refresh Timer for Out-of-Band Writes
+
+Files written **through** NFS are visible to all NFS clients at once. Files written another way (Filer API, S3, the web uploader) can stay invisible to NFS clients until the server drops its directory cache; see the README "NFS consistency model". The script installs this timer by default (`NFS_META_REFRESH_SEC=30`):
+
+```bash
+sudo tee /etc/systemd/system/seaweedfs-nfs-meta-refresh.service > /dev/null <<'UNIT'
+[Unit]
+Description=SeaweedFS NFS re-export metadata cache refresh
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'sync; echo 2 > /proc/sys/vm/drop_caches'
+UNIT
+
+sudo tee /etc/systemd/system/seaweedfs-nfs-meta-refresh.timer > /dev/null <<'UNIT'
+[Unit]
+Description=Periodic SeaweedFS NFS metadata cache refresh (every 30s)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=seaweedfs-nfs-meta-refresh.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now seaweedfs-nfs-meta-refresh.timer
 ```
 
 ---
@@ -620,7 +698,7 @@ Add port `3000` to the caddy service in the compose file:
 sudo sed -i '/- "8333:8333"/a\      - "3000:3000"' /opt/seaweedfs/seaweedfs-compose.yaml
 ```
 
-Reload Caddy:
+Reload Caddy (the recreate keeps the CA, because `/data` is mounted from `/opt/caddy/data`):
 
 ```bash
 sudo docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --force-recreate caddy
@@ -858,11 +936,11 @@ Container images are saved separately from OS packages using the Docker CLI.
 
 ```bash
 # Pull core images
-docker pull chrislusf/seaweedfs:latest
-docker pull caddy:latest
+docker pull chrislusf/seaweedfs:4.30
+docker pull caddy:2.11.3
 
 # Save core images only
-docker save chrislusf/seaweedfs:latest caddy:latest \
+docker save chrislusf/seaweedfs:4.30 caddy:2.11.3 \
   | gzip > seaweedfs-images.tar.gz
 
 # --- OR --- pull and save core + monitoring images
@@ -871,8 +949,8 @@ docker pull grafana/grafana-oss:11.5.2
 docker pull prom/prometheus:v3.2.1
 
 docker save \
-  chrislusf/seaweedfs:latest \
-  caddy:latest \
+  chrislusf/seaweedfs:4.30 \
+  caddy:2.11.3 \
   grafana/loki:3.4.2 \
   grafana/grafana-oss:11.5.2 \
   prom/prometheus:v3.2.1 \
@@ -1094,12 +1172,12 @@ The registry must have these projects pre-created before pushing. See the [READM
 
 ```bash
 # SeaweedFS
-docker tag chrislusf/seaweedfs:latest ${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:latest
-docker push ${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:latest
+docker tag chrislusf/seaweedfs:4.30 ${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:4.30
+docker push ${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:4.30
 
 # Caddy (uses the 'library' project namespace)
-docker tag caddy:latest ${REG_HOST}:${REG_PORT}/library/caddy:latest
-docker push ${REG_HOST}:${REG_PORT}/library/caddy:latest
+docker tag caddy:2.11.3 ${REG_HOST}:${REG_PORT}/library/caddy:2.11.3
+docker push ${REG_HOST}:${REG_PORT}/library/caddy:2.11.3
 
 # Monitoring images (skip if not deploying monitoring)
 docker tag grafana/loki:3.4.2 ${REG_HOST}:${REG_PORT}/grafana/loki:3.4.2
@@ -1118,11 +1196,11 @@ When creating the Docker Compose and monitoring compose files, substitute the im
 
 ```bash
 # Override image variables before following the core install steps
-SWFS_IMAGE="${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:latest"
-CADDY_IMAGE="${REG_HOST}:${REG_PORT}/library/caddy:latest"
+SWFS_IMAGE="${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:4.30"
+CADDY_IMAGE="${REG_HOST}:${REG_PORT}/library/caddy:2.11.3"
 LOKI_IMAGE="${REG_HOST}:${REG_PORT}/grafana/loki:3.4.2"
 GRAFANA_IMAGE="${REG_HOST}:${REG_PORT}/grafana/grafana-oss:11.5.2"
 PROMETHEUS_IMAGE="${REG_HOST}:${REG_PORT}/prom/prometheus:v3.2.1"
 ```
 
-Then proceed with [Section 5 (Create the Docker Compose File)](#5-create-the-docker-compose-file) and replace `chrislusf/seaweedfs:latest` / `caddy:latest` with `${SWFS_IMAGE}` / `${CADDY_IMAGE}`, and similarly for the monitoring compose file.
+Then proceed with [Section 5 (Create the Docker Compose File)](#5-create-the-docker-compose-file) and replace `chrislusf/seaweedfs:4.30` / `caddy:2.11.3` with `${SWFS_IMAGE}` / `${CADDY_IMAGE}`, and similarly for the monitoring compose file.
