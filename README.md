@@ -10,6 +10,7 @@ A bash automation script that deploys a self-contained, production-ready Seaweed
 - [Features](#features)
 - [Usage](#usage)
   - [Quick Start](#quick-start)
+  - [Upgrading an existing install](#upgrading-an-existing-install)
 - [Examples](#examples)
 - [Configuration Variables](#configuration-variables)
 - [Service Endpoints](#service-endpoints)
@@ -103,7 +104,33 @@ Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and Seawe
 | `/opt/seaweedfs/.install-state` | Install-state record used by uninstall/re-install (mode 600) — see [Install-state file](#install-state-file) |
 | `/opt/caddy/Caddyfile` | Caddy reverse proxy configuration |
 | `/opt/caddy/srv/index.html` | Caddy web landing page |
+| `/opt/caddy/data/`, `/opt/caddy/config/` | Caddy's internal CA, issued certificates and autosaved config (bind-mounted, so the CA survives container recreates; `data/` is mode 700) |
 | `/opt/monitoring/docker-compose.yml` | Docker Compose file for the monitoring stack |
+
+#### Upgrading an existing install
+
+`install` is also the upgrade path: run the newer script on the host and it reconciles the running install in place (containers are recreated only when the compose file changes; data under `/opt/seaweedfs/mini` is kept). Back up first (a VM snapshot, or at least `/opt/seaweedfs` and `/opt/caddy`).
+
+The installer does **not** read the previous install's settings back — any value you changed from the default at install time must be passed again, or the default is applied:
+
+| Carry over | Why |
+|:-----------|:----|
+| `HOST_FQDN` (and any `SWFS_*_FQDN` / `*_PORT`) | default is `$(hostname).edge.lab` — certificates, landing page and links would change |
+| `SWFS_USER` / `SWFS_PASSWORD` | default `admin` / `changeme` — Admin UI, Filer/Master basic auth and SMB would switch to the default password |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | default is a **new random key pair** — existing S3 clients would be locked out. The current keys are in the previous `seaweedfs-install.log` and in the Filer at `/etc/iam/identities/<user>.json` |
+| `DEFAULT_FILER_DIR_NAME` | default `artifacts` — SMB/NFS and the `/<dir>` redirect would point at an empty directory |
+| `ENABLE_MONITORING`, `ENABLE_SMB`, `ENABLE_NFS`, `ENABLE_MQ`, `NFS_CLIENTS`, `SPLASH_REQUIRE_LOGIN` | defaults may enable/disable features (monitoring is on by default; a feature turned off is torn down) |
+| `S3_BUCKET` / `EXTRA_BUCKETS`, `VOLUME_*`, `CLUSTER_*` | as originally installed |
+
+Example:
+
+```bash
+HOST_FQDN=files.example.lab SWFS_PASSWORD='<current>' S3_ACCESS_KEY=<current> S3_SECRET_KEY=<current> \
+DEFAULT_FILER_DIR_NAME=share ENABLE_MONITORING=false NFS_CLIENTS=192.168.10.0/24 ./install-seaweedfs install
+```
+
+- **Installs from before the install-state file** (no `/opt/seaweedfs/.install-state`): the port preflight recognises ports held by this installer's own `seaweed-*` containers and treats the run as an upgrade — no need to stop the stack first.
+- **Caddy CA:** older installs kept Caddy's CA inside the container, so any recreate produced a new CA. On the first run of this version the existing CA and certificates are copied to `/opt/caddy/data` before the container is recreated, so clients that already trust it keep working; from then on it persists.
 
 #### `save`
 
@@ -221,6 +248,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `DEFAULT_FILER_DIR_NAME` | `artifacts` | Default Filer directory for user data |
 | `ENABLE_SMB` | `true` | Enable Samba (SMB) share with basic auth on the default Filer path |
 | `ENABLE_NFS` | `true` | Enable NFS export (NFSv3, no authentication) of the default Filer path |
+| `NFS_CLIENTS` | `*` | Clients allowed to mount the NFS export, separated by spaces or commas: hosts, IPs, CIDRs (`192.168.10.0/24`), wildcards (`*.lab`) or `@netgroups`. Each gets the same export options. Re-runs rewrite the export line, so set it on every run to keep a restricted scope. |
 | `NFS_META_REFRESH_SEC` | `30` | NFS re-export cache-coherence interval (seconds). The server drops its dentry/inode cache every N seconds so writes made *outside* the NFS path (filer HTTP API, S3, web uploader, another node) become visible to NFS clients within ~N seconds. `0` disables it. See [NFS consistency model](#nfs-consistency-model). |
 | `ENABLE_MQ` | `true` | Deploy SeaweedMQ message broker |
 | `MQ_BROKER_PORT` | `17777` | TCP port for SeaweedMQ broker |
@@ -327,6 +355,7 @@ Uninstall and re-install reconciliation read this file; deleting it degrades uni
 - The install log (`seaweedfs-install.log`) contains the full credentials and is written mode **600**; the console output masks passwords and S3 keys. Uninstall removes the install log.
 - The Caddy landing page sits behind the Admin UI login by default (`SPLASH_REQUIRE_LOGIN=true`) and never embeds a password or S3 key — the Windows `net use` example uses `*` to prompt for it. `/ca.crt` serves only Caddy's public root certificate (the route is pinned to that one file; the CA private key is not reachable).
 - `docker login` uses `--password-stdin`; registry passwords are not echoed.
+- `/opt/caddy/data/` holds the Caddy CA private key (mode 700, root). Uninstall removes it with the rest of `/opt/caddy`.
 - `/opt/monitoring/loki/loki-config.yaml` embeds the S3 keys and is readable only by the Loki container user (UID 10001) and root; monitoring data directories are owned per container user (Loki 10001, Prometheus 65534, Grafana 472, mode 750) instead of world-writable.
 
 ### Per-distro service and package names

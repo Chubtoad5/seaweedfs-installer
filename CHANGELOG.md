@@ -1,5 +1,28 @@
 # Changelog — seaweedfs-installer
 
+## 2026-10-23 — Caddy CA persists; NFS_CLIENTS; upgrades of older installs (feature/persist-caddy-data-nfs-clients)
+
+### Fixed
+- **The Caddy CA changed whenever the container was recreated** (image bump, compose change,
+  re-install), so every client that trusted it broke. Caddy's `/data` and `/config` are now
+  bind-mounted from `/opt/caddy/data` and `/opt/caddy/config`. On the first run over an older
+  install the existing CA and certificates are copied out of the running container before it is
+  recreated, so the CA is kept.
+- **Upgrading an install from before the install-state file failed the port preflight** on its own
+  containers. Ports published by this installer's `seaweed-*` containers are no longer counted as
+  conflicts.
+
+### Added
+- **`NFS_CLIENTS`** (default `*`): client list for the NFS export (hosts, IPs, CIDRs, wildcards,
+  `@netgroups`; space- or comma-separated), validated before any change is made.
+- README **"Upgrading an existing install"**: the settings to carry over on every re-run.
+
+### Upgrade notes
+- The compose file changes (two new Caddy volumes), so the first re-run **recreates
+  `seaweed-caddy`** (a few seconds of downtime on the web endpoints). The CA is migrated first and
+  the log prints its fingerprint. SeaweedFS containers and data are untouched.
+- Re-runs rewrite the NFS export line from `NFS_CLIENTS` — pass a restricted scope every time.
+
 ## 2026-10-23 — Landing page behind the Admin UI login; Admin UI catch-all route (feature/admin-splash-login)
 
 ### Fixed
