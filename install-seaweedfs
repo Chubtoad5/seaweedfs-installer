@@ -38,7 +38,7 @@ MQ_BROKER_PORT=${MQ_BROKER_PORT:-"17777"}
 DEFAULT_FILER_DIR_NAME=${DEFAULT_FILER_DIR_NAME:-"artifacts"}  # Default directory on SeaweedFS Filer for artifacts
 ENABLE_SMB=${ENABLE_SMB:-"true"}                               # Enable Samba smb share with basic authentication
 ENABLE_NFS=${ENABLE_NFS:-"true"}                              # Enable NFS export with NFSv3, no authentication
-NFS_CLIENTS=${NFS_CLIENTS:-"*"}                               # NFS export client list (space/comma separated): hosts, IPs, CIDRs (192.168.10.0/24), wildcards (*.lab), @netgroups. Default "*" = any client
+NFS_CLIENTS=${NFS_CLIENTS:-"*"}                               # NFS export client list (space/comma separated): hosts, IPs, CIDRs (10.0.0.0/24), wildcards (*.lab), @netgroups. Default "*" = any client
 NFS_META_REFRESH_SEC=${NFS_META_REFRESH_SEC:-"30"}            # NFS re-export cache coherence: server drops its dentry/inode cache every N sec so out-of-band writes (filer HTTP API, S3, web uploader) become visible to NFS clients within ~N sec. 0 = disable. See README "NFS consistency model".
 ARTIFACTS_TO_DOWNLOAD=${ARTIFACTS_TO_DOWNLOAD:-""}             # List of artifact URLS to auto download with 'curl -k' and upload to SeaweedFS filer
 S3_BUCKET=${S3_BUCKET:-"charlie"}                              # S3 bucket name
@@ -1598,11 +1598,11 @@ download_binaries () {
     echo "  Downloading $(basename "$url")..." | tee -a "$base_dir/$LOG_FILE"
     if ! curl -kfLO "$url"; then
       echo "  ERROR: failed to download artifact $url" | tee -a "$base_dir/$LOG_FILE"
-      cd "$base_dir"
+      cd "$base_dir" || return 1
       return 1
     fi
   done
-  cd "$base_dir"
+  cd "$base_dir" || return 1
 }
 
 upload_binaries () {
@@ -1856,7 +1856,8 @@ setup_monitoring () {
   echo "  Waiting for monitoring stack to become healthy..."
   local attempt=1
   while [[ $attempt -le 12 ]]; do
-    local loki_ready=$(docker exec loki wget --quiet --tries=1 --output-document=- http://localhost:3100/ready 2>/dev/null || true)
+    local loki_ready
+    loki_ready=$(docker exec loki wget --quiet --tries=1 --output-document=- http://localhost:3100/ready 2>/dev/null || true)
     if [[ "$loki_ready" == "ready" ]]; then
       echo "  Monitoring stack is healthy."
       break
@@ -1895,7 +1896,6 @@ os_check () {
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
     source /etc/os-release
-    OS_ID_LIKE="${ID_LIKE:-}"
     OS_ID="${ID:-}"
   else
     echo "Unknown or unsupported OS $OS_ID."
@@ -2022,7 +2022,7 @@ EOF
   # NFS server package name is distro-specific ($NFS_PACKAGE, set by os_check).
   ./install_packages.sh save samba "$NFS_PACKAGE" \
     || die "install_packages.sh save (samba $NFS_PACKAGE) failed — OS package bundle was not produced."
-  cd "$base_dir"
+  cd "$base_dir" || return 1
   debug_run download_binaries || die "Artifact download failed."
   cat > "$base_dir/swfs-save-version.txt" <<EOF
 # SeaweedFS Installer Save Archive
@@ -2349,6 +2349,11 @@ Examples:
 
 EOF
 }
+
+# When sourced by a test harness, stop here: only the functions above are wanted.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 # --- CLI Wrapper --- #
 if [[ "$#" -eq 0 ]]; then
