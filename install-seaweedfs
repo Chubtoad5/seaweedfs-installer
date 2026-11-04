@@ -2022,7 +2022,8 @@ EOF
   # NFS server package name is distro-specific ($NFS_PACKAGE, set by os_check).
   ./install_packages.sh save samba "$NFS_PACKAGE" \
     || die "install_packages.sh save (samba $NFS_PACKAGE) failed — OS package bundle was not produced."
-  cd "$base_dir" || return 1
+  # die, not return: the caller doesn't check run_save, so a return would turn this into exit 0 with no archive.
+  cd "$base_dir" || die "Cannot return to $base_dir."
   debug_run download_binaries || die "Artifact download failed."
   cat > "$base_dir/swfs-save-version.txt" <<EOF
 # SeaweedFS Installer Save Archive
