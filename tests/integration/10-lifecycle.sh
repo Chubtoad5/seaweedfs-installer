@@ -9,6 +9,13 @@ W=$(mktemp -d); cd "$W" || exit 1
 cp "$REPO/install-seaweedfs" .; chmod +x install-seaweedfs
 export HOST_FQDN=files.test.lab SWFS_PASSWORD=Test-Pass-1 S3_ACCESS_KEY=aaaa1111bbbb2222 S3_SECRET_KEY=cccc3333dddd4444eeee5555ffff6666 DEBUG=0
 IP=$(hostname -I | awk '{print $1}')
+# Rocky's image has Cockpit's socket on 9090, which Prometheus needs. The installer should refuse and say how to free it.
+if systemctl is-active -q cockpit.socket 2>/dev/null; then
+  if ./install-seaweedfs install >"$W/o" 2>&1; then bad "installed with 9090 taken"
+  elif grep -q "disable --now cockpit.socket" "$W/o"; then ok "refuses while Cockpit holds 9090, and says how to free it"
+  else bad "the refusal doesn't say how to free 9090"; tail -6 "$W/o" | cut -c1-170; fi
+  systemctl disable --now cockpit.socket >/dev/null 2>&1
+fi
 ./install-seaweedfs install >"$W/o" 2>&1 && ok "install" || { bad "install"; tail -6 "$W/o" | cut -c1-170; }
 for c in seaweed-mini seaweed-caddy; do [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = true ] && ok "$c is running" || bad "$c isn't running"; done
 code=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' "https://$IP:443/login"); [[ "$code" =~ ^[23] ]] && ok "the admin UI answers" || bad "the admin UI answered $code"
