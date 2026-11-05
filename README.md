@@ -132,7 +132,7 @@ Example:
 
 ```bash
 HOST_FQDN=files.example.lab SWFS_PASSWORD='<current>' S3_ACCESS_KEY=<current> S3_SECRET_KEY=<current> \
-DEFAULT_FILER_DIR_NAME=share ENABLE_MONITORING=false NFS_CLIENTS=192.168.10.0/24 ./install-seaweedfs install
+DEFAULT_FILER_DIR_NAME=share ENABLE_MONITORING=false NFS_CLIENTS=10.0.0.0/24 ./install-seaweedfs install
 ```
 
 - **Installs from before the install-state file** (no `/opt/seaweedfs/.install-state`): the port preflight recognises ports held by this installer's own `seaweed-*` containers and treats the run as an upgrade — no need to stop the stack first.
@@ -254,7 +254,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `DEFAULT_FILER_DIR_NAME` | `artifacts` | Default Filer directory for user data |
 | `ENABLE_SMB` | `true` | Enable Samba (SMB) share with basic auth on the default Filer path |
 | `ENABLE_NFS` | `true` | Enable NFS export (NFSv3, no authentication) of the default Filer path |
-| `NFS_CLIENTS` | `*` | Clients allowed to mount the NFS export, separated by spaces or commas: hosts, IPs, CIDRs (`192.168.10.0/24`), wildcards (`*.lab`) or `@netgroups`. Each gets the same export options. Re-runs rewrite the export line, so set it on every run to keep a restricted scope. |
+| `NFS_CLIENTS` | `*` | Clients allowed to mount the NFS export, separated by spaces or commas: hosts, IPs, CIDRs (`10.0.0.0/24`), wildcards (`*.lab`) or `@netgroups`. Each gets the same export options. Re-runs rewrite the export line, so set it on every run to keep a restricted scope. |
 | `NFS_META_REFRESH_SEC` | `30` | NFS re-export cache-coherence interval (seconds). The server drops its dentry/inode cache every N seconds so writes made *outside* the NFS path (filer HTTP API, S3, web uploader, another node) become visible to NFS clients within ~N seconds. `0` disables it. See [NFS consistency model](#nfs-consistency-model). |
 | `ENABLE_MQ` | `true` | Deploy SeaweedMQ message broker |
 | `MQ_BROKER_PORT` | `17777` | TCP port for SeaweedMQ broker |

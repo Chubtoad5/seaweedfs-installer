@@ -475,7 +475,7 @@ EOF
 ```bash
 # fsid=1 is required: a FUSE filesystem has no stable device ID, so without it clients
 # get "stale file handle" errors after a restart. Replace '*' with a host, IP or CIDR
-# (e.g. 192.168.10.0/24) to limit who can mount (the script's NFS_CLIENTS setting).
+# (e.g. 10.0.0.0/24) to limit who can mount (the script's NFS_CLIENTS setting).
 echo "/mnt/seaweed *(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=1) # seaweedfs-installer" \
   | sudo tee -a /etc/exports
 
