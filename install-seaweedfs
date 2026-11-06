@@ -6,6 +6,8 @@
 
 # -- USER DEFINED Configuration Variables -- #
 
+SCRIPT_VERSION="1.1.0"
+
 DEBUG=${DEBUG:-1}
 
 # - Container Images
@@ -43,8 +45,9 @@ NFS_META_REFRESH_SEC=${NFS_META_REFRESH_SEC:-"30"}            # NFS re-export ca
 ARTIFACTS_TO_DOWNLOAD=${ARTIFACTS_TO_DOWNLOAD:-""}             # List of artifact URLS to auto download with 'curl -k' and upload to SeaweedFS filer
 S3_BUCKET=${S3_BUCKET:-"charlie"}                              # S3 bucket name
 S3_USER=${S3_USER:-"$SWFS_USER"}                               # S3 user name
-S3_ACCESS_KEY=${S3_ACCESS_KEY:-$(openssl rand -hex 8)}         # S3 access key (override to pin; otherwise random per install)
-S3_SECRET_KEY=${S3_SECRET_KEY:-$(openssl rand -hex 16)}        # S3 secret key (override to pin; otherwise random per install)
+S3_ACCESS_KEY=${S3_ACCESS_KEY:-""}                             # S3 access key. Unset: a re-run keeps the pair the last install recorded; a first install generates a random one
+S3_SECRET_KEY=${S3_SECRET_KEY:-""}                             # S3 secret key. Unset: as S3_ACCESS_KEY
+S3_REVOKE_ACCESS_KEYS=${S3_REVOKE_ACCESS_KEYS:-""}             # Space-separated S3 access keys to delete from S3_USER after this run's key is configured. Refuses this run's own key
 ENABLE_MQ=${ENABLE_MQ:-"true"}                               # Install SeaweedMQ message broker and agent
 
 # - Volume server tuning (optional; empty = use 'weed mini' small/dev defaults)
@@ -101,6 +104,7 @@ INSTALL_MODE=0
 UNINSTALL_MODE=0
 JOIN_MODE=0
 PUSH_MODE=0
+PUSH_ONLY=0        # 1 = a bare 'push': images go to the registry, and nothing is installed or recorded on this host
 REGISTRY_MODE=0
 REGISTRY_INFO=""
 REG_FQDN=""
@@ -240,9 +244,18 @@ EOF
 
 file_md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
+# private_file <path>: make sure the file exists with mode 600 before secrets are written into it. 'cat >' keeps
+# an existing file's mode, so this also tightens files an earlier release left world-readable.
+private_file() {
+  mkdir -p "$(dirname "$1")"
+  ( umask 077; [[ -e "$1" ]] || : > "$1" )
+  chmod 600 "$1"
+}
+
 # Restart a running container when its bind-mounted config content changed (SW-8):
 # 'docker compose up' only reacts to compose-file changes, not to regenerated
 # bind-mounted configs, so password/setting rotations never reached the containers.
+# Returns non-zero when the restart fails, and every caller checks it.
 restart_if_changed() {
   local container="$1" before="$2" after="$3"
   [[ "$before" == "$after" ]] && return 0
@@ -250,6 +263,66 @@ restart_if_changed() {
     echo "  Configuration changed — restarting $container..."
     docker restart "$container" >/dev/null 2>&1
   fi
+}
+
+# Exit 0 means every Caddy-fronted URL works, so wait for Caddy itself: the container running, and the Admin UI's
+# login page answering below 500 on the host's own address. A probe from the host isn't affected by its firewall.
+verify_caddy() {
+  local attempt state="" code=""
+  for attempt in {1..30}; do
+    state=$(docker inspect -f '{{.State.Status}}' seaweed-caddy 2>/dev/null)
+    if [[ "$state" == "running" ]]; then
+      code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' "https://$MGMT_IP:$SWFS_ADMIN_PORT/login" 2>/dev/null)
+      [[ "$code" =~ ^[1-4][0-9][0-9]$ ]] && return 0
+    fi
+    sleep 2
+  done
+  echo "  Caddy isn't serving (container: ${state:-missing}, https://$MGMT_IP:$SWFS_ADMIN_PORT/login: ${code:-no answer}). Its last log lines:" | tee -a "$LOG_FILE"
+  docker logs --tail 20 seaweed-caddy 2>&1 | tee -a "$LOG_FILE"
+  die "Caddy didn't start serving within 60s, so the Admin UI, Filer, Master and S3 URLs don't work."
+}
+
+# S3 keys: a passed key wins. With neither passed, keep the pair the last install recorded for this S3_USER, so a
+# plain re-run doesn't add a new key each time. A different S3_USER gets a new pair: one key on two users would clash.
+# Installs from before 1.1.0 recorded no pair, so their first re-run with no keys still generates one.
+resolve_s3_keys() {
+  if [[ -z "$S3_ACCESS_KEY" && -z "$S3_SECRET_KEY" ]]; then
+    local key secret keys_user
+    key=$(get_state S3_ACCESS_KEY) || key=""; secret=$(get_state S3_SECRET_KEY) || secret=""
+    keys_user=$(get_state S3_KEYS_USER) || keys_user=""
+    if [[ -n "$key" && -n "$secret" && "$keys_user" == "$S3_USER" ]]; then
+      S3_ACCESS_KEY=$key S3_SECRET_KEY=$secret
+      echo "  No S3 keys passed: keeping the pair the last install recorded."
+    fi
+  fi
+  [[ -n "$S3_ACCESS_KEY" ]] || S3_ACCESS_KEY=$(openssl rand -hex 8)
+  [[ -n "$S3_SECRET_KEY" ]] || S3_SECRET_KEY=$(openssl rand -hex 16)
+  local k
+  for k in $S3_REVOKE_ACCESS_KEYS; do
+    [[ "$k" == "$S3_ACCESS_KEY" ]] && die "S3_REVOKE_ACCESS_KEYS names the key this run configures ($k). Drop it from the list, or pass a new S3_ACCESS_KEY and S3_SECRET_KEY."
+  done
+  return 0
+}
+
+# mgmt_ip_ok: install and join need MGMT_IP to be an IPv4 address. Other modes don't use it.
+mgmt_ip_ok() {
+  [[ $INSTALL_MODE -eq 1 || $JOIN_MODE -eq 1 ]] || return 0
+  [[ "$MGMT_IP" =~ $ipv4_pattern ]]
+}
+
+# mask_s3_keys: weed shell output with every key value replaced, for the log.
+mask_s3_keys() {
+  sed -E 's/("(accessKey|secretKey)"[[:space:]]*:[[:space:]]*")[^"]*/\1****/g; s/(-(access_key|secret_key)=)[^[:space:]]*/\1****/g'
+}
+
+# Remove the credentials earlier runs wrote to the log: the marked blocks, and in logs from releases before 1.1.0,
+# the known credential lines and the raw S3 identity output.
+scrub_logged_credentials() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  sed -i -e '/^# BEGIN credentials$/,/^# END credentials$/d' \
+    -e '/^  Password: /d' -e '/^  API Key:  /d' -e '/^  API Secret: /d' \
+    -e '/^  Grafana: .*(user: .* \/ pass: .*)$/d' -e "/^To mount SMB share from Windows: 'net use /d" \
+    -e '/"\(accessKey\|secretKey\)"[[:space:]]*:/d' "$LOG_FILE"
 }
 
 # Re-install convergence (SW-7): when a previous install configured something that is
@@ -391,8 +464,16 @@ configure_firewall() {
         ufw --force delete allow "$p" >/dev/null 2>&1
       fi
     done
+    # Only claim rules WE add, as the firewalld branch does: 'ufw allow' also returns 0 for a rule that already
+    # exists, and uninstall would then delete another service's rule. 'ufw show added' lists rules active or not.
+    local added
+    added=$(ufw show added 2>/dev/null)
     for p in $want_ports; do
-      ufw allow "$p" comment 'seaweedfs-installer' >/dev/null 2>&1 && keep_ports+="$p "
+      if grep -qE "^ufw allow ${p}( |$)" <<< "$added"; then
+        list_contains "$p" "$prior_ports" && keep_ports+="$p "
+      else
+        ufw allow "$p" comment 'seaweedfs-installer' >/dev/null 2>&1 && keep_ports+="$p "
+      fi
     done
     record_state UFW_ADDED_PORTS "${keep_ports% }"
   else
@@ -526,12 +607,24 @@ preflight_port_check () {
   echo "  Port preflight passed — all required host ports are free."
 }
 
+# warn_filer_dir_change: a changed DEFAULT_FILER_DIR_NAME is allowed, but it moves the shares to an empty folder.
+warn_filer_dir_change() {
+  local prev
+  prev=$(get_state FILER_DIR_NAME) || prev=""
+  if [[ -n "$prev" && "$prev" != "$DEFAULT_FILER_DIR_NAME" ]]; then
+    echo "  WARNING: DEFAULT_FILER_DIR_NAME changed from '$prev' to '$DEFAULT_FILER_DIR_NAME'. The SMB share, the NFS export and the Filer links move to /$DEFAULT_FILER_DIR_NAME. Files in /$prev stay on the Filer, but are no longer shared." | tee -a "$LOG_FILE"
+  fi
+  return 0
+}
+
 install_swfs () {
   echo "# -- SeaweedFS Installer Started - $(date) -- #" | tee -a "$LOG_FILE"
   preflight_nfs_check
   preflight_port_check
+  resolve_s3_keys
   mkdir -p /opt/caddy/srv
   mkdir -p /opt/seaweedfs/mini
+  warn_filer_dir_change
   record_state STATE_VERSION "1"
   record_state INSTALL_DATE "$(date)"
   record_state NODE_ROLE "control"
@@ -554,7 +647,8 @@ install_swfs () {
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
   # Apply a regenerated Caddyfile to an already-running container (SW-8): compose
   # only recreates on compose-file changes, not bind-mounted config changes.
-  restart_if_changed seaweed-caddy "$caddyfile_before" "$(file_md5 /opt/caddy/Caddyfile)"
+  restart_if_changed seaweed-caddy "$caddyfile_before" "$(file_md5 /opt/caddy/Caddyfile)" \
+    || die "Restarting seaweed-caddy failed (check 'docker logs seaweed-caddy')."
   echo "  Waiting for SeaweedFS and Caddy to start..."
   local response_code=""
   local attempt=1
@@ -572,6 +666,7 @@ install_swfs () {
   if [[ $filer_ready -ne 1 ]]; then
     die "Timeout waiting for SeaweedFS Filer to become ready (120s). Check 'docker logs seaweed-mini'."
   fi
+  verify_caddy
   echo "  Creating default artifact directory on SeaweedFS Filer..."
   # 409 = already exists: the seaweed-mount container auto-creates the filer
   # path when it wins the startup race, and re-runs always find it - both are
@@ -586,8 +681,23 @@ install_swfs () {
   echo "  Configuring S3 credentials..."
   local shell_out=""
   shell_out=$(echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell 2>&1)
-  echo "$shell_out" >> "$LOG_FILE"
-  echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)' && die "S3 credential configuration failed (see $LOG_FILE)."
+  # The output lists every identity with its keys, so the log gets it only on failure, and masked.
+  if echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)'; then
+    echo "$shell_out" | mask_s3_keys >> "$LOG_FILE"
+    die "S3 credential configuration failed (see $LOG_FILE)."
+  fi
+  record_state S3_ACCESS_KEY "$S3_ACCESS_KEY"
+  record_state S3_SECRET_KEY "$S3_SECRET_KEY"
+  record_state S3_KEYS_USER "$S3_USER"
+  local revoke
+  for revoke in $S3_REVOKE_ACCESS_KEYS; do
+    shell_out=$(echo "s3.configure -user=$S3_USER -access_key=$revoke -delete -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell 2>&1)
+    if echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)'; then
+      echo "$shell_out" | mask_s3_keys >> "$LOG_FILE"
+      die "Revoking S3 access key $revoke failed (see $LOG_FILE)."
+    fi
+    echo "  Revoked S3 access key $revoke from user $S3_USER (a key it doesn't have is left as it is)." | tee -a "$LOG_FILE"
+  done
   echo "  Creating S3 buckets..."
   local all_buckets="$S3_BUCKET"
   if [[ ${ENABLE_MONITORING,,} == "true" ]] && ! list_contains "$LOKI_BUCKET" "$all_buckets"; then
@@ -676,12 +786,43 @@ EOF
         || die "image_pull_push.sh reg-cert for $REGISTRY_INFO failed."
     fi
   fi
-  if [[ $REGISTRY_MODE -eq 1 ]]; then
+  # A bare 'push' stops here: the login is for this host's own pulls, and recording it would create the state file,
+  # which tells a later install that this host is already installed, so it would skip the port preflight.
+  if [[ $REGISTRY_MODE -eq 1 && $PUSH_ONLY -eq 0 ]]; then
     echo "  Logging into local registry $REG_FQDN:$REG_PORT ..."
     printf '%s' "$REG_PASS" | docker login "$REG_FQDN:$REG_PORT" -u "$REG_USER" --password-stdin \
       || die "docker login to $REG_FQDN:$REG_PORT failed."
     record_state REGISTRY_LOGIN "$REG_FQDN:$REG_PORT"
   fi
+}
+
+# ensure_swfs_user: the OS account Samba checks SWFS_USER against. Records whether this installer created it, because
+# uninstall must never delete an account that was already there. A changed SWFS_USER first retires the previous one:
+# its Samba entry goes, and so does its account if this installer created it. Otherwise the new name would inherit
+# the old 'created' flag, and uninstall would delete an account it didn't create.
+ensure_swfs_user() {
+  local prev_user prev_created group_flag=()
+  prev_user=$(get_state SWFS_USER_NAME) || prev_user=""
+  prev_created=$(get_state SWFS_USER_CREATED) || prev_created=""
+  if [[ -n "$prev_user" && "$prev_user" != "$SWFS_USER" ]]; then
+    echo "  SWFS_USER changed from '$prev_user' to '$SWFS_USER': removing '$prev_user' from Samba."
+    smbpasswd -x "$prev_user" >/dev/null 2>&1 || true
+    if [[ "$prev_created" == "true" ]] && id "$prev_user" &>/dev/null; then
+      userdel "$prev_user" || echo "  WARNING: could not delete the account '$prev_user' this installer created." | tee -a "$LOG_FILE"
+    fi
+    prev_created="false"
+    record_state SWFS_USER_CREATED "false"
+  fi
+  if ! id "$SWFS_USER" &>/dev/null; then
+    # A group of the same name may exist (Ubuntu ships an 'admin' group, and SWFS_USER defaults to 'admin'): join it
+    # with -g, or useradd refuses.
+    getent group "$SWFS_USER" >/dev/null 2>&1 && group_flag=(-g "$SWFS_USER")
+    useradd -M -s /sbin/nologin "${group_flag[@]}" "$SWFS_USER" || die "Failed to create SMB user '$SWFS_USER'."
+    record_state SWFS_USER_CREATED "true"
+  else
+    [[ "$prev_created" == "true" ]] || record_state SWFS_USER_CREATED "false"
+  fi
+  record_state SWFS_USER_NAME "$SWFS_USER"
 }
 
 run_smb () {
@@ -701,19 +842,7 @@ run_smb () {
     testparm -s /etc/samba/smb.conf > /dev/null 2>> "$LOG_FILE" \
       || die "The existing /etc/samba/smb.conf is rejected by Samba (testparm -s; details in $LOG_FILE). Fix it and re-run."
   fi
-  # Create the SMB user idempotently. If a group of the same name already exists
-  # (e.g. Ubuntu ships a pre-existing 'admin' group and SWFS_USER defaults to 'admin'),
-  # attach to it with -g; otherwise useradd would abort and the SMB user is never created.
-  # Record whether WE created the account: uninstall must never delete a pre-existing user.
-  if ! id "$SWFS_USER" &>/dev/null; then
-    swfs_user_group_flag=""
-    getent group "$SWFS_USER" >/dev/null 2>&1 && swfs_user_group_flag="-g $SWFS_USER"
-    useradd -M -s /sbin/nologin $swfs_user_group_flag "$SWFS_USER" || die "Failed to create SMB user '$SWFS_USER'."
-    record_state SWFS_USER_CREATED "true"
-  else
-    [[ "$(get_state SWFS_USER_CREATED)" == "true" ]] || record_state SWFS_USER_CREATED "false"
-  fi
-  record_state SWFS_USER_NAME "$SWFS_USER"
+  ensure_swfs_user
   (echo "$SWFS_PASSWORD"; echo "$SWFS_PASSWORD") | smbpasswd -a -s "$SWFS_USER" \
     || die "smbpasswd failed for user '$SWFS_USER'."
   # One-time backup of the pre-install smb.conf (kept for operator reference; the
@@ -877,10 +1006,27 @@ generate_caddyfile () {
   else
     local caddy_image_local="$CADDY_IMAGE"
   fi
-  CADDY_HASHED_PASSWORD=$(docker run --rm ${caddy_image_local} caddy hash-password --plaintext "${SWFS_PASSWORD}")
-  if [[ -z "$CADDY_HASHED_PASSWORD" ]]; then
-    die "Failed to hash SWFS_PASSWORD with the Caddy image ($caddy_image_local). Is the image available?"
+  # The bcrypt hash gets a fresh salt every time, so hashing on every run changed the Caddyfile and restarted Caddy
+  # on every re-run. Keep the hash while the password is the same: .auth-hash holds it with a fingerprint of the
+  # pair, and the password reaches openssl through a pipe, not its arguments.
+  local auth_file=/opt/caddy/.auth-hash stored_hash="" stored_fp=""
+  if [[ -f "$auth_file" ]]; then
+    stored_hash=$(sed -n 's/^hash=//p' "$auth_file")
+    stored_fp=$(sed -n 's/^fingerprint=//p' "$auth_file")
   fi
+  if [[ -n "$stored_hash" && -n "$stored_fp" && "$(auth_fingerprint "$stored_hash")" == "$stored_fp" ]]; then
+    CADDY_HASHED_PASSWORD=$stored_hash
+  else
+    CADDY_HASHED_PASSWORD=$(docker run --rm ${caddy_image_local} caddy hash-password --plaintext "${SWFS_PASSWORD}")
+    if [[ -z "$CADDY_HASHED_PASSWORD" ]]; then
+      die "Failed to hash SWFS_PASSWORD with the Caddy image ($caddy_image_local). Is the image available?"
+    fi
+    private_file "$auth_file"
+    printf 'hash=%s\nfingerprint=%s\n' "$CADDY_HASHED_PASSWORD" "$(auth_fingerprint "$CADDY_HASHED_PASSWORD")" > "$auth_file"
+  fi
+  # The Filer site's catch-all sends visitors to the Admin UI, on its port unless that is 443.
+  local admin_suffix=""
+  [[ "$SWFS_ADMIN_PORT" != "443" ]] && admin_suffix=":$SWFS_ADMIN_PORT"
   # Landing page gate: with SPLASH_REQUIRE_LOGIN=true, Caddy asks the Admin UI whether the
   # request carries a valid session (GET /admin: 200 = logged in, 307 -> /login otherwise,
   # which forward_auth hands straight back to the browser), and a successful login is sent
@@ -893,7 +1039,11 @@ generate_caddyfile () {
     login_location='header_down Location "^(https?://[^/]+)?/admin$" "/"'
   fi
   echo "  Creating Caddyfile..." | tee -a "$LOG_FILE"
-  cat > /opt/caddy/Caddyfile <<EOF
+  # Written to Caddyfile.new and validated first, so a value Caddy can't parse stops the run while the running
+  # Caddy keeps its old config. It holds the password hash, so it is private.
+  local new_cf=/opt/caddy/Caddyfile.new
+  private_file "$new_cf"
+  cat > "$new_cf" <<EOF
 {
         debug
         default_sni $MGMT_IP
@@ -947,8 +1097,8 @@ $SWFS_FILER_FQDN:$SWFS_FILER_PORT, https://$MGMT_IP:$SWFS_FILER_PORT {
         }
         handle {
                 @isDomain host $SWFS_FILER_FQDN
-                redir @isDomain https://$SWFS_ADMIN_FQDN permanent
-                redir https://{host} permanent
+                redir @isDomain https://$SWFS_ADMIN_FQDN$admin_suffix permanent
+                redir https://{host}$admin_suffix permanent
         }
 }
 $SWFS_MASTER_FQDN:$SWFS_MASTER_PORT, https://$MGMT_IP:$SWFS_MASTER_PORT {
@@ -964,13 +1114,29 @@ $SWFS_S3_FQDN:$SWFS_S3_PORT, https://$MGMT_IP:$SWFS_S3_PORT {
 }
 EOF
   if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
-    cat >> /opt/caddy/Caddyfile <<EOF
+    cat >> "$new_cf" <<EOF
 $GRAFANA_FQDN:$GRAFANA_PORT, https://$MGMT_IP:$GRAFANA_PORT {
         tls internal
         reverse_proxy grafana:3000
 }
 EOF
   fi
+  local validate_out
+  if ! validate_out=$(docker run --rm -v "$new_cf:/etc/caddy/Caddyfile:ro" "$caddy_image_local" \
+      caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1); then
+    echo "$validate_out" >> "$LOG_FILE"
+    rm -f "$new_cf"
+    die "Caddy rejected the generated Caddyfile, so nothing was changed. Check the values it is built from (SWFS_USER, the FQDNs, the ports). Caddy said: $(grep -m1 -iE 'error' <<< "$validate_out")"
+  fi
+  # 'cat >', not 'mv': the running container bind-mounts this one file, and mv would give it a new inode.
+  private_file /opt/caddy/Caddyfile
+  cat "$new_cf" > /opt/caddy/Caddyfile
+  rm -f "$new_cf"
+}
+
+# auth_fingerprint <bcrypt hash>: ties a stored hash to the current SWFS_PASSWORD.
+auth_fingerprint() {
+  printf '%s' "$1:$SWFS_PASSWORD" | openssl dgst -sha256 | awk '{print $NF}'
 }
 
 generate_compose_file () {
@@ -1008,6 +1174,8 @@ generate_compose_file () {
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_VOLUME_GRPC_PORT:$CLUSTER_VOLUME_GRPC_PORT\""$'\n'
   fi
   echo "  Creating seaweedfs-compose.yaml..." | tee -a "$LOG_FILE"
+  # It carries the admin password, so only root reads it. Compose and the containers run as root.
+  private_file /opt/seaweedfs/seaweedfs-compose.yaml
   cat > /opt/seaweedfs/seaweedfs-compose.yaml <<EOF
 networks:
   seaweed_net:
@@ -1498,7 +1666,10 @@ download_install_packages () {
 }
 
 generate_outputs () {
+  # The log keeps only this run's credentials: earlier blocks go first, so a changed password or key doesn't linger.
+  scrub_logged_credentials
   cat >> "$LOG_FILE" <<EOF
+# BEGIN credentials
 # -- SeaweedFS Installer Finished - $(date) -- #
 
 Docker compose file:   /opt/seaweedfs/seaweedfs-compose.yaml
@@ -1546,6 +1717,7 @@ Monitoring Stack:
   Credentials file:   /opt/seaweedfs/monitoring-credentials.env
 EOF
   fi
+  echo "# END credentials" >> "$LOG_FILE"
   chmod 600 "$LOG_FILE"
   # Console banner: same summary but with secrets MASKED (SW-13). ap-tools captures
   # stdout into its own logs; the full credentials live only in the 600-mode files.
@@ -1695,7 +1867,7 @@ global:
 scrape_configs:
   - job_name: "prometheus-self"
     static_configs:
-      - targets: ["localhost:${PROMETHEUS_EXT_PORT}"]
+      - targets: ["localhost:9090"]
 
   - job_name: "loki"
     static_configs:
@@ -1703,7 +1875,7 @@ scrape_configs:
 
   - job_name: "grafana"
     static_configs:
-      - targets: ["grafana:${GRAFANA_PORT}"]
+      - targets: ["grafana:3000"]
 EOF
 }
 
@@ -1716,7 +1888,7 @@ datasources:
   - name: Prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus:${PROMETHEUS_EXT_PORT}
+    url: http://prometheus:9090
     isDefault: true
     editable: true
 
@@ -1742,6 +1914,8 @@ generate_monitoring_compose () {
     local prometheus_image="$PROMETHEUS_EXT_IMAGE"
   fi
   record_state LOADED_MONITORING_IMAGES "$loki_image $grafana_image $prometheus_image"
+  # It carries Grafana's admin password, so only root reads it.
+  private_file /opt/monitoring/docker-compose.yml
   cat > /opt/monitoring/docker-compose.yml <<EOF
 networks:
   seaweed_net:
@@ -1819,7 +1993,8 @@ write_monitoring_credentials () {
 MONITORING_HOST=${MGMT_IP}
 MONITORING_S3_ACCESS_KEY=${S3_ACCESS_KEY}
 MONITORING_S3_SECRET_KEY=${S3_SECRET_KEY}
-MONITORING_S3_ENDPOINT=http://${MGMT_IP}:8333
+MONITORING_S3_ENDPOINT=https://${MGMT_IP}:${SWFS_S3_PORT}
+MONITORING_S3_CA=/opt/caddy/data/caddy/pki/authorities/local/root.crt
 MONITORING_LOKI_BUCKET=${LOKI_BUCKET}
 MONITORING_LOKI_PORT=${LOKI_PORT}
 MONITORING_PROMETHEUS_PORT=${PROMETHEUS_EXT_PORT}
@@ -1850,9 +2025,9 @@ setup_monitoring () {
     || die "docker compose up failed for /opt/monitoring/docker-compose.yml."
   record_state MONITORING_CONFIGURED "true"
   # Apply regenerated bind-mounted configs to running containers (SW-8).
-  restart_if_changed loki "$loki_before" "$(file_md5 /opt/monitoring/loki/loki-config.yaml)"
-  restart_if_changed prometheus "$prom_before" "$(file_md5 /opt/monitoring/prometheus/prometheus.yml)"
-  restart_if_changed grafana "$ds_before" "$(file_md5 /opt/monitoring/grafana/provisioning/datasources/datasources.yaml)"
+  restart_if_changed loki "$loki_before" "$(file_md5 /opt/monitoring/loki/loki-config.yaml)" || die "Restarting loki failed (check 'docker logs loki')."
+  restart_if_changed prometheus "$prom_before" "$(file_md5 /opt/monitoring/prometheus/prometheus.yml)" || die "Restarting prometheus failed (check 'docker logs prometheus')."
+  restart_if_changed grafana "$ds_before" "$(file_md5 /opt/monitoring/grafana/provisioning/datasources/datasources.yaml)" || die "Restarting grafana failed (check 'docker logs grafana')."
   echo "  Waiting for monitoring stack to become healthy..."
   local attempt=1
   while [[ $attempt -le 12 ]]; do
@@ -2299,6 +2474,7 @@ uninstall_docker_residue () {
 }
 
 display_args() {
+  echo "  SCRIPT_VERSION: $SCRIPT_VERSION"
   echo "  AIR_GAPPED_MODE: $AIR_GAPPED_MODE"
   echo "  INSTALL_MODE: $INSTALL_MODE"
   echo "  JOIN_MODE: $JOIN_MODE"
@@ -2471,6 +2647,12 @@ if [[ "$REGISTRY_MODE" == "1" ]]; then
     exit 1
   fi
 fi
+# install and join build site addresses and -ip= from MGMT_IP. Empty (the network not up yet, so 'hostname -I'
+# printed nothing) or an IPv6 first address would give a broken Caddyfile, so refuse. save and uninstall don't use it.
+if ! mgmt_ip_ok; then
+  echo "Error: Could not determine a valid MGMT_IP (got '${MGMT_IP}'). Set MGMT_IP to this host's management IPv4 address."
+  exit 1
+fi
 # Air-gap auto-detection with sanity check + explicit override (SW-17). A stale
 # sentinel (e.g. a build host that ran 'save' earlier) used to flip later runs into
 # air-gapped mode silently.
@@ -2510,6 +2692,13 @@ echo "### SeaweedFS Installer Started - $(date) ###"
 display_args
 
 [[ -d $base_dir/utilities/artifacts ]] || mkdir -p $base_dir/utilities/artifacts
+if [[ $PUSH_MODE -eq 1 && $INSTALL_MODE -eq 0 && $JOIN_MODE -eq 0 ]]; then
+  echo "### SeaweedFS/Caddy Image Push Starting ###"
+  PUSH_ONLY=1
+  # Not through debug_run: the push is the whole job, so its progress shows, and so does the reason if it fails.
+  run_docker || die "Image push to $REGISTRY_INFO failed."
+  echo "  Pushed the SeaweedFS and Caddy images$([[ ${ENABLE_MONITORING,,} == "true" ]] && echo ", and the monitoring images,") to $REGISTRY_INFO."
+fi
 if [[ $INSTALL_MODE -eq 1 ]]; then
   echo "### SeaweedFS/Caddy Installation Starting ###"
   install_swfs

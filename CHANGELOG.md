@@ -1,5 +1,55 @@
 # Changelog — seaweedfs-installer
 
+## v1.1.0 — 2026-11-06 — Day-2 fixes
+
+The first release with `SCRIPT_VERSION`. Every fix was reproduced on Ubuntu 24.04 first, and each has a test that
+failed before it. Settings, commands and exit codes that callers use are unchanged, apart from the two additions and
+the S3 key change below.
+
+### Fixed
+- **A re-run with the same settings restarted Caddy,** dropping S3 and admin connections, because the password was
+  hashed with a fresh salt on every run. The hash is kept in `/opt/caddy/.auth-hash` (mode 600) while the password is
+  the same.
+- **Exit 0 didn't mean Caddy was serving.** A value Caddy couldn't parse left it in a restart loop while the install
+  exited 0. The Caddyfile is now validated before it replaces the running one, so a bad value stops the run and the
+  running Caddy keeps its config. A failed container restart is an error, and the install waits up to 60 s for the
+  Admin UI to answer through Caddy before it reports success.
+- **A blank `MGMT_IP` was accepted,** for example when the network wasn't up yet, giving a Caddyfile with empty site
+  addresses. `install` and `join` now refuse anything that isn't an IPv4 address. `save` and `uninstall` don't need it.
+- **Passwords were readable by every user** in the compose files, and the install log kept every earlier password
+  and S3 key. The compose files and the Caddyfile are now mode 600, the log keeps only the latest run's credentials,
+  and the raw S3 identity output (which lists keys) is logged only on failure, masked. The latest block keeps its
+  `API Key:` and `API Secret:` lines unchanged.
+- **Non-default Prometheus or Grafana ports broke monitoring:** the scrape targets and Grafana's datasource used the
+  published port inside the Docker network. They now use the containers' own ports.
+- **`MONITORING_S3_ENDPOINT` was `http://…:8333`,** plain HTTP to a TLS port, and ignored `SWFS_S3_PORT`. It is now
+  `https://<MGMT_IP>:<SWFS_S3_PORT>`, and the new `MONITORING_S3_CA` names Caddy's root CA.
+- **The Filer's redirect to the Admin UI dropped a non-443 `SWFS_ADMIN_PORT`.** `ap-tools` installs use 9443, so
+  their Caddyfile changes once.
+- **A bare `push` exited 0 having pushed nothing.** It now pushes the images, and changes nothing else on the host.
+- **Changing `SWFS_USER` made uninstall delete the wrong account:** the new name inherited the old one's "created by
+  the installer" flag. The previous user now leaves Samba, and its account is deleted only if the installer created
+  it.
+- **UFW: uninstall deleted rules that were there before the install,** because `ufw allow` succeeds for an existing
+  rule and the installer claimed it. It now claims only the rules it adds, as it already did with firewalld.
+
+### Added
+- **`S3_REVOKE_ACCESS_KEYS`:** access keys to delete from `S3_USER` after this run's key is configured. A new key is
+  added rather than replacing the old one, so this is how an old key stops working. The run refuses to revoke the key
+  it is configuring.
+- A warning when `DEFAULT_FILER_DIR_NAME` differs from the last install's, because the shares move to an empty folder.
+- The README says that re-running with the same image tag, such as `latest`, doesn't pull a newer image.
+
+### Changed
+- **S3 keys on a re-run:** with neither `S3_ACCESS_KEY` nor `S3_SECRET_KEY` passed, a re-run now keeps the pair the
+  last install recorded for the same `S3_USER`, instead of adding a new random pair each time. A passed key still
+  wins, and a first install still generates one. Installs from before 1.1.0 recorded no pair, so their first re-run
+  without keys still adds a new one.
+
+### Upgrading
+- The first re-run after upgrading restarts Caddy once, because no stored hash exists yet. It also tightens the file
+  modes and clears old credentials from the log.
+
 ## 2026-10-23 — Manual install guide brought in line with the script (docs/manual-sync)
 
 ### Changed (docs only)

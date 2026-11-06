@@ -80,7 +80,7 @@ Commands:
   uninstall         | Uninstall SeaweedFS and Caddy including data and configuration (auto-detects a volume node)
 
 Options:
-  push              | Push SeaweedFS and Caddy images to a local registry, must include -registry option
+  push              | Push SeaweedFS and Caddy images (and the monitoring images, unless ENABLE_MONITORING=false) to a local registry, must include -registry option. On its own, it only pushes
   -registry         | Registry credentials for pushing or pulling from local registry (Format: -registry [registry:port username password])
   -master           | Control-plane master to join (join only). Format: -master <host-or-ip>:9333
 ```
@@ -123,8 +123,8 @@ The installer does **not** read the previous install's settings back — any val
 |:-----------|:----|
 | `HOST_FQDN` (and any `SWFS_*_FQDN` / `*_PORT`) | default is `$(hostname).edge.lab` — certificates, landing page and links would change |
 | `SWFS_USER` / `SWFS_PASSWORD` | default `admin` / `changeme` — Admin UI, Filer/Master basic auth and SMB would switch to the default password |
-| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | default is a **new random key pair** — existing S3 clients would be locked out. The current keys are in the previous `seaweedfs-install.log` and in the Filer at `/etc/iam/identities/<user>.json` |
-| `DEFAULT_FILER_DIR_NAME` | default `artifacts` — SMB/NFS and the `/<dir>` redirect would point at an empty directory |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | since 1.1.0, a re-run that passes neither keeps the pair the last install recorded for the same `S3_USER`. An install made before 1.1.0 recorded no pair, so its first re-run without keys adds a new random pair (the old one keeps working). The current keys are in `seaweedfs-install.log` and in the Filer at `/etc/iam/identities/<user>.json` |
+| `DEFAULT_FILER_DIR_NAME` | default `artifacts` — SMB/NFS and the `/<dir>` redirect would point at an empty directory. The run warns when it differs from the recorded value |
 | `ENABLE_MONITORING`, `ENABLE_SMB`, `ENABLE_NFS`, `ENABLE_MQ`, `NFS_CLIENTS`, `SPLASH_REQUIRE_LOGIN` | defaults may enable/disable features (monitoring is on by default; a feature turned off is torn down) |
 | `S3_BUCKET` / `EXTRA_BUCKETS`, `VOLUME_*`, `CLUSTER_*` | as originally installed |
 
@@ -136,6 +136,8 @@ DEFAULT_FILER_DIR_NAME=share ENABLE_MONITORING=false NFS_CLIENTS=10.0.0.0/24 ./i
 ```
 
 - **Installs from before the install-state file** (no `/opt/seaweedfs/.install-state`): the port preflight recognises ports held by this installer's own `seaweed-*` containers and treats the run as an upgrade — no need to stop the stack first.
+- **Image tags:** `install` doesn't pull a newer image under a tag it already has, so re-running with the same tag (for example `latest`) keeps the image you have. To move to a newer release, set `SWFS_IMAGE` or `CADDY_IMAGE` to the new tag.
+- **From before 1.1.0:** the first re-run restarts Caddy once, because the stored password hash doesn't exist yet. It also makes the compose files and the Caddyfile mode 600, and removes the credentials earlier runs left in `seaweedfs-install.log`, keeping the latest.
 - **Caddy CA:** older installs kept Caddy's CA inside the container, so any recreate produced a new CA. On the first run of this version the existing CA and certificates are copied to `/opt/caddy/data` before the container is recreated, so clients that already trust it keep working; from then on it persists.
 
 #### `save`
@@ -175,7 +177,7 @@ Stops and removes all containers, then deletes all configuration and data direct
 
 #### `push` option
 
-When combined with `install` and `-registry`, images are pulled from the internet (or the local archive in air-gapped mode) and pushed to the specified local registry before the install proceeds. The registry must have the following projects pre-created:
+On its own (`push -registry <registry:port> <user> <pass>`), it pulls the images from the internet (or the local archive in air-gapped mode) and pushes them to the registry, and changes nothing else on the host. When combined with `install`, the install then proceeds using that registry. The registry must have the following projects pre-created:
 
 | Project | Image | Required When |
 |:--------|:------|:--------------|
@@ -261,13 +263,14 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `S3_BUCKET` | `charlie` | Default S3 bucket name |
 | `EXTRA_BUCKETS` | `""` | Space-separated list of additional S3 bucket names to create at install time. Useful for pre-creating per-cluster Velero buckets when the cluster inventory is known. Buckets are deduplicated against `S3_BUCKET` and `LOKI_BUCKET`. |
 | `S3_USER` | `$SWFS_USER` | S3 API username |
-| `S3_ACCESS_KEY` | *(randomly generated)* | S3 access key (`openssl rand -hex 8`); set explicitly to pin a stable key across re-installs |
-| `S3_SECRET_KEY` | *(randomly generated)* | S3 secret key (`openssl rand -hex 16`); set explicitly to pin a stable key across re-installs |
+| `S3_ACCESS_KEY` | *(kept, or randomly generated)* | S3 access key. Unset, a re-run keeps the pair the last install recorded for this `S3_USER`, and a first install generates one (`openssl rand -hex 8`). A new key is added: the old one keeps working until it is revoked |
+| `S3_SECRET_KEY` | *(kept, or randomly generated)* | S3 secret key, as `S3_ACCESS_KEY` (`openssl rand -hex 16`) |
+| `S3_REVOKE_ACCESS_KEYS` | *(empty)* | Space-separated access keys to delete from `S3_USER` once this run's key is configured. A key the user doesn't have is left as it is. The run refuses to revoke the key it is configuring |
 | `ARTIFACTS_TO_DOWNLOAD` | `""` | Space-separated list of URLs to download and upload to the default Filer path |
 | `VOLUME_INDEX` | `""` | Optional volume index mode `[memory\|leveldb\|leveldbMedium\|leveldbLarge]`. `leveldb` lowers volume-server RAM for many small files on edge hosts. Empty = `weed mini` default (`memory`). |
 | `VOLUME_SIZE_LIMIT_MB` | `""` | Optional cap (MB) after which the master stops directing writes to a volume. Empty = `weed mini` auto-sizing (64–1024 MB). |
 | `SPLASH_REQUIRE_LOGIN` | `true` | `true` = the landing page sits behind the SeaweedFS Admin UI login (`SWFS_USER` / `SWFS_PASSWORD`); after signing in you land on it, with a link to the Admin Console. `false` = public landing page (the previous behaviour). See [Landing page and Admin UI access](#landing-page-and-admin-ui-access). |
-| `MGMT_IP` | *(first host IP)* | IP used as the Caddy `default_sni` fallback and cluster advertise address. Overridable (honored when passed by ap-tools or set explicitly). |
+| `MGMT_IP` | *(first host IP)* | IP used as the Caddy `default_sni` fallback and cluster advertise address. Overridable (honored when passed by ap-tools or set explicitly). `install` and `join` refuse to run when it isn't an IPv4 address, for example when the network isn't up yet and `hostname -I` prints nothing |
 | `SWFS_FORCE_ONLINE` | `false` | Ignore a `swfs-save-version.txt` sentinel in the working directory and stay in online mode (recover from a stale sentinel, e.g. on a build host that ran `save`). |
 | `SWFS_REMOVE_IMAGES` | `false` | `uninstall` only: also `docker rmi` the container images this installer loaded (recorded in the install-state file). |
 
@@ -275,7 +278,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 
 > **Recommendation:** The monitoring stack deploys Grafana, Loki, and Prometheus as additional containers and requires additional host resources. Only enable it if you plan to use an external log or metrics collector such as Fluent Bit or a Prometheus remote-write agent to ship data to this host. If no external agents are configured, set `ENABLE_MONITORING="false"` to reduce overhead.
 >
-> When monitoring is enabled, a credentials file is written to `/opt/seaweedfs/monitoring-credentials.env` containing the S3 access key, Loki endpoint, and Prometheus endpoint — ready to be sourced by external tools or automation scripts.
+> When monitoring is enabled, a credentials file is written to `/opt/seaweedfs/monitoring-credentials.env` containing the S3 access key, Loki endpoint, and Prometheus endpoint — ready to be sourced by external tools or automation scripts. Its `MONITORING_S3_ENDPOINT` is Caddy's TLS S3 address, `https://<MGMT_IP>:<SWFS_S3_PORT>`, and `MONITORING_S3_CA` is the path of Caddy's root CA, which clients need to trust it.
 
 | Variable | Default Value | Description |
 |:---------|:-------------|:------------|
@@ -330,7 +333,7 @@ Known SeaweedFS behaviour: Admin UI sessions are self-contained 24-hour cookies,
 
 ### Exit codes
 
-The script exits `0` only when the requested operation actually succeeded. Critical-path failures — `docker compose up`, the Filer not becoming ready within 120 s, S3 credential/bucket configuration, package installation, image pull/push/load, save-archive creation, registry login — abort the run with a non-zero exit code and an `ERROR:` message (also appended to the log). Callers such as `ap-tools` can rely on the exit code. Non-critical issues (e.g. Loki slow to report ready, artifact upload failures) are logged as `WARNING` and do not fail the install.
+The script exits `0` only when the requested operation actually succeeded. Critical-path failures — `docker compose up`, the Filer not becoming ready within 120 s, a Caddyfile Caddy rejects, Caddy not serving the Admin UI within 60 s, a failed container restart, S3 credential/bucket configuration, package installation, image pull/push/load, save-archive creation, registry login — abort the run with a non-zero exit code and an `ERROR:` message (also appended to the log). Callers such as `ap-tools` can rely on the exit code. Non-critical issues (e.g. Loki slow to report ready, artifact upload failures) are logged as `WARNING` and do not fail the install.
 
 ### Install-state file
 
