@@ -266,13 +266,14 @@ restart_if_changed() {
 }
 
 # Exit 0 means every Caddy-fronted URL works, so wait for Caddy itself: the container running, and the Admin UI's
-# login page answering below 500 on the host's own address. A probe from the host isn't affected by its firewall.
+# login page answering below 500 on the host's own address. A probe from the host isn't affected by its firewall,
+# and --noproxy keeps a proxy set in the environment out of it.
 verify_caddy() {
   local attempt state="" code=""
   for attempt in {1..30}; do
     state=$(docker inspect -f '{{.State.Status}}' seaweed-caddy 2>/dev/null)
     if [[ "$state" == "running" ]]; then
-      code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' "https://$MGMT_IP:$SWFS_ADMIN_PORT/login" 2>/dev/null)
+      code=$(curl -sk --noproxy '*' -m 5 -o /dev/null -w '%{http_code}' "https://$MGMT_IP:$SWFS_ADMIN_PORT/login" 2>/dev/null)
       [[ "$code" =~ ^[1-4][0-9][0-9]$ ]] && return 0
     fi
     sleep 2
@@ -284,12 +285,18 @@ verify_caddy() {
 
 # S3 keys: a passed key wins. With neither passed, keep the pair the last install recorded for this S3_USER, so a
 # plain re-run doesn't add a new key each time. A different S3_USER gets a new pair: one key on two users would clash.
-# Installs from before 1.1.0 recorded no pair, so their first re-run with no keys still generates one.
+# Installs from before 1.1.0 recorded no pair in the state file, so for those, the newest pair in this folder's
+# install log is used, if it belongs to the same S3_USER.
 resolve_s3_keys() {
   if [[ -z "$S3_ACCESS_KEY" && -z "$S3_SECRET_KEY" ]]; then
     local key secret keys_user
     key=$(get_state S3_ACCESS_KEY) || key=""; secret=$(get_state S3_SECRET_KEY) || secret=""
     keys_user=$(get_state S3_KEYS_USER) || keys_user=""
+    if [[ ( -z "$key" || -z "$secret" ) && -f "$LOG_FILE" ]]; then
+      key=$(sed -n 's/^  API Key:  //p' "$LOG_FILE" | tail -1)
+      secret=$(sed -n 's/^  API Secret: //p' "$LOG_FILE" | tail -1)
+      keys_user=$(sed -n 's/^  API User: //p' "$LOG_FILE" | tail -1)
+    fi
     if [[ -n "$key" && -n "$secret" && "$keys_user" == "$S3_USER" ]]; then
       S3_ACCESS_KEY=$key S3_SECRET_KEY=$secret
       echo "  No S3 keys passed: keeping the pair the last install recorded."
@@ -2507,7 +2514,7 @@ Commands:
   uninstall         | Uninstall SeaweedFS and Caddy including data and configuration (auto-detects a volume node)
 
 Options:
-  push              | Push SeaweedFS and Caddy images to a local registry, must include -registry option
+  push              | Push SeaweedFS and Caddy images (and the monitoring images, unless ENABLE_MONITORING=false) to a local registry, must include -registry option. On its own, it only pushes
   -registry         | Registry credentials for pushing or pulling from local registry (Format: -registry [registry:port username password])
   -master           | Control-plane master to join (join only). Format: -master <host-or-ip>:$SWFS_MASTER_PORT
 

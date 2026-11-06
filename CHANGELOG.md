@@ -26,7 +26,9 @@ the S3 key change below.
   `https://<MGMT_IP>:<SWFS_S3_PORT>`, and the new `MONITORING_S3_CA` names Caddy's root CA.
 - **The Filer's redirect to the Admin UI dropped a non-443 `SWFS_ADMIN_PORT`.** `ap-tools` installs use 9443, so
   their Caddyfile changes once.
-- **A bare `push` exited 0 having pushed nothing.** It now pushes the images, and changes nothing else on the host.
+- **A bare `push` exited 0 having pushed nothing.** It now pushes the images. It installs nothing of SeaweedFS's
+  and records no install state, though `image_pull_push.sh` still installs Docker if it's missing, trusts the
+  registry's certificate, and may restart Docker.
 - **Changing `SWFS_USER` made uninstall delete the wrong account:** the new name inherited the old one's "created by
   the installer" flag. The previous user now leaves Samba, and its account is deleted only if the installer created
   it.
@@ -43,8 +45,11 @@ the S3 key change below.
 ### Changed
 - **S3 keys on a re-run:** with neither `S3_ACCESS_KEY` nor `S3_SECRET_KEY` passed, a re-run now keeps the pair the
   last install recorded for the same `S3_USER`, instead of adding a new random pair each time. A passed key still
-  wins, and a first install still generates one. Installs from before 1.1.0 recorded no pair, so their first re-run
-  without keys still adds a new one.
+  wins, and a first install still generates one. The pair is recorded in `.install-state`. For an install from
+  before 1.1.0, the newest pair in the install log of the folder you run from is kept. Run from another folder, it
+  adds a new pair, and the old one keeps working.
+- **The install log keeps only the current credentials.** Older S3 keys that were never revoked keep working, and
+  are listed in the Filer at `/etc/iam/identities/<user>.json`.
 
 ### Upgrading
 - The first re-run after upgrading restarts Caddy once, because no stored hash exists yet. It also tightens the file

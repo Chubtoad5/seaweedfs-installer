@@ -123,7 +123,7 @@ The installer does **not** read the previous install's settings back — any val
 |:-----------|:----|
 | `HOST_FQDN` (and any `SWFS_*_FQDN` / `*_PORT`) | default is `$(hostname).edge.lab` — certificates, landing page and links would change |
 | `SWFS_USER` / `SWFS_PASSWORD` | default `admin` / `changeme` — Admin UI, Filer/Master basic auth and SMB would switch to the default password |
-| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | since 1.1.0, a re-run that passes neither keeps the pair the last install recorded for the same `S3_USER`. An install made before 1.1.0 recorded no pair, so its first re-run without keys adds a new random pair (the old one keeps working). The current keys are in `seaweedfs-install.log` and in the Filer at `/etc/iam/identities/<user>.json` |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | since 1.1.0, a re-run that passes neither keeps the pair the last install recorded for the same `S3_USER`. For an install made before 1.1.0, that is the newest pair in the `seaweedfs-install.log` of the folder you run from; run from another folder, and it adds a new pair (the old one keeps working). The log then keeps only the current pair: all the user's keys are in the Filer at `/etc/iam/identities/<user>.json` |
 | `DEFAULT_FILER_DIR_NAME` | default `artifacts` — SMB/NFS and the `/<dir>` redirect would point at an empty directory. The run warns when it differs from the recorded value |
 | `ENABLE_MONITORING`, `ENABLE_SMB`, `ENABLE_NFS`, `ENABLE_MQ`, `NFS_CLIENTS`, `SPLASH_REQUIRE_LOGIN` | defaults may enable/disable features (monitoring is on by default; a feature turned off is torn down) |
 | `S3_BUCKET` / `EXTRA_BUCKETS`, `VOLUME_*`, `CLUSTER_*` | as originally installed |
@@ -177,7 +177,7 @@ Stops and removes all containers, then deletes all configuration and data direct
 
 #### `push` option
 
-On its own (`push -registry <registry:port> <user> <pass>`), it pulls the images from the internet (or the local archive in air-gapped mode) and pushes them to the registry, and changes nothing else on the host. When combined with `install`, the install then proceeds using that registry. The registry must have the following projects pre-created:
+On its own (`push -registry <registry:port> <user> <pass>`), it pulls the images from the internet (or the local archive in air-gapped mode) and pushes them to the registry. It installs nothing of SeaweedFS's and records no install state, so a later `install` treats the host as new. It does use the host's Docker: `image_pull_push.sh` installs Docker if it's missing, trusts the registry's certificate, and may restart Docker to load it. When combined with `install`, the install then proceeds using that registry. The registry must have the following projects pre-created:
 
 | Project | Image | Required When |
 |:--------|:------|:--------------|
@@ -349,6 +349,7 @@ The script exits `0` only when the requested operation actually succeeded. Criti
 | `FIREWALLD_ADDED_PORTS` / `FIREWALLD_ADDED_SERVICES` / `UFW_ADDED_PORTS` | Exactly the firewall entries this installer added |
 | `SELINUX_SAMBA_FUSEFS_PRIOR` | Prior value of the boolean, if this installer changed it |
 | `REGISTRY_LOGIN` / `LOADED_IMAGES` / `LOADED_MONITORING_IMAGES` | Registry session and images for uninstall cleanup |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_KEYS_USER` | The S3 key pair this install configured, and its user, kept for a re-run that passes no keys (since 1.1.0) |
 
 Uninstall and re-install reconciliation read this file; deleting it degrades uninstall to the conservative legacy fallback (evidence-based, never removes user accounts).
 

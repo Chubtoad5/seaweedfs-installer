@@ -349,6 +349,17 @@ users_stub() { # users_stub "<accounts that exist>"
   [[ "$S3_ACCESS_KEY" =~ ^[0-9a-f]{16}$ ]]
 }
 
+@test "S11: an install from before 1.1.0 keeps the newest pair in its log, if it is this S3 user's" {
+  printf '%s\n' '  API User: admin' '  API Key:  oldest1' '  API Secret: oldsec1' '  API User: admin' '  API Key:  newest2' '  API Secret: newsec2' > "$LOG_FILE"
+  : > "$STATE_FILE"
+  S3_USER=admin S3_ACCESS_KEY="" S3_SECRET_KEY=""
+  resolve_s3_keys
+  [ "$S3_ACCESS_KEY" = newest2 ] && [ "$S3_SECRET_KEY" = newsec2 ]
+  S3_USER=other S3_ACCESS_KEY="" S3_SECRET_KEY=""
+  resolve_s3_keys
+  [ "$S3_ACCESS_KEY" != newest2 ]
+}
+
 @test "SC1: revoking the key this run configures is refused" {
   S3_USER=admin S3_ACCESS_KEY=k1 S3_SECRET_KEY=s1 S3_REVOKE_ACCESS_KEYS="k0 k1"
   run resolve_s3_keys
