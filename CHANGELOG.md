@@ -46,8 +46,9 @@ the S3 key change below.
 - **S3 keys on a re-run:** with neither `S3_ACCESS_KEY` nor `S3_SECRET_KEY` passed, a re-run now keeps the pair the
   last install recorded for the same `S3_USER`, instead of adding a new random pair each time. A passed key still
   wins, and a first install still generates one. The pair is recorded in `.install-state`. For an install from
-  before 1.1.0, the newest pair in the install log of the folder you run from is kept. Run from another folder, it
-  adds a new pair, and the old one keeps working.
+  before 1.1.0, the newest pair in the install log of the folder you run from is kept, if this host's running
+  SeaweedFS has that key, so a log copied from another host is never used. Otherwise it adds a new pair, and the
+  old one keeps working.
 - **The install log keeps only the current credentials.** Older S3 keys that were never revoked keep working, and
   are listed in the Filer at `/etc/iam/identities/<user>.json`.
 

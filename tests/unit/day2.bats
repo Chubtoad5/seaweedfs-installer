@@ -349,15 +349,33 @@ users_stub() { # users_stub "<accounts that exist>"
   [[ "$S3_ACCESS_KEY" =~ ^[0-9a-f]{16}$ ]]
 }
 
-@test "S11: an install from before 1.1.0 keeps the newest pair in its log, if it is this S3 user's" {
+old_log() { # an install log as releases before 1.1.0 wrote it: two runs, newest last
   printf '%s\n' '  API User: admin' '  API Key:  oldest1' '  API Secret: oldsec1' '  API User: admin' '  API Key:  newest2' '  API Secret: newsec2' > "$LOG_FILE"
-  : > "$STATE_FILE"
+}
+mini_with_key() { # docker: seaweed-mini runs, and its S3 identities hold key $1 (none if empty)
+  stub docker 'case "$1" in ps) echo seaweed-mini ;; exec) [ -n "'"$1"'" ] && echo "      \"accessKey\": \"'"$1"'\"," ;; esac; exit 0'
+}
+
+@test "S11: an install from before 1.1.0 keeps the newest pair in its log, if this host has that key" {
+  old_log; mini_with_key newest2
   S3_USER=admin S3_ACCESS_KEY="" S3_SECRET_KEY=""
   resolve_s3_keys
   [ "$S3_ACCESS_KEY" = newest2 ] && [ "$S3_SECRET_KEY" = newsec2 ]
   S3_USER=other S3_ACCESS_KEY="" S3_SECRET_KEY=""
   resolve_s3_keys
   [ "$S3_ACCESS_KEY" != newest2 ]
+}
+
+@test "S11: a log from another host is never used: no SeaweedFS here, or one without that key" {
+  old_log
+  stub docker 'exit 0'
+  S3_USER=admin S3_ACCESS_KEY="" S3_SECRET_KEY=""
+  resolve_s3_keys
+  [[ "$S3_ACCESS_KEY" != newest2 && "$S3_ACCESS_KEY" =~ ^[0-9a-f]{16}$ ]]
+  mini_with_key somethingelse
+  S3_ACCESS_KEY="" S3_SECRET_KEY=""
+  resolve_s3_keys
+  [[ "$S3_ACCESS_KEY" != newest2 && "$S3_ACCESS_KEY" =~ ^[0-9a-f]{16}$ ]]
 }
 
 @test "SC1: revoking the key this run configures is refused" {

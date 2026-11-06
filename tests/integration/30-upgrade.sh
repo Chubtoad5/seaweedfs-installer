@@ -39,5 +39,14 @@ st=$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)
 ./install-seaweedfs install > "$W/o" 2>&1 && ok "a second re-run" || { bad "a second re-run"; show; }
 [ "$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)" = "$st" ] && ok "after the upgrade, a re-run doesn't restart Caddy" || bad "a re-run after the upgrade restarted Caddy"
 ./install-seaweedfs uninstall > "$W/o" 2>&1 && ok "uninstall" || { bad "uninstall"; show; }
+
+# A log from another host, as ap-tools' offline-prep bundle carries one: its keys must never go live here.
+W2=$(mktemp -d -p /var/tmp); cd "$W2" || exit 1
+cp "$REPO/install-seaweedfs" .; chmod +x install-seaweedfs
+printf '%s\n' '  API User: admin' '  API Key:  0000aaaa1111bbbb' '  API Secret: 2222cccc3333dddd4444eeee5555ffff' > seaweedfs-install.log
+./install-seaweedfs install > "$W/o" 2>&1 && ok "a fresh install, with another host's log in its folder" || { bad "a fresh install with another host's log"; show; }
+! grep -q "keeping the pair" "$W/o" && [ "$(s3ls 0000aaaa1111bbbb 2222cccc3333dddd4444eeee5555ffff)" = 403 ] \
+  && ok "another host's logged key isn't used" || bad "another host's logged key went live"
+./install-seaweedfs uninstall > "$W/o" 2>&1 && ok "uninstall" || { bad "uninstall"; show; }
 [ -z "$(docker ps -q --filter name=seaweed 2>/dev/null)" ] && ok "no containers left" || bad "containers left behind"
 echo "=== exit $fail"; exit $fail
