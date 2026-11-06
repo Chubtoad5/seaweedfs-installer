@@ -352,8 +352,12 @@ users_stub() { # users_stub "<accounts that exist>"
 old_log() { # an install log as releases before 1.1.0 wrote it: two runs, newest last
   printf '%s\n' '  API User: admin' '  API Key:  oldest1' '  API Secret: oldsec1' '  API User: admin' '  API Key:  newest2' '  API Secret: newsec2' > "$LOG_FILE"
 }
-mini_with_key() { # docker: seaweed-mini runs, and its S3 identities hold key $1 (none if empty)
-  stub docker 'case "$1" in ps) echo seaweed-mini ;; exec) [ -n "'"$1"'" ] && echo "      \"accessKey\": \"'"$1"'\"," ;; esac; exit 0'
+mini_with_key() { # docker: seaweed-mini runs, its Filer answers ${FILER_CODE:-200}, and its S3 identities hold key $1
+  stub docker 'case "$1 $3" in
+    "ps "*) echo seaweed-mini ;;
+    "exec curl") echo "'"${FILER_CODE:-200}"'" ;;
+    "exec "*) [ -n "'"$1"'" ] && echo "      \"accessKey\": \"'"$1"'\"," ;;
+  esac; exit 0'
 }
 
 @test "S11: an install from before 1.1.0 keeps the newest pair in its log, if this host has that key" {
@@ -376,6 +380,15 @@ mini_with_key() { # docker: seaweed-mini runs, and its S3 identities hold key $1
   S3_ACCESS_KEY="" S3_SECRET_KEY=""
   resolve_s3_keys
   [[ "$S3_ACCESS_KEY" != newest2 && "$S3_ACCESS_KEY" =~ ^[0-9a-f]{16}$ ]]
+}
+
+@test "S11: a SeaweedFS that doesn't answer isn't asked, so the run doesn't wait on it" {
+  old_log
+  FILER_CODE=000 mini_with_key newest2
+  S3_USER=admin S3_ACCESS_KEY="" S3_SECRET_KEY=""
+  resolve_s3_keys
+  [[ "$S3_ACCESS_KEY" != newest2 ]]
+  ! called "weed shell"
 }
 
 @test "SC1: revoking the key this run configures is refused" {

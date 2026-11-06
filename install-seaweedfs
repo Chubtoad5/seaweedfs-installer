@@ -321,10 +321,15 @@ mgmt_ip_ok() {
   [[ "$MGMT_IP" =~ $ipv4_pattern ]]
 }
 
-# s3_key_on_this_host <access key>: true when this host's running seaweed-mini already has the key.
+# s3_key_on_this_host <access key>: true when this host's running seaweed-mini already has the key. It runs before
+# the stack is (re)started, so it gives up rather than wait: 'weed shell' waits for ever for a master that doesn't
+# answer, and ignores SIGTERM. Any doubt means false, and the caller generates a new pair.
 s3_key_on_this_host() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq seaweed-mini || return 1
-  echo "s3.configure" | docker exec -i seaweed-mini /usr/bin/weed shell 2>/dev/null \
+  local code
+  code=$(docker exec seaweed-mini curl -s -m 3 -o /dev/null -w '%{http_code}' http://localhost:8888 2>/dev/null)
+  [[ "$code" =~ ^2[0-9][0-9]$ ]] || return 1
+  echo "s3.configure" | timeout -k 5 20 docker exec -i seaweed-mini /usr/bin/weed shell 2>/dev/null \
     | grep -qF "\"accessKey\": \"$1\""
 }
 
