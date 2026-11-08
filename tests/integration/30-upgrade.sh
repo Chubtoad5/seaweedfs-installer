@@ -21,6 +21,8 @@ fi
 chmod +x install-seaweedfs
 ./install-seaweedfs install > "$W/o" 2>&1 && ok "install v1.0.0, no S3 keys passed" || { bad "install v1.0.0"; show; }
 key=$(sed -n 's/^  API Key:  //p' "$LOG" | tail -1); secret=$(sed -n 's/^  API Secret: //p' "$LOG" | tail -1)
+# v1.0.0 doesn't wait for Caddy to answer, so S3 can still be coming up here (000 on Ubuntu minimal, lab run 42487046505).
+for _ in $(seq 1 12); do [ "$(s3ls "$key" "$secret")" = 200 ] && break; sleep 5; done
 [ "$(s3ls "$key" "$secret")" = 200 ] && ok "v1.0.0's key works" || bad "v1.0.0's key got $(s3ls "$key" "$secret")"
 n=$(s3keys)
 
