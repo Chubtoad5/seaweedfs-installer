@@ -13,7 +13,7 @@ P=Test-Pass-1 K=aaaa1111bbbb2222 S=cccc3333dddd4444eeee5555ffff6666
 export HOST_FQDN=files.test.lab DEBUG=0 SWFS_PASSWORD=$P S3_ACCESS_KEY=$K S3_SECRET_KEY=$S
 systemctl disable --now cockpit.socket >/dev/null 2>&1 || true
 tar -xzf "$CI_HANDOFF/swfs-save.tar.gz" && ok "unpack the bundle" || { bad "unpack the bundle"; echo "=== exit 1"; exit 1; }
-./install-seaweedfs install > "$W/o" 2>&1 && ok "install with no route out" || { bad "install with no route out"; tail -8 "$W/o" | cut -c1-170; }
+./install-seaweedfs install > "$W/o" 2>&1 && ok "install with no route out" || { bad "install with no route out"; tail -8 "$W/o" | cut -c1-170; echo "  (the checks after it would only fail too)"; echo "=== exit 1"; exit 1; }
 grep -q "AIR_GAPPED_MODE: 1" "$W/o" "$W/seaweedfs-install.log" 2>/dev/null && ok "it installs from the bundle" || bad "it didn't install in air-gapped mode"
 for c in seaweed-mini seaweed-caddy seaweed-mq seaweed-mount grafana loki prometheus; do
   [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = true ] && ok "$c is running" || bad "$c isn't running"
