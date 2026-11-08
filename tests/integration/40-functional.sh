@@ -82,7 +82,8 @@ echo "=== MQ"
 # spec 09's tries. So this checks what the broker does: it's registered, and it takes a topic and leads its partition.
 wshell() { echo "$1" | docker exec -i seaweed-mini weed shell 2>&1; }
 mq_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' seaweed-mq 2>/dev/null)
-mq_registered() { wshell mq.topic.list | grep -q "$mq_ip:17777"; }
+# Output is captured before grep sees it: with pipefail, grep -q stopping at its match makes weed shell's pipe fail.
+mq_registered() { local out; out=$(wshell mq.topic.list); grep -q "$mq_ip:17777" <<< "$out"; }
 within 30 mq_registered && ok "the broker is registered with the master" || bad "the master doesn't list the broker ($mq_ip)"
 mq_topic() { wshell "mq.topic.configure -namespace=ci -topic=c1 -partitionCount=2" > "$W/mq.out"; grep -q "\"leader_broker\": \"$mq_ip:17777\"" "$W/mq.out"; }
 within 30 mq_topic && ok "a new topic gets the broker as its partitions' leader" \
@@ -103,8 +104,8 @@ line="ci-c1 log line $$ $(date +%s)"
 c=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -X POST "http://$IP:3100/loki/api/v1/push" \
   -d "{\"streams\":[{\"stream\":{\"job\":\"ci-c1\",\"cluster\":\"edge-lab\"},\"values\":[[\"$(date +%s%N)\",\"$line\"]]}]}")
 [ "$c" = 204 ] && ok "push a log line to Loki" || bad "Loki push got $c"
-loki_has() { curl -s -m 10 -G "http://$IP:3100/loki/api/v1/query_range" --data-urlencode 'query={job="ci-c1"}' \
-  --data-urlencode "start=$(( $(date +%s) - 600 ))000000000" | grep -qF "$line"; }
+loki_has() { local out; out=$(curl -s -m 10 -G "http://$IP:3100/loki/api/v1/query_range" --data-urlencode 'query={job="ci-c1"}' \
+  --data-urlencode "start=$(( $(date +%s) - 600 ))000000000"); grep -qF "$line" <<< "$out"; }
 within 60 loki_has && ok "read it back from Loki" || bad "Loki doesn't return the line"
 
 echo "=== Caddy's CA survives a recreate"
