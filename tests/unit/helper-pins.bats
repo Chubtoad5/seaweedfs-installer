@@ -9,7 +9,7 @@ setup() {
   load_script install-seaweedfs
   base_dir=$BATS_TEST_TMPDIR/b
   LOG_FILE=$BATS_TEST_TMPDIR/install.log
-  AIR_GAPPED_MODE=0
+  AIR_GAPPED_MODE=0 SAVE_MODE=0
   U=$base_dir/utilities
   # A curl that writes a small script to its -o path
   stub curl 'out=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out=$a; prev=$a; done
@@ -106,6 +106,17 @@ helper_sha() { printf '#!/bin/bash\necho helper\n' | sha256sum | cut -d' ' -f1; 
   [ "$status" -eq 1 ]
   [[ "$output" == *"Extract the whole swfs-save.tar.gz"* ]]
   ! called "curl" || false
+}
+@test "a save fetches the pinned copies even where a left-over sentinel made the run air-gapped" {
+  AIR_GAPPED_MODE=1 SAVE_MODE=1
+  mkdir -p "$U"
+  echo old > "$U/image_pull_push.sh"
+  echo old > "$U/install_packages.sh"
+  download_image_pull_push >/dev/null
+  download_install_packages >/dev/null
+  [ "$(cat "$U/.image_pull_push.sh.ref")" = v1.1.1 ]
+  [ "$(cat "$U/.install_packages.sh.ref")" = v1.1.2 ]
+  grep -q "echo helper" "$U/install_packages.sh"
 }
 @test "nothing fetches a helper from main any more" {
   ! grep -nE '(images-pull-push|install-packages)/raw/refs/heads/main' "$BATS_TEST_DIRNAME/../../install-seaweedfs" || false

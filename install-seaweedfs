@@ -1682,11 +1682,12 @@ fetch_helper () {
 }
 
 # helper_check <file> <url> <ref> [sha256]: the helper in utilities/. A bundle uses the copy it brought, and an
-# air-gapped run must never reach the download.
+# air-gapped run must never reach the download. A save pulls images and packages whatever the folder holds, so it is
+# online, and always fetches the pinned copy, even where a left-over sentinel made the run air-gapped.
 helper_check () {
   local dest="$base_dir/utilities/$1"
   mkdir -p "$base_dir/utilities"
-  if [[ $AIR_GAPPED_MODE -eq 1 ]]; then
+  if [[ $AIR_GAPPED_MODE -eq 1 && $SAVE_MODE -eq 0 ]]; then
     [[ -s "$dest" ]] && return 0
     die "Air-gapped, but $dest isn't here. Extract the whole swfs-save.tar.gz in this folder, or set SWFS_FORCE_ONLINE=true."
   fi

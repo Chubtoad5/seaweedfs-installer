@@ -8,8 +8,10 @@
   until a pin moves (spec 12).
 - **A copy already in `utilities/` is reused only if it came from the same ref,** recorded beside it in a `.ref` file.
   Before, any copy was kept for good, so a host never saw a fix. A copy with no record is fetched again once.
-- **Air-gapped, the bundle's copies are used, and nothing is downloaded,** `save` included. With no copy there, the run
-  stops and says to extract the whole bundle, or to set `SWFS_FORCE_ONLINE=true`.
+- **Air-gapped, the bundle's copies are used, and nothing is downloaded.** With no copy there, the run stops and says to
+  extract the whole bundle, or to set `SWFS_FORCE_ONLINE=true`. A `save` always fetches the pinned copies, even in a
+  folder whose left-over sentinel makes it air-gapped, since it pulls images and packages anyway. So a second
+  `ap-tools offline-prep` bundles the pinned helpers too.
 - **`INSTALL_PACKAGES_REF` is passed on to `image_pull_push.sh`,** which reads it, so one setting covers both helpers.
 
 ### Added
