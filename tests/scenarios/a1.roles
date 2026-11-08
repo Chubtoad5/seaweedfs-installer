@@ -1,0 +1,4 @@
+# Spec 09's A1: the bundle, built on one host, installs on a second that can't reach outside. Run by automation-ci's
+# ci/scenario.sh: one clone per role, in this order, on the same distro.
+role build  4 6144 tests/scenarios/a1-build.sh
+role target 4 6144 tests/scenarios/a1-install.sh offline
