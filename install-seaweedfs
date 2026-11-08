@@ -6,7 +6,7 @@
 
 # -- USER DEFINED Configuration Variables -- #
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 DEBUG=${DEBUG:-1}
 
@@ -89,6 +89,15 @@ SWFS_REMOVE_IMAGES=${SWFS_REMOVE_IMAGES:-"false"}  # uninstall: also 'docker rmi
 
 # - Air-gap detection override
 SWFS_FORCE_ONLINE=${SWFS_FORCE_ONLINE:-"false"}    # true = ignore a swfs-save-version.txt sentinel in the working directory and stay in online mode
+
+# - Helper scripts: which release of each is fetched (spec 12). A URL wins over its ref; a checksum is optional.
+IMAGE_PULL_PUSH_REF=${IMAGE_PULL_PUSH_REF:-"v1.1.1"}      # images-pull-push release (tag, branch or commit) whose image_pull_push.sh is fetched
+IMAGE_PULL_PUSH_URL=${IMAGE_PULL_PUSH_URL:-"https://raw.githubusercontent.com/Chubtoad5/images-pull-push/${IMAGE_PULL_PUSH_REF}/image_pull_push.sh"}
+IMAGE_PULL_PUSH_SHA256=${IMAGE_PULL_PUSH_SHA256:-""}      # optional sha256 of image_pull_push.sh; a mismatch stops the run
+INSTALL_PACKAGES_REF=${INSTALL_PACKAGES_REF:-"v1.1.2"}    # install-packages release (tag, branch or commit) whose install_packages.sh is fetched
+INSTALL_PACKAGES_URL=${INSTALL_PACKAGES_URL:-"https://raw.githubusercontent.com/Chubtoad5/install-packages/${INSTALL_PACKAGES_REF}/install_packages.sh"}
+INSTALL_PACKAGES_SHA256=${INSTALL_PACKAGES_SHA256:-""}    # optional sha256 of install_packages.sh; a mismatch stops the run
+export INSTALL_PACKAGES_REF                               # image_pull_push.sh reads it too, so one setting covers both helpers
 
 # -- Licensing (air-gap bundle copyleft compliance) -- #
 # When monitoring is bundled, the save archive redistributes Grafana and Loki, which
@@ -1647,13 +1656,46 @@ generate_index_html () {
 EOF
 }
 
-download_image_pull_push () {
-  if [[ ! -f "$base_dir/utilities/image_pull_push.sh" ]]; then
-    echo "  Downloading image_pull_push.sh..."
-    curl -sfL https://github.com/Chubtoad5/images-pull-push/raw/refs/heads/main/image_pull_push.sh -o "$base_dir/utilities/image_pull_push.sh" \
-      || die "Failed to download image_pull_push.sh (check network access, or use the air-gap bundle)."
-    chmod +x "$base_dir/utilities/image_pull_push.sh"
+# fetch_helper <dest> <url> <ref> [sha256]: a helper script at a given ref (spec 12, as Harbor does). A copy is reused
+# only when the .ref file beside it names the same ref; any other copy is fetched again. A failed download or a
+# checksum mismatch leaves no file behind.
+fetch_helper () {
+  local dest=$1 url=$2 ref=$3 sha=${4:-} ref_file
+  ref_file="$(dirname "$dest")/.$(basename "$dest").ref"
+  if [[ -s "$dest" && "$(cat "$ref_file" 2>/dev/null)" == "$ref" ]]; then
+    return 0
   fi
+  echo "  Downloading $(basename "$dest") ($ref)..."
+  if ! curl -fsSL "$url" -o "$dest.tmp"; then
+    rm -f "$dest.tmp"
+    echo "Error: failed to download $url"
+    return 1
+  fi
+  if [[ -n "$sha" ]] && ! echo "$sha  $dest.tmp" | sha256sum -c --status; then
+    rm -f "$dest.tmp"
+    echo "Error: $(basename "$dest") from $url doesn't match its checksum."
+    return 1
+  fi
+  mv "$dest.tmp" "$dest"
+  chmod +x "$dest"
+  printf '%s\n' "$ref" > "$ref_file"
+}
+
+# helper_check <file> <url> <ref> [sha256]: the helper in utilities/. A bundle uses the copy it brought, and an
+# air-gapped run must never reach the download. A save pulls images and packages whatever the folder holds, so it is
+# online, and always fetches the pinned copy, even where a left-over sentinel made the run air-gapped.
+helper_check () {
+  local dest="$base_dir/utilities/$1"
+  mkdir -p "$base_dir/utilities"
+  if [[ $AIR_GAPPED_MODE -eq 1 && $SAVE_MODE -eq 0 ]]; then
+    [[ -s "$dest" ]] && return 0
+    die "Air-gapped, but $dest isn't here. Extract the whole swfs-save.tar.gz in this folder, or set SWFS_FORCE_ONLINE=true."
+  fi
+  fetch_helper "$dest" "$2" "$3" "${4:-}" || die "Failed to fetch $1 (check network access, or use the air-gap bundle)."
+}
+
+download_image_pull_push () {
+  helper_check image_pull_push.sh "$IMAGE_PULL_PUSH_URL" "$IMAGE_PULL_PUSH_REF" "$IMAGE_PULL_PUSH_SHA256"
 }
 
 # install_os_packages <online|offline> <package>... — runs install_packages.sh with its
@@ -1680,12 +1722,7 @@ install_os_packages () {
 }
 
 download_install_packages () {
-  if [[ ! -f "$base_dir/utilities/install_packages.sh" ]]; then
-    echo "  Downloading install_packages.sh..."
-    curl -sfL https://github.com/Chubtoad5/install-packages/raw/refs/heads/main/install_packages.sh -o "$base_dir/utilities/install_packages.sh" \
-      || die "Failed to download install_packages.sh (check network access, or use the air-gap bundle)."
-    chmod +x "$base_dir/utilities/install_packages.sh"
-  fi
+  helper_check install_packages.sh "$INSTALL_PACKAGES_URL" "$INSTALL_PACKAGES_REF" "$INSTALL_PACKAGES_SHA256"
 }
 
 generate_outputs () {
