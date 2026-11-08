@@ -1,5 +1,28 @@
 # Changelog — seaweedfs-installer
 
+## v1.2.0 — 2026-11-08 — The helpers come from releases
+
+### Changed
+- **`image_pull_push.sh` and `install_packages.sh` are fetched from releases, `images-pull-push` `v1.1.1` and
+  `install-packages` `v1.1.2`, instead of `main`.** So a merge in either no longer reaches this installer, or `ap-tools`,
+  until a pin moves (spec 12).
+- **A copy already in `utilities/` is reused only if it came from the same ref,** recorded beside it in a `.ref` file.
+  Before, any copy was kept for good, so a host never saw a fix. A copy with no record is fetched again once.
+- **Air-gapped, the bundle's copies are used, and nothing is downloaded,** `save` included. With no copy there, the run
+  stops and says to extract the whole bundle, or to set `SWFS_FORCE_ONLINE=true`.
+- **`INSTALL_PACKAGES_REF` is passed on to `image_pull_push.sh`,** which reads it, so one setting covers both helpers.
+
+### Added
+- **`IMAGE_PULL_PUSH_REF`** (default `v1.1.1`) and **`INSTALL_PACKAGES_REF`** (default `v1.1.2`): the tag, branch or commit
+  to fetch.
+- **`IMAGE_PULL_PUSH_URL`** and **`INSTALL_PACKAGES_URL`**: full URLs, for a mirror. Each wins over its ref.
+- **`IMAGE_PULL_PUSH_SHA256`** and **`INSTALL_PACKAGES_SHA256`**: optional checksums. A mismatch, or a failed download,
+  stops the run and leaves no file.
+
+### Tests
+- `tests/unit/helper-pins.bats`: both default tags, the ref and URL settings, the export to `image_pull_push.sh`, reuse
+  and refetch, both checksum cases, a failed download, and both air-gapped cases.
+
 ## v1.1.0 — 2026-11-06 — Day-2 fixes
 
 The first release with `SCRIPT_VERSION`. Every fix was reproduced on Ubuntu 24.04 first, and each has a test that
