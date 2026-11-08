@@ -59,15 +59,16 @@ if mount -t nfs -o vers=3,nolock "$IP:/mnt/seaweed" /mnt/ci-nfs; then
   [ "$(filer "https://$IP:8888/artifacts/via-smb.txt")" = "from smb $$" ] && ok "read it from the Filer" || bad "the Filer doesn't show the SMB file"
   echo "from nfs $$" > /mnt/ci-nfs/via-nfs.txt && sync && ok "write a file over NFS" || bad "write a file over NFS"
   rm -f "$W/smb/via-nfs.txt"
-  smb 'get via-nfs.txt' && [ "$(cat "$W/smb/via-nfs.txt" 2>/dev/null)" = "from nfs $$" ] && ok "read it over SMB" || bad "SMB doesn't show the NFS file"
+  smb 'get via-nfs.txt' && [ "$(cat "$W/smb/via-nfs.txt" 2>/dev/null)" = "from nfs $$" ] && ok "read it over SMB" || { bad "SMB doesn't show the NFS file"; tail -3 "$W/smb.out"; }
   within 20 filer_is via-nfs.txt "from nfs $$" && ok "read it from the Filer" || bad "the Filer doesn't show the NFS file"
   c=$(docker run --rm --network host alpine:3.20 sh -c "apk add -q --no-cache samba-client >/dev/null 2>&1 && smbclient -m SMB3 //$IP/artifacts -U 'admin%wrong' -c ls" 2>&1)
-  [[ "$c" == *NT_STATUS_LOGON_FAILURE* ]] && ok "SMB refuses a wrong password" || bad "SMB with a wrong password: $(tail -1 <<< "$c")"
+  [[ "$c" == *NT_STATUS_LOGON_FAILURE* ]] && ok "SMB refuses a wrong password" || bad "SMB with a wrong password: $(tail -2 <<< "$c")"
   # The refresh timer: a file written straight to the Filer, around SMB and NFS, shows over NFS within a few runs of it.
   systemctl is-active -q seaweedfs-nfs-meta-refresh.timer && ok "the NFS refresh timer is active" || bad "the NFS refresh timer isn't active"
   ls /mnt/ci-nfs >/dev/null
   echo "from the filer $$" > "$W/via-filer.txt"
   filer -F "file=@$W/via-filer.txt" "https://$IP:8888/artifacts/" >/dev/null
+  filer_is via-filer.txt "from the filer $$" || bad "the upload to the Filer didn't work, so the next check can't mean anything"
   within 45 test -e /mnt/ci-nfs/via-filer.txt && ok "a file written to the Filer shows over NFS within 45 s (NFS_META_REFRESH_SEC=10)" \
     || bad "a file written to the Filer didn't show over NFS in 45 s"
   umount /mnt/ci-nfs || umount -l /mnt/ci-nfs
@@ -81,7 +82,8 @@ echo "=== MQ"
 # spec 09's tries. So this checks what the broker does: it's registered, and it takes a topic and leads its partition.
 wshell() { echo "$1" | docker exec -i seaweed-mini weed shell 2>&1; }
 mq_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' seaweed-mq 2>/dev/null)
-within 30 grep -q "$mq_ip:17777" <<< "$(wshell mq.topic.list)" && ok "the broker is registered with the master" || bad "the master doesn't list the broker ($mq_ip)"
+mq_registered() { wshell mq.topic.list | grep -q "$mq_ip:17777"; }
+within 30 mq_registered && ok "the broker is registered with the master" || bad "the master doesn't list the broker ($mq_ip)"
 mq_topic() { wshell "mq.topic.configure -namespace=ci -topic=c1 -partitionCount=2" > "$W/mq.out"; grep -q "\"leader_broker\": \"$mq_ip:17777\"" "$W/mq.out"; }
 within 30 mq_topic && ok "a new topic gets the broker as its partitions' leader" \
   || { bad "configure a topic"; tail -5 "$W/mq.out"; }
@@ -147,5 +149,6 @@ else
 fi
 
 ./install-seaweedfs uninstall > "$W/o" 2>&1 && ok "uninstall" || { bad "uninstall"; show; }
-[ -z "$(docker ps -aq --filter name=seaweed 2>/dev/null)" ] && ok "no containers left" || bad "containers left behind"
+left=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -xE 'seaweed-.*|grafana|loki|prometheus')
+[ -z "$left" ] && ok "no containers left" || bad "containers left behind: $left"
 echo "=== exit $fail"; exit $fail
