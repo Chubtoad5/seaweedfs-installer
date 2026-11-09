@@ -1,5 +1,19 @@
 # Changelog — seaweedfs-installer
 
+## v1.2.1 — 2026-11-09 — Air-gapped Docker on Rocky 10 and Leap 16
+
+### Fixed
+- **An air-gapped install on Rocky 10 or Leap 16 installs Docker from the bundle** (spec 15, F1 and F7, through the
+  helpers). `IMAGE_PULL_PUSH_REF` now defaults to `images-pull-push` v1.1.2, whose bundle carries the running kernel's
+  `kernel-modules-extra` on EL. `INSTALL_PACKAGES_REF` defaults to `install-packages` v1.1.3, whose SUSE bundle carries
+  Docker's `container-selinux`. SeaweedFS exports its `INSTALL_PACKAGES_REF` to `image_pull_push.sh`, so both pins had to move.
+  Before, the load of the image archive stopped at Docker's install on both.
+- The bundle's licence notice points at the `LICENSES/` inside the images-pull-push archive, which lists Docker's packages
+  and covers them with a written offer.
+
+### Tests
+- `tests/unit/helper-pins.bats` follows both pins. Phase 4's A1 (spec 09) is part of this release.
+
 ## v1.2.0 — 2026-11-08 — The helpers come from releases
 
 ### Changed

@@ -17,19 +17,19 @@ printf "#!/bin/bash\necho helper\n" > "$out"'
 }
 helper_sha() { printf '#!/bin/bash\necho helper\n' | sha256sum | cut -d' ' -f1; }
 
-@test "image_pull_push.sh comes from images-pull-push v1.1.1, by tag" {
+@test "image_pull_push.sh comes from images-pull-push v1.1.2, by tag" {
   run download_image_pull_push
   [ "$status" -eq 0 ]
-  called "curl -fsSL https://raw.githubusercontent.com/Chubtoad5/images-pull-push/v1.1.1/image_pull_push.sh"
+  called "curl -fsSL https://raw.githubusercontent.com/Chubtoad5/images-pull-push/v1.1.2/image_pull_push.sh"
   [ -x "$U/image_pull_push.sh" ]
-  [ "$(cat "$U/.image_pull_push.sh.ref")" = v1.1.1 ]
+  [ "$(cat "$U/.image_pull_push.sh.ref")" = v1.1.2 ]
 }
-@test "install_packages.sh comes from install-packages v1.1.2, by tag" {
+@test "install_packages.sh comes from install-packages v1.1.3, by tag" {
   run download_install_packages
   [ "$status" -eq 0 ]
-  called "curl -fsSL https://raw.githubusercontent.com/Chubtoad5/install-packages/v1.1.2/install_packages.sh"
+  called "curl -fsSL https://raw.githubusercontent.com/Chubtoad5/install-packages/v1.1.3/install_packages.sh"
   [ -x "$U/install_packages.sh" ]
-  [ "$(cat "$U/.install_packages.sh.ref")" = v1.1.2 ]
+  [ "$(cat "$U/.install_packages.sh.ref")" = v1.1.3 ]
 }
 @test "the refs set the URLs" {
   export IMAGE_PULL_PUSH_REF=v9.9.9 INSTALL_PACKAGES_REF=v8.8.8
@@ -47,7 +47,7 @@ helper_sha() { printf '#!/bin/bash\necho helper\n' | sha256sum | cut -d' ' -f1; 
 }
 @test "INSTALL_PACKAGES_REF is exported, so image_pull_push.sh fetches the same install_packages.sh" {
   run bash -c 'echo "$INSTALL_PACKAGES_REF"'
-  [ "$output" = v1.1.2 ]
+  [ "$output" = v1.1.3 ]
 }
 @test "a copy whose record names the same ref is reused" {
   download_install_packages >/dev/null
@@ -65,7 +65,7 @@ helper_sha() { printf '#!/bin/bash\necho helper\n' | sha256sum | cut -d' ' -f1; 
   download_install_packages >/dev/null
   grep -q "echo helper" "$U/image_pull_push.sh"
   grep -q "echo helper" "$U/install_packages.sh"
-  [ "$(cat "$U/.install_packages.sh.ref")" = v1.1.2 ]
+  [ "$(cat "$U/.install_packages.sh.ref")" = v1.1.3 ]
 }
 @test "a matching checksum passes" {
   INSTALL_PACKAGES_SHA256=$(helper_sha)
@@ -114,8 +114,8 @@ helper_sha() { printf '#!/bin/bash\necho helper\n' | sha256sum | cut -d' ' -f1; 
   echo old > "$U/install_packages.sh"
   download_image_pull_push >/dev/null
   download_install_packages >/dev/null
-  [ "$(cat "$U/.image_pull_push.sh.ref")" = v1.1.1 ]
-  [ "$(cat "$U/.install_packages.sh.ref")" = v1.1.2 ]
+  [ "$(cat "$U/.image_pull_push.sh.ref")" = v1.1.2 ]
+  [ "$(cat "$U/.install_packages.sh.ref")" = v1.1.3 ]
   grep -q "echo helper" "$U/install_packages.sh"
 }
 @test "nothing fetches a helper from main any more" {
