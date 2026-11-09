@@ -6,7 +6,7 @@
 
 # -- USER DEFINED Configuration Variables -- #
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 
 DEBUG=${DEBUG:-1}
 
@@ -91,10 +91,10 @@ SWFS_REMOVE_IMAGES=${SWFS_REMOVE_IMAGES:-"false"}  # uninstall: also 'docker rmi
 SWFS_FORCE_ONLINE=${SWFS_FORCE_ONLINE:-"false"}    # true = ignore a swfs-save-version.txt sentinel in the working directory and stay in online mode
 
 # - Helper scripts: which release of each is fetched (spec 12). A URL wins over its ref; a checksum is optional.
-IMAGE_PULL_PUSH_REF=${IMAGE_PULL_PUSH_REF:-"v1.1.1"}      # images-pull-push release (tag, branch or commit) whose image_pull_push.sh is fetched
+IMAGE_PULL_PUSH_REF=${IMAGE_PULL_PUSH_REF:-"v1.1.2"}      # images-pull-push release (tag, branch or commit) whose image_pull_push.sh is fetched
 IMAGE_PULL_PUSH_URL=${IMAGE_PULL_PUSH_URL:-"https://raw.githubusercontent.com/Chubtoad5/images-pull-push/${IMAGE_PULL_PUSH_REF}/image_pull_push.sh"}
 IMAGE_PULL_PUSH_SHA256=${IMAGE_PULL_PUSH_SHA256:-""}      # optional sha256 of image_pull_push.sh; a mismatch stops the run
-INSTALL_PACKAGES_REF=${INSTALL_PACKAGES_REF:-"v1.1.2"}    # install-packages release (tag, branch or commit) whose install_packages.sh is fetched
+INSTALL_PACKAGES_REF=${INSTALL_PACKAGES_REF:-"v1.1.3"}    # install-packages release (tag, branch or commit) whose install_packages.sh is fetched
 INSTALL_PACKAGES_URL=${INSTALL_PACKAGES_URL:-"https://raw.githubusercontent.com/Chubtoad5/install-packages/${INSTALL_PACKAGES_REF}/install_packages.sh"}
 INSTALL_PACKAGES_SHA256=${INSTALL_PACKAGES_SHA256:-""}    # optional sha256 of install_packages.sh; a mismatch stops the run
 export INSTALL_PACKAGES_REF                               # image_pull_push.sh reads it too, so one setting covers both helpers
@@ -2184,6 +2184,8 @@ generate_bundle_licenses() {
     echo "OS distribution packages bundled via install-packages (each keeps its own license):"
     echo "  samba ............... GPL-3.0-or-later   (see WRITTEN_OFFER.txt)"
     printf "  %-21s GPL-2.0-or-later   (see WRITTEN_OFFER.txt)\\n" "$NFS_PACKAGE ...."
+    echo "Docker's packages, for an install with no route out, are inside utilities/container_images_*.tar.gz. That"
+    echo "  archive has its own LICENSES/ (images-pull-push v1.1.2 or later), with their list and a written offer."
     echo "The installer scripts themselves are Apache-2.0 (Chubtoad5)."
   } > "$dir/THIRD_PARTY_NOTICES.txt"
 
