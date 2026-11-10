@@ -11,6 +11,7 @@ A bash automation script that deploys a self-contained, production-ready Seaweed
 - [Usage](#usage)
   - [Quick Start](#quick-start)
   - [Upgrading an existing install](#upgrading-an-existing-install)
+  - [Clustering (two or more nodes)](#clustering-two-or-more-nodes)
   - [Manual installation](#manual-installation)
 - [Examples](#examples)
 - [Configuration Variables](#configuration-variables)
@@ -62,6 +63,33 @@ sudo ./install-seaweedfs install
 ```
 
 After installation, a summary with all service URLs, credentials, and API examples is printed to the console and saved to `seaweedfs-install.log`.
+
+### Clustering (two or more nodes)
+
+Cluster mode grows one node into a small cluster with no data loss. It's SeaweedFS's
+[small-cluster layout](https://github.com/seaweedfs/seaweedfs/wiki/Quick-Start-with-weed-mini): node 1 runs `weed mini`
+(master, volume server, Filer and S3 in one), and each joined node adds a volume server that keeps a second copy of the data.
+
+```bash
+# Node 1: a cluster-ready control plane. Replication stays at one copy while it's alone, so writes work.
+sudo CLUSTER_MODE=cluster ./install-seaweedfs install
+
+# Node 2 (and 3): a volume node, pointed at node 1's master
+sudo ./install-seaweedfs join -master <node1-ip>:9333
+
+# Node 1, once node 2 has joined: new writes get two copies (a re-run, data kept: carry your settings over, as "Upgrading an existing install" says)
+sudo CLUSTER_MODE=cluster CLUSTER_REPLICATION=001 ./install-seaweedfs install
+# ...and so does the data already there
+printf 'lock\nvolume.configure.replication -replication 001\nvolume.fix.replication -apply\nunlock\n' \
+  | sudo docker exec -i seaweed-mini weed shell -master=localhost:9333 -filer=localhost:8888
+```
+
+What it protects, and what it doesn't:
+- **Losing a volume node:** every volume has a copy on another server, so the data is still served.
+- **Losing node 1:** the cluster stops until node 1 returns. Node 1 holds the only master and Filer. The copies on the other nodes are safe, but nothing serves them meanwhile. High availability for the control plane (three masters, two or more Filers) is SeaweedFS's [multi-component setup](https://github.com/seaweedfs/seaweedfs/wiki/Production-Setup), which this installer doesn't build.
+- **Security:** the cluster's ports (master gRPC 19333, volume 9340 and 19340) are unauthenticated, which is SeaweedFS's default. Keep them on a trusted network, or firewall them to the cluster's nodes.
+- **`weed shell` by hand:** add `-filer=localhost:8888` for `fs.*` and `s3.*` commands. In cluster mode the shell otherwise looks for the Filer at the host's address, on a port cluster mode doesn't publish. `volume.*` commands only need the master.
+- **Removing a volume node:** replicate its volumes elsewhere first, then `./install-seaweedfs uninstall` on it. The uninstall warns about this too.
 
 ### Manual installation
 

@@ -1,5 +1,30 @@
 # Changelog — seaweedfs-installer
 
+## v1.2.2 — 2026-11-10 — Cluster mode installs again
+
+### Fixed
+- **`CLUSTER_MODE=cluster ./install-seaweedfs install` finishes** (spec 17, F1). It stopped at "Configuring S3
+  credentials" in every release since v1.0.0. Cluster mode makes the control plane advertise the host's address, so the
+  installer's `weed shell`, run inside the container, looked the Filer up at that address and dialled its gRPC port,
+  18888, which cluster mode doesn't publish. Every `weed shell` the installer runs now names the container's own Filer,
+  `-filer=localhost:8888`, and so do the cluster commands `join` prints. No new port is opened. Single-node installs
+  never had the problem: there the Filer advertises the container's own address.
+
+### Documentation
+- **A clustering section in the README:** the steps (install node 1 with `CLUSTER_MODE=cluster`, `join`, then two
+  copies for new and existing data), and what this layout protects and doesn't. Losing a volume node keeps the data
+  served; losing node 1 stops the cluster until it returns. The cluster's ports are unauthenticated, as SeaweedFS ships
+  them. And `-filer=localhost:8888` for `fs.*` and `s3.*` commands run by hand.
+
+### Tests
+- `tests/unit/cluster-shell.bats`: every `weed shell` names the local Filer.
+- Spec 09 Phase 5's scenarios are part of this release:
+  - **A4:** a cluster-mode install and a write on one node; a second node joins and the README's replication steps run.
+    Node 2's own copies match byte for byte, and with node 2 stopped everything reads back through node 1. Node 2 rejoins
+    and uninstalls.
+  - **A5:** the last release installed and given data, then this version installed over it, with the data, keys,
+    password and Caddy's root CA kept.
+
 ## v1.2.1 — 2026-11-09 — Air-gapped Docker on Rocky 10 and Leap 16
 
 ### Fixed

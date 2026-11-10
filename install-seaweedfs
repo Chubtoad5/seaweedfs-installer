@@ -6,7 +6,7 @@
 
 # -- USER DEFINED Configuration Variables -- #
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 
 DEBUG=${DEBUG:-1}
 
@@ -330,6 +330,9 @@ mgmt_ip_ok() {
   [[ "$MGMT_IP" =~ $ipv4_pattern ]]
 }
 
+# Every 'weed shell' here names the container's own Filer (-filer=localhost:8888). In cluster mode the control plane
+# advertises the host's address, and the shell's own lookup would dial the Filer's gRPC port there, which cluster mode
+# doesn't publish (spec 17): the install used to stop at "Configuring S3 credentials".
 # s3_key_on_this_host <access key>: true when this host's running seaweed-mini already has the key. It runs before
 # the stack is (re)started, so it gives up rather than wait: 'weed shell' waits for ever for a master that doesn't
 # answer, and ignores SIGTERM. Any doubt means false, and the caller generates a new pair.
@@ -338,7 +341,7 @@ s3_key_on_this_host() {
   local code
   code=$(docker exec seaweed-mini curl -s -m 3 -o /dev/null -w '%{http_code}' http://localhost:8888 2>/dev/null)
   [[ "$code" =~ ^2[0-9][0-9]$ ]] || return 1
-  echo "s3.configure" | timeout -k 5 20 docker exec -i seaweed-mini /usr/bin/weed shell 2>/dev/null \
+  echo "s3.configure" | timeout -k 5 20 docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>/dev/null \
     | grep -qF "\"accessKey\": \"$1\""
 }
 
@@ -712,7 +715,7 @@ install_swfs () {
   upload_binaries
   echo "  Configuring S3 credentials..."
   local shell_out=""
-  shell_out=$(echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell 2>&1)
+  shell_out=$(echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>&1)
   # The output lists every identity with its keys, so the log gets it only on failure, and masked.
   if echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)'; then
     echo "$shell_out" | mask_s3_keys >> "$LOG_FILE"
@@ -723,7 +726,7 @@ install_swfs () {
   record_state S3_KEYS_USER "$S3_USER"
   local revoke
   for revoke in $S3_REVOKE_ACCESS_KEYS; do
-    shell_out=$(echo "s3.configure -user=$S3_USER -access_key=$revoke -delete -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell 2>&1)
+    shell_out=$(echo "s3.configure -user=$S3_USER -access_key=$revoke -delete -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>&1)
     if echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)'; then
       echo "$shell_out" | mask_s3_keys >> "$LOG_FILE"
       die "Revoking S3 access key $revoke failed (see $LOG_FILE)."
@@ -739,14 +742,14 @@ install_swfs () {
     list_contains "$extra" "$all_buckets" || all_buckets="$all_buckets $extra"
   done
   local existing_buckets=""
-  existing_buckets=$(echo "s3.bucket.list" | docker exec -i seaweed-mini /usr/bin/weed shell 2>/dev/null | awk '{print $1}')
+  existing_buckets=$(echo "s3.bucket.list" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>/dev/null | awk '{print $1}')
   for bucket in $all_buckets; do
     if echo "$existing_buckets" | grep -Fxq "$bucket"; then
       echo "  Bucket already exists, skipping: $bucket"
       continue
     fi
     echo "  Creating bucket: $bucket"
-    shell_out=$(echo "s3.bucket.create -name $bucket -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell 2>&1)
+    shell_out=$(echo "s3.bucket.create -name $bucket -owner=$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>&1)
     echo "$shell_out" >> "$LOG_FILE"
     echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)' && die "Failed to create S3 bucket '$bucket' (see $LOG_FILE)."
   done
@@ -2351,10 +2354,10 @@ generate_join_outputs () {
   2. Replicate EXISTING data onto this node. fix.replication only acts on under-replicated volumes, so first
      raise existing volumes' replication, then fix (a single weed-shell session; 'lock' is required):
        printf 'lock\nvolume.configure.replication -replication 001\nvolume.fix.replication -apply\nunlock\n' \
-         | sudo docker exec -i seaweed-mini weed shell -master=localhost:$SWFS_MASTER_PORT
+         | sudo docker exec -i seaweed-mini weed shell -master=localhost:$SWFS_MASTER_PORT -filer=localhost:8888
 
   Verify (each volume should now report 2 copies, one on each node):
-       printf 'lock\nvolume.list\nunlock\n' | sudo docker exec -i seaweed-mini weed shell -master=localhost:$SWFS_MASTER_PORT
+       printf 'lock\nvolume.list\nunlock\n' | sudo docker exec -i seaweed-mini weed shell -master=localhost:$SWFS_MASTER_PORT -filer=localhost:8888
 EOF
 }
 
