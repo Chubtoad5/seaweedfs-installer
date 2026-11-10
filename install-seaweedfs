@@ -2354,10 +2354,10 @@ generate_join_outputs () {
   2. Replicate EXISTING data onto this node. fix.replication only acts on under-replicated volumes, so first
      raise existing volumes' replication, then fix (a single weed-shell session; 'lock' is required):
        printf 'lock\nvolume.configure.replication -replication 001\nvolume.fix.replication -apply\nunlock\n' \
-         | sudo docker exec -i seaweed-mini weed shell -master=localhost:$SWFS_MASTER_PORT -filer=localhost:8888
+         | sudo docker exec -i seaweed-mini weed shell -master=localhost:9333 -filer=localhost:8888
 
   Verify (each volume should now report 2 copies, one on each node):
-       printf 'lock\nvolume.list\nunlock\n' | sudo docker exec -i seaweed-mini weed shell -master=localhost:$SWFS_MASTER_PORT -filer=localhost:8888
+       printf 'lock\nvolume.list\nunlock\n' | sudo docker exec -i seaweed-mini weed shell -master=localhost:9333 -filer=localhost:8888
 EOF
 }
 

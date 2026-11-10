@@ -9,12 +9,15 @@
   18888, which cluster mode doesn't publish. Every `weed shell` the installer runs now names the container's own Filer,
   `-filer=localhost:8888`, and so do the cluster commands `join` prints. No new port is opened. Single-node installs
   never had the problem: there the Filer advertises the container's own address.
+- **The replication commands `join` prints use the container's master port, 9333.** They used `SWFS_MASTER_PORT`,
+  which is Caddy's port on the host, so they were wrong whenever that was changed.
 
 ### Documentation
 - **A clustering section in the README:** the steps (install node 1 with `CLUSTER_MODE=cluster`, `join`, then two
   copies for new and existing data), and what this layout protects and doesn't. Losing a volume node keeps the data
   served; losing node 1 stops the cluster until it returns. The cluster's ports are unauthenticated, as SeaweedFS ships
   them. And `-filer=localhost:8888` for `fs.*` and `s3.*` commands run by hand.
+- `CLUSTER_MODE`, `CLUSTER_REPLICATION` and the cluster ports are in the Configuration Variables table.
 
 ### Tests
 - `tests/unit/cluster-shell.bats`: every `weed shell` names the local Filer.
