@@ -21,7 +21,9 @@ s3() { curl -sk -m 30 --aws-sigv4 aws:amz:us-east-1:s3 --user "$K:$S" "$@"; }
 s3ok() { [ "$(s3 -o /dev/null -w '%{http_code}' "https://$IP:8333/")" = 200 ]; }
 put() { [ "$(s3 -o /dev/null -w '%{http_code}' -T "$2" "https://$IP:8333/$B/a4/$1")" = 200 ]; }
 same() { [ "$(s3 "https://$IP:8333/$B/a4/$1" | sha256sum | cut -d' ' -f1)" = "$(sha256sum < "$CI_HANDOFF/$1" | cut -d' ' -f1)" ]; }
-shell() { printf '%s\n' "$@" | docker exec -i seaweed-mini weed shell -master=localhost:9333 2>&1; }
+# In cluster mode the shell must be told the Filer is local: the cluster advertises the host address, whose Filer gRPC
+# port is not published (spec 17)
+shell() { printf '%s\n' "$@" | docker exec -i seaweed-mini weed shell -master=localhost:9333 -filer=localhost:8888 2>&1; }
 # The volume IDs of an object's chunks, from the Filer's entry
 vids() { shell "fs.meta.cat /buckets/$B/a4/$1" | grep -oiE '"file_?id": *"[0-9]+,' | grep -oE '[0-9]+' | sort -u; }
 # Where the master says a volume is
