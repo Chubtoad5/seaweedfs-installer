@@ -1,0 +1,9 @@
+# Spec 09's A4 for SeaweedFS: a cluster grown from one node to two with no data loss, following the README's join
+# steps, then a node stopped and the data read back. Run by automation-ci's ci/scenario.sh, one line after another; a
+# step runs another script on a role's clone (each script branches on CI_STEP).
+role node1 4 6144 tests/scenarios/a4-node1.sh
+role node2 4 6144 tests/scenarios/a4-node2.sh
+step node1 tests/scenarios/a4-node1.sh
+step node2 tests/scenarios/a4-node2.sh
+step node1 tests/scenarios/a4-node1.sh
+step node2 tests/scenarios/a4-node2.sh

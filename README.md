@@ -11,6 +11,7 @@ A bash automation script that deploys a self-contained, production-ready Seaweed
 - [Usage](#usage)
   - [Quick Start](#quick-start)
   - [Upgrading an existing install](#upgrading-an-existing-install)
+  - [Clustering (two or more nodes)](#clustering-two-or-more-nodes)
   - [Manual installation](#manual-installation)
 - [Examples](#examples)
 - [Configuration Variables](#configuration-variables)
@@ -62,6 +63,33 @@ sudo ./install-seaweedfs install
 ```
 
 After installation, a summary with all service URLs, credentials, and API examples is printed to the console and saved to `seaweedfs-install.log`.
+
+### Clustering (two or more nodes)
+
+Cluster mode grows one node into a small cluster with no data loss. It's SeaweedFS's
+[small-cluster layout](https://github.com/seaweedfs/seaweedfs/wiki/Quick-Start-with-weed-mini): node 1 runs `weed mini`
+(master, volume server, Filer and S3 in one), and each joined node adds a volume server that keeps a second copy of the data.
+
+```bash
+# Node 1: a cluster-ready control plane. Replication stays at one copy while it's alone, so writes work.
+sudo CLUSTER_MODE=cluster ./install-seaweedfs install
+
+# Node 2 (and 3): a volume node, pointed at node 1's master
+sudo ./install-seaweedfs join -master <node1-ip>:9333
+
+# Node 1, once node 2 has joined: new writes get two copies (a re-run, data kept: carry your settings over, as "Upgrading an existing install" says)
+sudo CLUSTER_MODE=cluster CLUSTER_REPLICATION=001 ./install-seaweedfs install
+# ...and so does the data already there
+printf 'lock\nvolume.configure.replication -replication 001\nvolume.fix.replication -apply\nunlock\n' \
+  | sudo docker exec -i seaweed-mini weed shell -master=localhost:9333 -filer=localhost:8888
+```
+
+What it protects, and what it doesn't:
+- **Losing a volume node:** every volume has a copy on another server, so the data is still served.
+- **Losing node 1:** the cluster stops until node 1 returns. Node 1 holds the only master and Filer. The copies on the other nodes are safe, but nothing serves them meanwhile. High availability for the control plane (three masters, two or more Filers) is SeaweedFS's [multi-component setup](https://github.com/seaweedfs/seaweedfs/wiki/Production-Setup), which this installer doesn't build.
+- **Security:** the cluster's ports (master gRPC 19333, volume 9340 and 19340 by default, set by `CLUSTER_*_PORT`) are unauthenticated, which is SeaweedFS's default. Keep them on a trusted network, or firewall them to the cluster's nodes.
+- **`weed shell` by hand:** add `-filer=localhost:8888` for `fs.*` and `s3.*` commands. In cluster mode the shell otherwise looks for the Filer at the host's address, on a port cluster mode doesn't publish. `volume.*` commands only need the master.
+- **Removing a volume node:** replicate its volumes elsewhere first, then `./install-seaweedfs uninstall` on it. The uninstall warns about this too.
 
 ### Manual installation
 
@@ -271,6 +299,9 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `VOLUME_SIZE_LIMIT_MB` | `""` | Optional cap (MB) after which the master stops directing writes to a volume. Empty = `weed mini` auto-sizing (64–1024 MB). |
 | `SPLASH_REQUIRE_LOGIN` | `true` | `true` = the landing page sits behind the SeaweedFS Admin UI login (`SWFS_USER` / `SWFS_PASSWORD`); after signing in you land on it, with a link to the Admin Console. `false` = public landing page (the previous behaviour). See [Landing page and Admin UI access](#landing-page-and-admin-ui-access). |
 | `MGMT_IP` | *(first host IP)* | IP used as the Caddy `default_sni` fallback and cluster advertise address. Overridable (honored when passed by ap-tools or set explicitly). `install` and `join` refuse to run when it isn't an IPv4 address, for example when the network isn't up yet and `hostname -I` prints nothing |
+| `CLUSTER_MODE` | *(empty)* | `cluster` makes this host a cluster-ready control plane: it advertises `MGMT_IP` and publishes the cluster ports. See [Clustering](#clustering-two-or-more-nodes). Empty is a single node. |
+| `CLUSTER_REPLICATION` | *(empty)* | The master's default replication, for example `001` (two copies on different servers). Set it only once a second node has joined: a lone node has nowhere to put the copy, so writes would block. |
+| `CLUSTER_MASTER_GRPC_PORT` / `CLUSTER_VOLUME_PORT` / `CLUSTER_VOLUME_GRPC_PORT` | `19333` / `9340` / `19340` | The ports cluster mode and `join` publish. |
 | `SWFS_FORCE_ONLINE` | `false` | Ignore a `swfs-save-version.txt` sentinel in the working directory and stay in online mode (recover from a stale sentinel, e.g. on a build host that ran `save`). |
 | `IMAGE_PULL_PUSH_REF` | `v1.1.2` | The `images-pull-push` release (a tag, branch or commit) whose `image_pull_push.sh` is fetched into `utilities/`. A copy already there is reused only if it came from the same ref. Air-gapped, the bundle's copy is used and nothing is downloaded |
 | `IMAGE_PULL_PUSH_URL` | the ref's file on `raw.githubusercontent.com` | Full URL of `image_pull_push.sh`, for a mirror. Wins over `IMAGE_PULL_PUSH_REF` |

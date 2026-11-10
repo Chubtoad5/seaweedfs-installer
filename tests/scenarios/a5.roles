@@ -1,0 +1,3 @@
+# Spec 09's A5 for SeaweedFS: the last release installed and given data, then the commit under test installed over it
+# with the same settings, as the README's upgrade section says. Run by automation-ci's ci/scenario.sh.
+role host 4 6144 tests/scenarios/a5-upgrade.sh
