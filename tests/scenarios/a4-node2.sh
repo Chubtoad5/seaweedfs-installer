@@ -11,9 +11,10 @@ bad() { echo "FAIL  $1"; fail=1; }
 within() { local t=$1 i; shift; for ((i = 0; i < t; i += 3)); do "$@" && return 0; sleep 3; done; "$@"; }
 W=/var/tmp/a4; mkdir -p "$W"; cd "$W" || exit 1
 N1=${CI_ROLE_NODE1_IP:?}
+P=Test-Pass-1
 export HOST_FQDN=files.test.lab DEBUG=0
 vol_up() { curl -s -m 5 -o /dev/null "http://127.0.0.1:9340/status"; }
-registered() { curl -sk -m 10 -u admin:Test-Pass-1 "https://$N1:9333/dir/status" | grep -q "$CI_CLONE_IP:9340"; }
+registered() { curl -sk -m 10 -u "admin:$P" "https://$N1:9333/dir/status" | grep -q "$CI_CLONE_IP:9340"; }
 
 case "${CI_STEP:-node2}" in
 node2)
