@@ -6,7 +6,7 @@
 
 # -- USER DEFINED Configuration Variables -- #
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.3.0"
 
 DEBUG=${DEBUG:-1}
 
@@ -252,6 +252,25 @@ EOF
 }
 
 file_md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# S15: the seaweed-mount container that holds the /mnt/seaweed FUSE mount: its ID and start time. install_swfs reads it
+# right before and right after 'docker compose up', so a container compose recreated or restarted shows, with no race
+# against the new mount coming up. Empty when there's no such container.
+mount_container() { docker inspect -f '{{.Id}} {{.State.StartedAt}}' seaweed-mount 2>/dev/null; }
+MOUNT_BEFORE="" MOUNT_AFTER=""
+# mount_replaced: did this run replace the /mnt/seaweed mount, or is it new? Samba and NFS would then serve a dead one.
+mount_replaced() { [[ -z "$MOUNT_BEFORE" || "$MOUNT_BEFORE" != "$MOUNT_AFTER" ]]; }
+# wait_for_mount: wait up to 60 s for a live FUSE mount at /mnt/seaweed, so a restarted NFS server exports the mount,
+# not the empty folder under it. A warning, not a failure: the services still restart.
+wait_for_mount() {
+  local fstype
+  for _ in {1..30}; do
+    fstype=$(findmnt -n -o FSTYPE /mnt/seaweed 2>/dev/null | tail -1)
+    [[ "$fstype" == fuse* ]] && timeout 5 ls /mnt/seaweed > /dev/null 2>&1 && return 0
+    sleep 2
+  done
+  echo "  WARNING: /mnt/seaweed isn't mounted yet (check: docker logs seaweed-mount)." | tee -a "$LOG_FILE"
+}
 
 # private_file <path>: make sure the file exists with mode 600 before secrets are written into it. 'cat >' keeps
 # an existing file's mode, so this also tightens files an earlier release left world-readable.
@@ -678,8 +697,10 @@ install_swfs () {
   generate_index_html
   persist_caddy_data
   echo "  Starting SeaweedFS and Caddy containers..."
+  MOUNT_BEFORE=$(mount_container)
   docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+  MOUNT_AFTER=$(mount_container)
   # Apply a regenerated Caddyfile to an already-running container (SW-8): compose
   # only recreates on compose-file changes, not bind-mounted config changes.
   restart_if_changed seaweed-caddy "$caddyfile_before" "$(file_md5 /opt/caddy/Caddyfile)" \
@@ -768,6 +789,8 @@ install_swfs () {
   configure_selinux
   configure_firewall "$(firewall_collect_ports)" "${ENABLE_SMB,,}" "${ENABLE_NFS,,}"
   generate_outputs
+  # Last, so a failed run keeps the last successful release's version (S16)
+  record_state SCRIPT_VERSION "$SCRIPT_VERSION"
 }
 
 run_docker() {
@@ -880,6 +903,8 @@ run_smb () {
   ensure_swfs_user
   (echo "$SWFS_PASSWORD"; echo "$SWFS_PASSWORD") | smbpasswd -a -s "$SWFS_USER" \
     || die "smbpasswd failed for user '$SWFS_USER'."
+  local smb_conf_before
+  smb_conf_before=$(file_md5 /etc/samba/smb.conf)
   # One-time backup of the pre-install smb.conf (kept for operator reference; the
   # marker block below — not this backup — is what uninstall removes).
   [[ -f /etc/samba/smb.conf.bak ]] || cp -p /etc/samba/smb.conf /etc/samba/smb.conf.bak
@@ -914,8 +939,23 @@ EOF
     testparm -s /etc/samba/smb.conf 2>/dev/null | grep -qxF "[$DEFAULT_FILER_DIR_NAME]" \
       || die "Samba did not load the [$DEFAULT_FILER_DIR_NAME] share from /etc/samba/smb.conf (check with: testparm -s)."
   fi
-  echo "  Restarting Samba..."
-  systemctl restart "$SMB_SERVICE" || die "Failed to restart Samba service '$SMB_SERVICE'."
+  # Restart only when needed, so a same-settings re-run keeps every SMB session (S15)
+  if ! systemctl is-active --quiet "$SMB_SERVICE"; then
+    echo "  Samba: not running, starting it..."
+    systemctl restart "$SMB_SERVICE" || die "Failed to start Samba service '$SMB_SERVICE'."
+  elif mount_replaced; then
+    echo "  Samba: this run replaced the /mnt/seaweed mount, restarting it..."
+    wait_for_mount
+    systemctl restart "$SMB_SERVICE" || die "Failed to restart Samba service '$SMB_SERVICE'."
+  elif [[ "$(file_md5 /etc/samba/smb.conf)" != "$smb_conf_before" ]]; then
+    echo "  Samba: configuration changed, reloading it (open sessions stay)..."
+    if ! systemctl reload "$SMB_SERVICE" 2>> "$LOG_FILE"; then
+      echo "  Samba: the reload failed, restarting it..."
+      systemctl restart "$SMB_SERVICE" || die "Failed to restart Samba service '$SMB_SERVICE'."
+    fi
+  else
+    echo "  Samba: no change, left running."
+  fi
   local smb_up=0 attempt
   for attempt in {1..10}; do
     [[ $attempt -gt 1 ]] && sleep 1
@@ -941,6 +981,8 @@ run_nfs () {
     install_os_packages offline "$NFS_PACKAGE" || die "NFS server package ($NFS_PACKAGE) installation (offline) failed (output above and in $LOG_FILE)."
   fi
   echo "  Configuring NFS export..."
+  local exports_before
+  exports_before=$(file_md5 /etc/exports)
   # Reconcile: drop any previously-appended seaweedfs-installer export line first so
   # re-installs never duplicate the export (the trailing marker tags our lines).
   [[ -f /etc/exports ]] && sed -i '/ # seaweedfs-installer$/d' /etc/exports
@@ -954,11 +996,23 @@ run_nfs () {
     export_line+=" ${client}(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=1)"
   done
   echo "$export_line # seaweedfs-installer" >> /etc/exports
-  echo "  Exporting NFS filesystem..."
-  exportfs -ra || die "exportfs -ra failed."
-  echo "  Restarting NFS service..."
-  systemctl enable "$NFS_SERVICE"
-  systemctl restart "$NFS_SERVICE" || die "Failed to restart NFS service '$NFS_SERVICE'."
+  systemctl enable "$NFS_SERVICE" >/dev/null 2>&1
+  # Restart only when needed, so a same-settings re-run keeps every NFS client (S15)
+  if ! systemctl is-active --quiet "$NFS_SERVICE"; then
+    echo "  NFS: not running, exporting and starting it..."
+    exportfs -ra || die "exportfs -ra failed."
+    systemctl restart "$NFS_SERVICE" || die "Failed to start NFS service '$NFS_SERVICE'."
+  elif mount_replaced; then
+    echo "  NFS: this run replaced the /mnt/seaweed mount, re-exporting and restarting it..."
+    wait_for_mount
+    exportfs -ra || die "exportfs -ra failed."
+    systemctl restart "$NFS_SERVICE" || die "Failed to restart NFS service '$NFS_SERVICE'."
+  elif [[ "$(file_md5 /etc/exports)" != "$exports_before" ]]; then
+    echo "  NFS: export changed, re-exporting it (no restart)..."
+    exportfs -ra || die "exportfs -ra failed."
+  else
+    echo "  NFS: no change, left running."
+  fi
   configure_nfs_meta_refresh
   record_state NFS_CONFIGURED "true"
   record_state NFS_SERVICE_NAME "$NFS_SERVICE"
@@ -2291,6 +2345,7 @@ run_join () {
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-volume-compose.yaml."
   configure_firewall "$CLUSTER_VOLUME_PORT/tcp $CLUSTER_VOLUME_GRPC_PORT/tcp" "false" "false"
   generate_join_outputs
+  record_state SCRIPT_VERSION "$SCRIPT_VERSION"
 }
 
 generate_join_compose_file () {

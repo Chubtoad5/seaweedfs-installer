@@ -39,6 +39,8 @@ within 90 s3ok && ok "S3 answers with the same keys" || bad "S3 doesn't answer w
 [ "$(s3 "https://$IP:8333/$B/a5/obj.bin" | sum)" = "$(sum < obj.bin)" ] && ok "the S3 object survived" || bad "the S3 object changed or is gone"
 [ "$(filer_get | sum)" = "$(sum < file.bin)" ] && ok "the Filer file survived, and the admin password still opens it" || bad "the Filer file changed or is gone, or the password no longer works"
 [ "$(ca)" = "$ca1" ] && ok "Caddy's root CA is unchanged, so clients still trust it" || bad "Caddy's root CA changed"
+v=$(sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p' new/install-seaweedfs)
+[ -n "$v" ] && grep -qx "SCRIPT_VERSION=$v" /opt/seaweedfs/.install-state && ok "S16: the upgrade recorded SCRIPT_VERSION=$v" || bad "S16: .install-state doesn't say SCRIPT_VERSION=$v"
 (cd new && ./install-seaweedfs uninstall) > o3 2>&1 && ok "uninstall" || { bad "uninstall"; tail -6 o3 | cut -c1-170; }
 left=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -xE 'seaweed-.*|grafana|loki|prometheus')
 [ -z "$left" ] && ok "no containers left" || bad "containers left behind: $left"
