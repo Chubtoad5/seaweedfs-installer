@@ -127,7 +127,7 @@ Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and Seawe
 - Re-running `install` reconciles instead of duplicating: Samba/NFS config blocks are marker-tagged and replaced (never appended twice), changed bind-mounted configs (Caddyfile, monitoring configs) trigger a restart of the affected container, Samba and NFS are left running unless something changed (see [Samba and NFS on a re-run](#samba-and-nfs-on-a-re-run)), and features toggled off since the previous install (`ENABLE_MQ`, `ENABLE_MONITORING`, `ENABLE_SMB`, `ENABLE_NFS`) are torn down (`--remove-orphans` plus recorded-state cleanup)
 - When **firewalld** (Rocky/RHEL, openSUSE Leap) or **UFW** (Ubuntu) is active, the ports for the enabled services are opened and recorded — see [Firewall and SELinux handling](#firewall-and-selinux-handling)
 - When **SELinux is enforcing** and SMB is enabled, the `samba_share_fusefs` boolean is set (prior value recorded for uninstall)
-- Samba and NFS server package installs log their output to `seaweedfs-install.log` (and the console with `DEBUG=1`); a failed install stops the run and prints the last lines of that output. With SMB enabled, `install` validates the generated `smb.conf` with `testparm -s` **before** restarting Samba (a bad config never takes down a running `smbd`), checks that the share was loaded, and fails unless the Samba service is active and listening on 445 after the restart
+- Samba and NFS server package installs log their output to `seaweedfs-install.log` (and the console with `DEBUG=1`); a failed install stops the run and prints the last lines of that output. With SMB enabled, `install` validates the generated `smb.conf` with `testparm -s` **before** reloading or restarting Samba (a bad config never takes down a running `smbd`), checks that the share was loaded, and fails unless the Samba service is active and listening on 445 afterwards
 
 **Configuration paths after installation:**
 
@@ -402,7 +402,7 @@ A re-run with the same settings leaves Samba and the NFS server running, so SMB 
 | Nothing changed, service running | Left alone | Left alone |
 | Its config changed (`smb.conf`'s share, `/etc/exports`' line) | Reloaded (`systemctl reload`): open sessions stay. A failed reload falls back to a restart | Re-exported (`exportfs -ra`), no restart |
 | The service isn't running | Started | Exported and started |
-| This run replaced the `/mnt/seaweed` mount (compose recreated `seaweed-mount`, for a new image say) | Restarted | Re-exported and restarted |
+| This run replaced the `/mnt/seaweed` mount (compose recreated or restarted `seaweed-mount`, for a new image say) | Restarted, once the new mount is up | Re-exported and restarted, once the new mount is up |
 
 A replaced mount needs the restart because both would otherwise keep serving the old one, whose clients have already
 lost it. The log says which case applied ("Samba: no change, left running.", "NFS: export changed, re-exporting it").

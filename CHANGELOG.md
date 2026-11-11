@@ -9,8 +9,9 @@ Spec 18 (chubtoad-automation), asked for by object-tech-ops' Phase B, which re-r
   re-run dropped every SMB session (`NT_STATUS_CONNECTION_DISCONNECTED`) and paused NFS clients. Now: nothing changed
   and the service running, it's left alone; a changed `smb.conf` reloads Samba (a failed reload restarts it), and a
   changed `/etc/exports` is re-exported with `exportfs -ra`, with no restart; a service that isn't running is started.
-  Both still restart when the run replaced the `/mnt/seaweed` mount, which they'd otherwise keep serving. The log says
-  which case applied.
+  Both still restart when the run replaced the `/mnt/seaweed` mount, which they'd otherwise keep serving: the
+  `seaweed-mount` container is read right before and right after `docker compose up`, and the restart waits up to 60 s
+  for the new FUSE mount. The log says which case applied.
 
 ### Added
 - **`.install-state` records `SCRIPT_VERSION`** (S16), the release that last finished an `install` or `join` on the
@@ -19,8 +20,8 @@ Spec 18 (chubtoad-automation), asked for by object-tech-ops' Phase B, which re-r
 ### Tests
 - `tests/unit/services.bats`: each Samba and NFS case, the mount check, and where `SCRIPT_VERSION` is written.
 - `tests/integration/20-day2.sh`: an SMB session held open across an identical re-run still works, and neither
-  service restarts; a changed share and export reload and re-export in place; a stopped NFS server is started;
-  `SCRIPT_VERSION` is recorded. A5 checks the upgrade records it.
+  service restarts; a changed share and export reload and re-export in place; a stopped NFS server is started; a re-run
+  that recreates `seaweed-mount` restarts both, and a new SMB session sees the new mount; `SCRIPT_VERSION` is recorded. A5 checks the upgrade records it.
 
 ## v1.2.2 — 2026-11-10 — Cluster mode installs again
 

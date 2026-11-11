@@ -253,12 +253,24 @@ EOF
 
 file_md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
-# The kernel's ID for the /mnt/seaweed mount: a new one each time the weed mount is mounted (S15). Empty when nothing is
-# mounted there. install_swfs reads it before 'docker compose up', and Samba and NFS compare it afterwards.
-seaweed_mount_id() { awk '$5 == "/mnt/seaweed" {id = $1} END {print id}' /proc/self/mountinfo 2>/dev/null; }
-MOUNT_ID_BEFORE=""
-# mount_replaced: did this run replace the /mnt/seaweed mount (or is it new)? Samba and NFS then serve a dead one.
-mount_replaced() { [[ "$(seaweed_mount_id)" != "$MOUNT_ID_BEFORE" || -z "$MOUNT_ID_BEFORE" ]]; }
+# S15: the seaweed-mount container that holds the /mnt/seaweed FUSE mount: its ID and start time. install_swfs reads it
+# right before and right after 'docker compose up', so a container compose recreated or restarted shows, with no race
+# against the new mount coming up. Empty when there's no such container.
+mount_container() { docker inspect -f '{{.Id}} {{.State.StartedAt}}' seaweed-mount 2>/dev/null; }
+MOUNT_BEFORE="" MOUNT_AFTER=""
+# mount_replaced: did this run replace the /mnt/seaweed mount, or is it new? Samba and NFS would then serve a dead one.
+mount_replaced() { [[ -z "$MOUNT_BEFORE" || "$MOUNT_BEFORE" != "$MOUNT_AFTER" ]]; }
+# wait_for_mount: wait up to 60 s for a live FUSE mount at /mnt/seaweed, so a restarted NFS server exports the mount,
+# not the empty folder under it. A warning, not a failure: the services still restart.
+wait_for_mount() {
+  local fstype
+  for _ in {1..30}; do
+    fstype=$(findmnt -n -o FSTYPE /mnt/seaweed 2>/dev/null | tail -1)
+    [[ "$fstype" == fuse* ]] && timeout 5 ls /mnt/seaweed > /dev/null 2>&1 && return 0
+    sleep 2
+  done
+  echo "  WARNING: /mnt/seaweed isn't mounted yet (check: docker logs seaweed-mount)." | tee -a "$LOG_FILE"
+}
 
 # private_file <path>: make sure the file exists with mode 600 before secrets are written into it. 'cat >' keeps
 # an existing file's mode, so this also tightens files an earlier release left world-readable.
@@ -685,9 +697,10 @@ install_swfs () {
   generate_index_html
   persist_caddy_data
   echo "  Starting SeaweedFS and Caddy containers..."
-  MOUNT_ID_BEFORE=$(seaweed_mount_id)
+  MOUNT_BEFORE=$(mount_container)
   docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+  MOUNT_AFTER=$(mount_container)
   # Apply a regenerated Caddyfile to an already-running container (SW-8): compose
   # only recreates on compose-file changes, not bind-mounted config changes.
   restart_if_changed seaweed-caddy "$caddyfile_before" "$(file_md5 /opt/caddy/Caddyfile)" \
@@ -932,6 +945,7 @@ EOF
     systemctl restart "$SMB_SERVICE" || die "Failed to start Samba service '$SMB_SERVICE'."
   elif mount_replaced; then
     echo "  Samba: this run replaced the /mnt/seaweed mount, restarting it..."
+    wait_for_mount
     systemctl restart "$SMB_SERVICE" || die "Failed to restart Samba service '$SMB_SERVICE'."
   elif [[ "$(file_md5 /etc/samba/smb.conf)" != "$smb_conf_before" ]]; then
     echo "  Samba: configuration changed, reloading it (open sessions stay)..."
@@ -990,6 +1004,7 @@ run_nfs () {
     systemctl restart "$NFS_SERVICE" || die "Failed to start NFS service '$NFS_SERVICE'."
   elif mount_replaced; then
     echo "  NFS: this run replaced the /mnt/seaweed mount, re-exporting and restarting it..."
+    wait_for_mount
     exportfs -ra || die "exportfs -ra failed."
     systemctl restart "$NFS_SERVICE" || die "Failed to restart NFS service '$NFS_SERVICE'."
   elif [[ "$(file_md5 /etc/exports)" != "$exports_before" ]]; then

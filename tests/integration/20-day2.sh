@@ -75,7 +75,7 @@ grep -q 'Samba: no change' "$W/o" && grep -q 'NFS: no change' "$W/o" && ok "S15:
 
 echo "=== S15: a changed share and export reload and re-export, with no restart"
 sp=$(smb_pid); ns=$(nfs_started)
-inst SWFS_PASSWORD=$P1 S3_ACCESS_KEY=$K1 S3_SECRET_KEY=$S1 SWFS_USER=s15user NFS_CLIENTS="$IP" && ok "re-run with a new SMB user and NFS client" || { bad "re-run with a new SMB user and NFS client"; show; }
+inst SWFS_PASSWORD=$P1 S3_ACCESS_KEY=$K1 S3_SECRET_KEY=$S1 SWFS_USER=s15user S3_USER=admin NFS_CLIENTS="$IP" && ok "re-run with a new SMB user and NFS client" || { bad "re-run with a new SMB user and NFS client"; show; }
 grep -q 'valid users = s15user' /etc/samba/smb.conf && grep -q "^/mnt/seaweed $IP(" /etc/exports && ok "smb.conf and /etc/exports changed" || bad "smb.conf or /etc/exports didn't change"
 grep -q 'Samba: configuration changed, reloading' "$W/o" && [ "$(smb_pid)" = "$sp" ] && ok "S15: Samba reloaded, not restarted" || bad "S15: Samba wasn't reloaded in place ($sp, now $(smb_pid))"
 grep -q 'NFS: export changed, re-exporting' "$W/o" && [ "$(nfs_started)" = "$ns" ] && ok "S15: the export changed without an NFS restart" || bad "S15: NFS wasn't re-exported in place"
@@ -83,8 +83,23 @@ exportfs -v | grep -q "^/mnt/seaweed" && exportfs -v | grep -A1 '^/mnt/seaweed' 
 
 echo "=== S15: a stopped NFS server is started"
 systemctl stop "$(state_value NFS_SERVICE_NAME)"
-inst SWFS_PASSWORD=$P1 S3_ACCESS_KEY=$K1 S3_SECRET_KEY=$S1 SWFS_USER=s15user NFS_CLIENTS="$IP" && ok "re-run with NFS stopped" || { bad "re-run with NFS stopped"; show; }
+inst SWFS_PASSWORD=$P1 S3_ACCESS_KEY=$K1 S3_SECRET_KEY=$S1 SWFS_USER=s15user S3_USER=admin NFS_CLIENTS="$IP" && ok "re-run with NFS stopped" || { bad "re-run with NFS stopped"; show; }
 systemctl is-active --quiet "$(state_value NFS_SERVICE_NAME)" && grep -q 'NFS: not running' "$W/o" && ok "S15: the re-run started NFS" || bad "S15: NFS is still stopped"
+
+echo "=== S15: a re-run that replaces the mount restarts Samba and NFS, which then serve the new one"
+# Run seaweed-mount with a config the installer doesn't write, so its re-run recreates the container
+sed -i 's/^\(    container_name: seaweed-mount\)$/\1\n    labels: [ci.s15=replace]/' /opt/seaweedfs/seaweedfs-compose.yaml
+docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d seaweed-mount >/dev/null 2>&1
+sp=$(smb_pid); ns=$(nfs_started)
+inst SWFS_PASSWORD=$P1 S3_ACCESS_KEY=$K1 S3_SECRET_KEY=$S1 SWFS_USER=s15user S3_USER=admin NFS_CLIENTS="$IP" && ok "re-run that recreates seaweed-mount" || { bad "re-run that recreates seaweed-mount"; show; }
+grep -q 'Samba: this run replaced the /mnt/seaweed mount' "$W/o" && grep -q 'NFS: this run replaced the /mnt/seaweed mount' "$W/o" && ok "S15: the log says the mount was replaced" || bad "S15: the replaced mount wasn't noticed"
+[ "$(smb_pid)" != "$sp" ] && [ "$(nfs_started)" != "$ns" ] && ok "S15: Samba and the NFS server restarted" || bad "S15: a service kept serving the old mount"
+[ "$(docker inspect -f '{{index .Config.Labels "ci.s15"}}' seaweed-mount 2>/dev/null)" = "" ] && findmnt -n -o FSTYPE /mnt/seaweed | tail -1 | grep -q '^fuse' && ok "S15: /mnt/seaweed is the new container's FUSE mount" || bad "S15: /mnt/seaweed isn't the new mount"
+echo s15 > /mnt/seaweed/s15-replaced.txt
+hold_smb s15user "$P1"
+end_smb && grep -q 's15-replaced.txt' "$W/hold/out" && ok "S15: a new SMB session sees a file written to the new mount" || { bad "S15: SMB doesn't serve the new mount"; tail -4 "$W/hold/out"; }
+exportfs -v | grep -q '^/mnt/seaweed' && ok "S15: NFS exports the new mount" || bad "S15: no NFS export after the restart"
+rm -f /mnt/seaweed/s15-replaced.txt
 
 echo "=== New password and keys (S3, S7), revoking a key (SC1), re-runs with no keys (S11)"
 st=$(started)
