@@ -19,6 +19,7 @@ A bash automation script that deploys a self-contained, production-ready Seaweed
 - [Behavior Notes](#behavior-notes)
   - [Exit codes](#exit-codes)
   - [Install-state file](#install-state-file)
+  - [Samba and NFS on a re-run](#samba-and-nfs-on-a-re-run)
   - [Firewall and SELinux handling](#firewall-and-selinux-handling)
   - [Security notes](#security-notes)
 - [Known Issues](#known-issues)
@@ -123,7 +124,7 @@ Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and Seawe
 
 - If `swfs-save-version.txt` is present in the same directory as `install-seaweedfs`, air-gapped install mode activates automatically (this file is bundled in the archive and extracted alongside the script). The sentinel is sanity-checked: if it is present but the image archives are missing, install aborts with instructions; set `SWFS_FORCE_ONLINE=true` to ignore a stale sentinel.
 - If `-registry` is specified, containers are pulled from the local registry instead of Docker Hub
-- Re-running `install` reconciles instead of duplicating: Samba/NFS config blocks are marker-tagged and replaced (never appended twice), changed bind-mounted configs (Caddyfile, monitoring configs) trigger a restart of the affected container, and features toggled off since the previous install (`ENABLE_MQ`, `ENABLE_MONITORING`, `ENABLE_SMB`, `ENABLE_NFS`) are torn down (`--remove-orphans` plus recorded-state cleanup)
+- Re-running `install` reconciles instead of duplicating: Samba/NFS config blocks are marker-tagged and replaced (never appended twice), changed bind-mounted configs (Caddyfile, monitoring configs) trigger a restart of the affected container, Samba and NFS are left running unless something changed (see [Samba and NFS on a re-run](#samba-and-nfs-on-a-re-run)), and features toggled off since the previous install (`ENABLE_MQ`, `ENABLE_MONITORING`, `ENABLE_SMB`, `ENABLE_NFS`) are torn down (`--remove-orphans` plus recorded-state cleanup)
 - When **firewalld** (Rocky/RHEL, openSUSE Leap) or **UFW** (Ubuntu) is active, the ports for the enabled services are opened and recorded — see [Firewall and SELinux handling](#firewall-and-selinux-handling)
 - When **SELinux is enforcing** and SMB is enabled, the `samba_share_fusefs` boolean is set (prior value recorded for uninstall)
 - Samba and NFS server package installs log their output to `seaweedfs-install.log` (and the console with `DEBUG=1`); a failed install stops the run and prints the last lines of that output. With SMB enabled, `install` validates the generated `smb.conf` with `testparm -s` **before** restarting Samba (a bad config never takes down a running `smbd`), checks that the share was loaded, and fails unless the Samba service is active and listening on 445 after the restart
@@ -387,8 +388,26 @@ The script exits `0` only when the requested operation actually succeeded. Criti
 | `SELINUX_SAMBA_FUSEFS_PRIOR` | Prior value of the boolean, if this installer changed it |
 | `REGISTRY_LOGIN` / `LOADED_IMAGES` / `LOADED_MONITORING_IMAGES` | Registry session and images for uninstall cleanup |
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_KEYS_USER` | The S3 key pair this install configured, and its user, kept for a re-run that passes no keys (since 1.1.0) |
+| `SCRIPT_VERSION` | The release of `install-seaweedfs` that last finished an `install` or `join` on this host (since 1.3.0). Written as the last step, so a failed run leaves the previous one |
 
 Uninstall and re-install reconciliation read this file; deleting it degrades uninstall to the conservative legacy fallback (evidence-based, never removes user accounts).
+
+### Samba and NFS on a re-run
+
+A re-run with the same settings leaves Samba and the NFS server running, so SMB sessions and NFS clients carry on
+(since 1.3.0; before, every run restarted both). Each run decides for each service:
+
+| What the run finds | Samba | NFS |
+|:----|:----|:----|
+| Nothing changed, service running | Left alone | Left alone |
+| Its config changed (`smb.conf`'s share, `/etc/exports`' line) | Reloaded (`systemctl reload`): open sessions stay. A failed reload falls back to a restart | Re-exported (`exportfs -ra`), no restart |
+| The service isn't running | Started | Exported and started |
+| This run replaced the `/mnt/seaweed` mount (compose recreated `seaweed-mount`, for a new image say) | Restarted | Re-exported and restarted |
+
+A replaced mount needs the restart because both would otherwise keep serving the old one, whose clients have already
+lost it. The log says which case applied ("Samba: no change, left running.", "NFS: export changed, re-exporting it").
+A changed SMB password takes effect without a restart. A reload applies a changed `valid users` to new connections,
+and Samba may close an open session the new setting no longer allows.
 
 ### Firewall and SELinux handling
 

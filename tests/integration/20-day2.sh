@@ -24,6 +24,23 @@ started() { docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null; 
 md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
 # Rocky's image has Cockpit on 9090, which Prometheus needs. 10-lifecycle.sh frees it; this does too, when run alone.
 systemctl disable --now cockpit.socket >/dev/null 2>&1 || true
+state_value() { sed -n "s/^$1=//p" /opt/seaweedfs/.install-state 2>/dev/null; }
+smb_pid() { systemctl show -p MainPID --value "$(state_value SMB_SERVICE_NAME)"; }
+nfs_started() { systemctl show -p ActiveEnterTimestamp --value "$(state_value NFS_SERVICE_NAME)"; }
+# S15: an SMB session held open across a re-run. smbclient reads its commands from a FIFO, and writes its output when
+# it exits. end_smb sends a second listing and is true when both listings came back with no NT_STATUS error.
+hold_smb() {
+  mkdir -p "$W/hold"; rm -f "$W/hold/in" "$W/hold/out"; mkfifo "$W/hold/in"; exec 7<>"$W/hold/in"
+  docker rm -f smbhold >/dev/null 2>&1
+  docker run -d --name smbhold --network host -v "$W/hold:/w" alpine:3.20 sh -c \
+    "apk add -q --no-cache samba-client >/dev/null 2>&1 && smbclient -m SMB3 //$IP/artifacts -U '$1%$2' < /w/in > /w/out 2>&1" >/dev/null
+  for _ in $(seq 1 60); do smbstatus -b 2>/dev/null | grep -q " $1 " && break; sleep 1; done
+  echo ls >&7
+}
+end_smb() {
+  echo ls >&7; echo exit >&7; timeout 30 docker wait smbhold >/dev/null 2>&1; exec 7>&-; docker rm -f smbhold >/dev/null 2>&1
+  [ "$(grep -c 'blocks of size' "$W/hold/out")" = 2 ] && ! grep -q NT_STATUS "$W/hold/out"
+}
 
 echo "=== S10: no MGMT_IP"
 mkdir -p "$W/stub"
@@ -44,10 +61,30 @@ grep -q '"accessKey"' "$LOG" && bad "the log has the raw S3 identity output" || 
 ( source /opt/seaweedfs/monitoring-credentials.env
   code=$(curl -s -m 10 --cacert "$MONITORING_S3_CA" --aws-sigv4 aws:amz:us-east-1:s3 --user "$MONITORING_S3_ACCESS_KEY:$MONITORING_S3_SECRET_KEY" -o /dev/null -w '%{http_code}' "$MONITORING_S3_ENDPOINT/")
   [ "$code" = 200 ] ) && ok "the monitoring credentials file's S3 endpoint and CA work" || bad "the monitoring credentials file's S3 endpoint or CA doesn't work"
+v=$(sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p' install-seaweedfs)
+[ -n "$v" ] && [ "$(state_value SCRIPT_VERSION)" = "$v" ] && ok "S16: .install-state records SCRIPT_VERSION=$v" || bad "S16: .install-state has SCRIPT_VERSION='$(state_value SCRIPT_VERSION)'"
+hold_smb admin "$P1"; sp=$(smb_pid); ns=$(nfs_started)
 cf=$(md5 /opt/caddy/Caddyfile); st=$(started)
 inst SWFS_PASSWORD=$P1 S3_ACCESS_KEY=$K1 S3_SECRET_KEY=$S1 && ok "identical re-run" || { bad "identical re-run"; show; }
 [ "$(md5 /opt/caddy/Caddyfile)" = "$cf" ] && ok "an identical re-run leaves the Caddyfile alone" || bad "an identical re-run changed the Caddyfile"
 [ "$(started)" = "$st" ] && ! grep -q "restarting seaweed-caddy" "$W/o" && ok "an identical re-run doesn't restart Caddy" || bad "an identical re-run restarted Caddy"
+[ "$(smb_pid)" = "$sp" ] && ok "S15: an identical re-run doesn't restart Samba" || bad "S15: Samba restarted ($sp, now $(smb_pid))"
+[ "$(nfs_started)" = "$ns" ] && ok "S15: an identical re-run doesn't restart the NFS server" || bad "S15: the NFS server restarted"
+end_smb && ok "S15: an SMB session open across the re-run still works" || { bad "S15: the open SMB session broke"; tail -3 "$W/hold/out"; }
+grep -q 'Samba: no change' "$W/o" && grep -q 'NFS: no change' "$W/o" && ok "S15: the log says Samba and NFS were left alone" || bad "S15: the log doesn't say so"
+
+echo "=== S15: a changed share and export reload and re-export, with no restart"
+sp=$(smb_pid); ns=$(nfs_started)
+inst SWFS_PASSWORD=$P1 S3_ACCESS_KEY=$K1 S3_SECRET_KEY=$S1 SWFS_USER=s15user NFS_CLIENTS="$IP" && ok "re-run with a new SMB user and NFS client" || { bad "re-run with a new SMB user and NFS client"; show; }
+grep -q 'valid users = s15user' /etc/samba/smb.conf && grep -q "^/mnt/seaweed $IP(" /etc/exports && ok "smb.conf and /etc/exports changed" || bad "smb.conf or /etc/exports didn't change"
+grep -q 'Samba: configuration changed, reloading' "$W/o" && [ "$(smb_pid)" = "$sp" ] && ok "S15: Samba reloaded, not restarted" || bad "S15: Samba wasn't reloaded in place ($sp, now $(smb_pid))"
+grep -q 'NFS: export changed, re-exporting' "$W/o" && [ "$(nfs_started)" = "$ns" ] && ok "S15: the export changed without an NFS restart" || bad "S15: NFS wasn't re-exported in place"
+exportfs -v | grep -q "^/mnt/seaweed" && exportfs -v | grep -A1 '^/mnt/seaweed' | grep -q "$IP" && ok "S15: the new export is live" || bad "S15: the new export isn't live: $(exportfs -v | tr '\n' ' ')"
+
+echo "=== S15: a stopped NFS server is started"
+systemctl stop "$(state_value NFS_SERVICE_NAME)"
+inst SWFS_PASSWORD=$P1 S3_ACCESS_KEY=$K1 S3_SECRET_KEY=$S1 SWFS_USER=s15user NFS_CLIENTS="$IP" && ok "re-run with NFS stopped" || { bad "re-run with NFS stopped"; show; }
+systemctl is-active --quiet "$(state_value NFS_SERVICE_NAME)" && grep -q 'NFS: not running' "$W/o" && ok "S15: the re-run started NFS" || bad "S15: NFS is still stopped"
 
 echo "=== New password and keys (S3, S7), revoking a key (SC1), re-runs with no keys (S11)"
 st=$(started)
