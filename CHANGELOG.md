@@ -1,6 +1,6 @@
 # Changelog — seaweedfs-installer
 
-## v1.3.0 — unreleased — Samba and NFS stay up on a re-run; the release in .install-state
+## v1.3.0 — 2026-11-11 — Samba and NFS stay up on a re-run; the release in .install-state
 
 Spec 18 (chubtoad-automation), asked for by object-tech-ops' Phase B, which re-runs the installer on every update.
 
