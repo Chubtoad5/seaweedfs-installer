@@ -386,8 +386,13 @@ configure_s3_credentials() {
     "$S3_ACCESS_KEY" "$S3_SECRET_KEY" "$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>&1)
   # The output lists every identity with its keys, so the log gets it only on failure, and masked. A failure is weed's
   # own error line, or the new key missing from the identities it prints, so a key in the output can't pass for one.
-  if weed_shell_failed "$shell_out" \
-      || ! sed -nE 's/.*"accessKey":[[:space:]]*"([^"]*)".*/\1/p' <<< "$shell_out" | grep -qxF -- "$S3_ACCESS_KEY"; then
+  # The key is looked for only when it's plain characters, which weed's JSON never escapes (& < > can come out as \u0026)
+  local key_missing=0
+  if [[ "$S3_ACCESS_KEY" =~ ^[A-Za-z0-9+/=._-]+$ ]] \
+      && ! sed -nE 's/.*"accessKey":[[:space:]]*"([^"]*)".*/\1/p' <<< "$shell_out" | grep -qxF -- "$S3_ACCESS_KEY"; then
+    key_missing=1
+  fi
+  if weed_shell_failed "$shell_out" || [[ $key_missing -eq 1 ]]; then
     echo "$shell_out" | mask_s3_keys >> "$LOG_FILE"
     die "S3 credential configuration failed (see $LOG_FILE)."
   fi
@@ -1273,11 +1278,17 @@ sh_value() {
   if [[ "$1" =~ ^[A-Za-z0-9]+$ ]]; then printf '%s' "$1"; else local v=${1//\'/\'\\\'\'}; printf "'%s'" "$v"; fi
 }
 
+# weed_key_changes <key>: true when weed's shell would change this S3 key (S24): a space, ;, a quote, a backslash or a
+# control character
+weed_key_changes() {
+  [[ "$1" == *[[:space:]\;\"\'\\]* || "$1" == *[[:cntrl:]]* ]]
+}
+
 # check_secrets: spec 21's checks, before anything is stopped or changed (rule 7). Each message names the variable and
 # never shows its value. Any SWFS_PASSWORD of printable characters works; keys and user names get the narrower rules
 # of the places they go.
 check_secrets() {
-  local bad=0 k user_re='^[a-z_][a-z0-9_-]{0,31}$' user_rule="lowercase letters, digits, _ and -, starting with a letter or _ (Samba needs it as a Linux account)"
+  local bad=0 k user_re='^[A-Za-z_][A-Za-z0-9_.-]{0,31}$' user_rule="letters, digits, _, . and -, starting with a letter or _ (Samba needs it as a Linux account)"
   if [[ "$SWFS_PASSWORD" == *[[:cntrl:]]* ]]; then
     echo "Error: SWFS_PASSWORD can't contain a control character, such as a tab or a newline."; bad=1
   elif (( ${#SWFS_PASSWORD} > 128 )); then
@@ -1290,19 +1301,19 @@ check_secrets() {
   if [[ ! "$SWFS_USER" =~ $user_re ]]; then
     echo "Error: SWFS_USER can only have $user_rule."; bad=1
   fi
-  # S24: weed shell splits a line on ; before its own quoting, then strips quotes and backslashes, so keys are limited
-  # to what it carries. Generated keys (hex) always fit.
-  if [[ -n "$S3_ACCESS_KEY" && ! "$S3_ACCESS_KEY" =~ ^[A-Za-z0-9]+$ ]]; then
-    echo "Error: S3_ACCESS_KEY can only have letters and digits, which weed's own shell carries exactly."; bad=1
-  fi
-  if [[ -n "$S3_SECRET_KEY" && ! "$S3_SECRET_KEY" =~ ^[A-Za-z0-9+/=._-]+$ ]]; then
-    echo "Error: S3_SECRET_KEY can only have letters, digits and + / = . _ -, which weed's own shell carries exactly."; bad=1
-  fi
+  # S24: weed shell splits a line at spaces and at ; before its own quoting, then strips quotes and backslashes, so a key
+  # with any of those is refused. Everything else reaches weed as written. Generated keys (hex) always fit.
+  local name
+  for name in S3_ACCESS_KEY S3_SECRET_KEY; do
+    if weed_key_changes "${!name}"; then
+      echo "Error: $name can't contain a space, ;, a quote, a backslash or a control character, which weed's own shell changes."; bad=1
+    fi
+  done
   local -a revoke_keys
   read -r -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS"
   for k in "${revoke_keys[@]}"; do
-    if [[ ! "$k" =~ ^[A-Za-z0-9]+$ ]]; then
-      echo "Error: S3_REVOKE_ACCESS_KEYS can only list access keys of letters and digits."; bad=1; break
+    if weed_key_changes "$k"; then
+      echo "Error: S3_REVOKE_ACCESS_KEYS lists a key with ;, a quote, a backslash or a control character, which weed's own shell changes."; bad=1; break
     fi
   done
   if [[ $REGISTRY_MODE -eq 1 || $PUSH_MODE -eq 1 ]]; then

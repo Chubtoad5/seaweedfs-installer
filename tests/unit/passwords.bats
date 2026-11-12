@@ -164,29 +164,40 @@ mini_command() { python3 -I -c 'import sys, yaml; d = yaml.safe_load(open(sys.ar
 @test "S24, S26: keys outside the rule, a bad user name and a bad password are refused before anything changes" {
   local k
   SWFS_PASSWORD=changeme
-  for k in 'AK IA' ' AKIA' 'AK;IA' 'AK"IA' "AK'IA" 'AK\IA' 'AK*' 'AK-IA'; do
+  for k in 'AK IA' ' AKIA' 'AK;IA' 'AK"IA' "AK'IA" 'AK\IA'; do
     S3_ACCESS_KEY=$k S3_SECRET_KEY=abc
     run check_secrets
     [ "$status" -eq 1 ]
-    [[ "$output" == *"S3_ACCESS_KEY can only have letters and digits"* && "$output" == *"Nothing has been changed"* ]]
+    [[ "$output" == *"S3_ACCESS_KEY can't contain"* && "$output" == *"Nothing has been changed"* ]]
   done
-  for k in 'ab c' 'ab;c' 'ab"c' "ab'c" 'ab\c' 'ab#c'; do
+  for k in 'ab c' 'ab;c' 'ab"c' "ab'c" 'ab\c'; do
     S3_ACCESS_KEY=AKIA S3_SECRET_KEY=$k
     run check_secrets
     [ "$status" -eq 1 ]
-    [[ "$output" == *"S3_SECRET_KEY can only have"* ]]
+    [[ "$output" == *"S3_SECRET_KEY can't contain"* ]]
     [[ "$output" != *"$k"* ]]
   done
-  S3_ACCESS_KEY="" S3_SECRET_KEY="" S3_REVOKE_ACCESS_KEYS='good1 b*d'
+  # What weed carries as written still works, as it did before: - _ . # @ and the rest
+  for k in 'AK-IA' 'velero_user.1' 'MySecret@123' 'ab#c' 'a+b/c=' '!$%&*()'; do
+    S3_ACCESS_KEY=$k S3_SECRET_KEY=$k
+    check_secrets
+  done
+  S3_ACCESS_KEY="" S3_SECRET_KEY="" S3_REVOKE_ACCESS_KEYS='good1 b;d'
   run check_secrets
   [ "$status" -eq 1 ]
   [[ "$output" == *"S3_REVOKE_ACCESS_KEYS"* ]]
+  S3_REVOKE_ACCESS_KEYS='good1 b-d'
+  check_secrets
   S3_REVOKE_ACCESS_KEYS=""
-  ENABLE_SMB=true SWFS_USER=Admin
-  run check_secrets
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"SWFS_USER can only have lowercase"* ]]
-  ENABLE_SMB=false
+  ENABLE_SMB=true
+  for u in Admin ops.admin _svc s15user; do SWFS_USER=$u; check_secrets; done
+  for u in 1admin ad:min 'ad min' -admin; do
+    SWFS_USER=$u
+    run check_secrets
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"SWFS_USER can only have letters, digits, _, . and -"* ]]
+  done
+  ENABLE_SMB=false SWFS_USER=admin
   check_secrets
   SWFS_USER='ad min'
   run check_secrets

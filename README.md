@@ -274,7 +274,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `DEBUG` | `1` | When disabled (`0`), sub-step output (Docker setup, package installs) is kept off the console; package-install output still goes to `seaweedfs-install.log` |
 | `SWFS_IMAGE` | `chrislusf/seaweedfs:4.30` | Container image for SeaweedFS (pinned for reproducible online/air-gapped installs; override to track a newer release) |
 | `CADDY_IMAGE` | `caddy:2.11.3` | Container image for Caddy (pinned; override to track a newer release) |
-| `SWFS_USER` | `admin` | Username for Admin UI, Filer, Master, and Caddy basic auth. With SMB on it is also a Linux account: lowercase letters, digits, `_` and `-`, starting with a letter or `_`. With SMB off: letters, digits and `. _ @ + -` |
+| `SWFS_USER` | `admin` | Username for Admin UI, Filer, Master, and Caddy basic auth. With SMB on it is also a Linux account: letters, digits, `_`, `.` and `-`, starting with a letter or `_`. With SMB off: letters, digits and `. _ @ + -` |
 | `SWFS_PASSWORD` | `changeme` | Password for Admin UI, Filer, Master, SMB, Grafana and Caddy basic auth. Any printable characters, up to 128 (spec 21) |
 | `HOST_FQDN` | `$(hostname).edge.lab` | FQDN for the host (e.g. `myhost.mydomain.com`) |
 | `SWFS_ADMIN_FQDN` | `admin.$HOST_FQDN` | FQDN for the Admin UI and Caddy landing page |
@@ -296,8 +296,8 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `EXTRA_BUCKETS` | `""` | Space-separated list of additional S3 bucket names to create at install time. Useful for pre-creating per-cluster Velero buckets when the cluster inventory is known. Buckets are deduplicated against `S3_BUCKET` and `LOKI_BUCKET`. |
 | `S3_USER` | `$SWFS_USER` | S3 API username |
 | `S3_ACCESS_KEY` | *(kept, or randomly generated)* | S3 access key. Unset, a re-run keeps the pair the last install recorded for this `S3_USER`, and a first install generates one (`openssl rand -hex 8`). A new key is added: the old one keeps working until it is revoked |
-| `S3_SECRET_KEY` | *(kept, or randomly generated)* | S3 secret key, as `S3_ACCESS_KEY` (`openssl rand -hex 16`). Letters, digits and `+ / = . _ -` only, because `weed shell` can't carry other characters exactly; an access key is letters and digits only. A generated pair always fits |
-| `S3_REVOKE_ACCESS_KEYS` | *(empty)* | Space-separated access keys (letters and digits) to delete from `S3_USER` once this run's key is configured. A key the user doesn't have is left as it is. The run refuses to revoke the key it is configuring |
+| `S3_SECRET_KEY` | *(kept, or randomly generated)* | S3 secret key, as `S3_ACCESS_KEY` (`openssl rand -hex 16`). Neither key can contain a space, `;`, a quote, a backslash or a control character, which `weed shell` changes. A generated pair always fits |
+| `S3_REVOKE_ACCESS_KEYS` | *(empty)* | Space-separated access keys to delete from `S3_USER` once this run's key is configured. A key the user doesn't have is left as it is. The run refuses to revoke the key it is configuring |
 | `ARTIFACTS_TO_DOWNLOAD` | `""` | Space-separated list of URLs to download and upload to the default Filer path |
 | `VOLUME_INDEX` | `""` | Optional volume index mode `[memory\|leveldb\|leveldbMedium\|leveldbLarge]`. `leveldb` lowers volume-server RAM for many small files on edge hosts. Empty = `weed mini` default (`memory`). |
 | `VOLUME_SIZE_LIMIT_MB` | `""` | Optional cap (MB) after which the master stops directing writes to a volume. Empty = `weed mini` auto-sizing (64–1024 MB). |

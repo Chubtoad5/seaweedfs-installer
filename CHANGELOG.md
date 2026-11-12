@@ -23,8 +23,9 @@ Spec 21 (chubtoad-automation).
   argon2id, with the password on stdin rather than in `ps`, and the Caddyfile says `basic_auth argon2id`.
 - **S3 keys reach `weed shell` exactly, or are refused** (S24). A key with a space or a leading space configured nothing
   while the step said it had; `;` cut the line in two; `\` and matched quotes were stripped, so requests failed their
-  signature check. Keys now follow the rule below, go in quotes, and the step fails on weed's own error line or when
-  the new key is missing from the identities weed prints, not on `error` or `failed` anywhere in the output.
+  signature check. Now a key with a space, `;`, a quote, a backslash or a control character is refused before anything
+  changes, and every other key goes in quotes as written. The step fails on weed's own error line, or when a plain key
+  is missing from the identities weed prints, not on `error` or `failed` anywhere in the output.
 - **Loki's config and `monitoring-credentials.env` carry the keys exactly** (S25): YAML single quotes and shell single
   quotes, for a key that isn't only letters and digits. Those files are byte-identical for keys that are.
 - **`S3_REVOKE_ACCESS_KEYS` isn't globbed** (S26), so a `*`, `?` or `[` can't revoke other keys.
@@ -33,10 +34,10 @@ Spec 21 (chubtoad-automation).
 
 ### Changed
 - **Checked before anything changes, each message naming the variable but never its value:** `SWFS_PASSWORD` with a
-  control character or over 128 characters; `SWFS_USER` outside what `useradd` takes (lowercase letters, digits, `_`
-  and `-`) with SMB on, or outside letters, digits and `. _ @ + -` with it off; an `S3_ACCESS_KEY` that isn't letters
-  and digits, an `S3_SECRET_KEY` outside letters, digits and `+ / = . _ -`, and the same for the keys to revoke; a
-  registry user with `:` or a space at either end. Generated keys always fit.
+  control character or over 128 characters; `SWFS_USER` outside letters, digits, `_`, `.` and `-` starting with a letter
+  or `_` with SMB on (a Linux account), or outside letters, digits and `. _ @ + -` with it off; an S3 key, or a key to
+  revoke, that weed's shell would change (above); a registry user with `:` or a space at either end. Each of these
+  failed or came out changed before, so nothing that worked stops working. Generated keys always fit.
 - **On the first run of v1.4.0 over an earlier release with monitoring on,** Grafana's admin password is set to
   `SWFS_PASSWORD` once, because there's no fingerprint yet. A password changed in Grafana's own UI is replaced then.
 - **An existing install keeps its bcrypt hash** while the password is the same, so the Caddyfile and Caddy are left as
