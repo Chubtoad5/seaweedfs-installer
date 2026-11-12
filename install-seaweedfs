@@ -1244,7 +1244,8 @@ auth_fingerprint() {
 # were globbed. This one does what the image's does for 'mini' (FIPS 140-3 mode on; as root, /data given to the image's
 # seaweed user when it isn't theirs, then weed run as that user) and passes the arguments whole. An image with no
 # su-exec or seaweed user runs weed as root, as its own entrypoint did. The image's /bin/sh reads it from a read-only
-# mount, so the host file needs no exec permission.
+# mount, so the host file needs no exec permission. A running seaweed-mini reads it only when it starts: a release that
+# changes this script but not the compose file must restart seaweed-mini itself (v1.3.1's compose change recreates it).
 write_weed_entrypoint () {
   cat > /opt/seaweedfs/weed-entrypoint.sh <<'WEED_ENTRYPOINT'
 #!/bin/sh
@@ -1843,7 +1844,7 @@ The following services are accessible by IP or FQDN if DNS is configured:
 To run weed commands:  docker exec -it seaweed-mini weed <command>
 To run caddy commands: docker exec -it seaweed-caddy caddy <command>
 To download the Root CA (if required): curl -k https://$SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT/ca.crt -o seaweedfs-root-ca.crt (on the host: /opt/caddy/data/caddy/pki/authorities/local/root.crt)
-To mount SMB share from Windows: 'net use Z: \\\\$HOST_FQDN\\$DEFAULT_FILER_DIR_NAME $SWFS_PASSWORD /USER:$SWFS_USER /PERSISTENT:YES'
+To mount SMB share from Windows: 'net use Z: \\\\$HOST_FQDN\\$DEFAULT_FILER_DIR_NAME "$SWFS_PASSWORD" /USER:$SWFS_USER /PERSISTENT:YES'
 To mount NFS share: 'sudo mount -t nfs -o vers=3 $HOST_FQDN:/mnt/seaweed /mnt/nfs'
 
 Master UI, Filer UI, and Admin UI require authentication:

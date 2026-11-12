@@ -85,6 +85,25 @@ S3_SECRET_KEY="$(openssl rand -hex 16)"
 sudo mkdir -p /opt/caddy/data /opt/caddy/config
 sudo chmod 700 /opt/caddy/data   # holds the Caddy CA private key
 sudo mkdir -p /opt/seaweedfs/mini
+sudo chmod 700 /opt/seaweedfs    # weed saves its flags, the admin password among them, to mini/mini.options, mode 644
+```
+
+`seaweed-mini` starts through this script rather than the image's `/entrypoint.sh`, which passes its arguments to weed
+unquoted: an admin password with a space would reach the Admin UI as its first word only, and `*`, `?` and `[` would be
+globbed. It does what the image's script does for `mini`, and passes the arguments whole.
+
+```bash
+sudo tee /opt/seaweedfs/weed-entrypoint.sh > /dev/null <<'EOF'
+#!/bin/sh
+export GODEBUG="${GODEBUG:+$GODEBUG,}fips140=on"
+if [ "$(id -u)" = "0" ] && id seaweed >/dev/null 2>&1 && command -v su-exec >/dev/null 2>&1; then
+  if [ "$(stat -c %u:%g /data 2>/dev/null)" != "$(id -u seaweed):$(id -g seaweed)" ]; then
+    chown -R seaweed:seaweed /data || echo "Warning: Failed to change ownership of /data." >&2
+  fi
+  exec su-exec seaweed /usr/bin/weed -logtostderr=true "$@"
+fi
+exec /usr/bin/weed -logtostderr=true "$@"
+EOF
 ```
 
 ---
@@ -168,6 +187,7 @@ services:
   seaweed-mini:
     image: chrislusf/seaweedfs:4.30
     container_name: seaweed-mini
+    entrypoint: ["/bin/sh", "/weed-entrypoint.sh"]
     command: >
       mini
       -admin.user "${SWFS_USER}"
@@ -176,6 +196,7 @@ services:
       -webdav=false
     volumes:
       - /opt/seaweedfs/mini:/data
+      - /opt/seaweedfs/weed-entrypoint.sh:/weed-entrypoint.sh:ro
     networks:
       - seaweed_net
     restart: unless-stopped
