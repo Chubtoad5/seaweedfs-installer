@@ -31,7 +31,8 @@ MO=/opt/seaweedfs/mini/mini.options
 # first login user) can read it
 private() {
   local uid
-  grep -qF -- "admin.password=$P" "$MO" 2>/dev/null && ok "$1: mini.options holds the whole password" || bad "$1: mini.options doesn't hold the whole password"
+  # weed quotes a value with a space in it: admin.password="Test Pass*?[1"
+  grep -qxF -e "admin.password=$P" -e "admin.password=\"$P\"" -- "$MO" 2>/dev/null && ok "$1: mini.options holds the whole password" || bad "$1: mini.options doesn't hold the whole password"
   for uid in 65534 "$(docker exec seaweed-mini id -u seaweed 2>/dev/null || echo 1000)"; do
     if setpriv --reuid="$uid" --regid="$uid" --clear-groups cat "$MO" >/dev/null 2>&1; then
       bad "$1: uid $uid can read mini.options ($(stat -c '%a' /opt/seaweedfs 2>/dev/null) on /opt/seaweedfs)"
