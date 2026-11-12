@@ -134,7 +134,9 @@ Installs Docker, SeaweedFS, Caddy, and optionally the monitoring stack and Seawe
 | Path | Contents |
 |:-----|:---------|
 | `/opt/seaweedfs/seaweedfs-compose.yaml` | Docker Compose file for SeaweedFS, Caddy, SeaweedMQ, and FUSE mount |
+| `/opt/seaweedfs/` | Root-only (mode 700) since 1.3.1, so nothing below it is readable by other users. That includes `mini/mini.options`, where weed saves its flags (the admin password among them) at every start with mode 644 |
 | `/opt/seaweedfs/mini/` | All SeaweedFS user data |
+| `/opt/seaweedfs/weed-entrypoint.sh` | How `seaweed-mini` starts (since 1.3.1): it does what the image's `/entrypoint.sh` does for `mini`, and passes the arguments whole. See [Security notes](#security-notes) |
 | `/opt/seaweedfs/monitoring-credentials.env` | S3/Loki/Prometheus credentials for external agents (when monitoring is enabled; mode 600) |
 | `/opt/seaweedfs/.install-state` | Install-state record used by uninstall/re-install (mode 600) — see [Install-state file](#install-state-file) |
 | `/opt/caddy/Caddyfile` | Caddy reverse proxy configuration |
@@ -167,6 +169,7 @@ DEFAULT_FILER_DIR_NAME=share ENABLE_MONITORING=false NFS_CLIENTS=10.0.0.0/24 ./i
 - **Installs from before the install-state file** (no `/opt/seaweedfs/.install-state`): the port preflight recognises ports held by this installer's own `seaweed-*` containers and treats the run as an upgrade — no need to stop the stack first.
 - **Image tags:** `install` doesn't pull a newer image under a tag it already has, so re-running with the same tag (for example `latest`) keeps the image you have. To move to a newer release, set `SWFS_IMAGE` or `CADDY_IMAGE` to the new tag.
 - **From before 1.1.0:** the first re-run restarts Caddy once, because the stored password hash doesn't exist yet. It also makes the compose files and the Caddyfile mode 600, and removes the credentials earlier runs left in `seaweedfs-install.log`, keeping the latest.
+- **From before 1.3.1:** the first re-run recreates `seaweed-mini` once, for its new entrypoint, a short pause for the Admin UI, Filer and S3. Caddy, the mount, Samba and NFS keep running. An admin password with a space, `*`, `?` or `[` now reaches the Admin UI whole: before, it took only the password's first word, and weed ignored every `weed mini` flag after it (`-webdav=false`, and the tuning and cluster flags). The re-run also makes `/opt/seaweedfs` mode 700.
 - **Caddy CA:** older installs kept Caddy's CA inside the container, so any recreate produced a new CA. On the first run of this version the existing CA and certificates are copied to `/opt/caddy/data` before the container is recreated, so clients that already trust it keep working; from then on it persists.
 
 #### `save`
@@ -421,6 +424,9 @@ and Samba may close an open session the new setting no longer allows.
 - The install log (`seaweedfs-install.log`) contains the full credentials and is written mode **600**; the console output masks passwords and S3 keys. Uninstall removes the install log.
 - The Caddy landing page sits behind the Admin UI login by default (`SPLASH_REQUIRE_LOGIN=true`) and never embeds a password or S3 key — the Windows `net use` example uses `*` to prompt for it. `/ca.crt` serves only Caddy's public root certificate (the route is pinned to that one file; the CA private key is not reachable).
 - `docker login` uses `--password-stdin`; registry passwords are not echoed.
+- **The admin password reaches weed whole (1.3.1).** The `chrislusf/seaweedfs` image's `/entrypoint.sh` passes its arguments to weed unquoted, so a password with a space was split, and `*`, `?` and `[` were globbed. `seaweed-mini` starts through `/opt/seaweedfs/weed-entrypoint.sh` instead, mounted read-only and run by the image's `/bin/sh`. It does what the image's does for `mini`: FIPS 140-3 mode on (`GODEBUG=fips140=on`), `/data` given to the image's `seaweed` user (uid 1000) when it isn't theirs, then weed run as that user. The other containers keep the image's entrypoint, because nothing in their commands is quoted.
+- **`/opt/seaweedfs` is root-only (1.3.1).** weed writes `mini.options`, with the admin password, mode 644 at every start, and most of its data files 644 too. So `install` and `join` make `/opt/seaweedfs` mode 700 on every run. Two limits: the password is still on weed's command line, which any local user can see with `ps`, and weed runs as uid 1000, often the VM's first login user, who can reach the process's files through `/proc`.
+- **Passwords:** `SWFS_PASSWORD` can hold a space, `*`, `?` and `[` (tested). The installer doesn't check it, and these break the compose files, so avoid them: `$` (compose reads it as a variable), `"` and `\` (the compose command's quoting), and, with monitoring on, `#` after a space, `: ` or a trailing `:` (YAML, in Grafana's environment line).
 - `/opt/caddy/data/` holds the Caddy CA private key (mode 700, root). Uninstall removes it with the rest of `/opt/caddy`.
 - `/opt/monitoring/loki/loki-config.yaml` embeds the S3 keys and is readable only by the Loki container user (UID 10001) and root; monitoring data directories are owned per container user (Loki 10001, Prometheus 65534, Grafana 472, mode 750) instead of world-writable.
 
