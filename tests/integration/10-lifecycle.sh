@@ -57,14 +57,14 @@ for c in seaweed-mini seaweed-caddy; do [ "$(docker inspect -f '{{.State.Running
 code=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' "https://$IP:443/login"); [[ "$code" =~ ^[23] ]] && ok "the admin UI answers" || bad "the admin UI answered $code"
 within 60 admin_login "$P" && ok "S17: the Admin UI's login takes the whole password" || bad "S17: the Admin UI's login refuses the whole password"
 admin_login Aa1 && bad "S17: the Admin UI's login takes the password's first word" || ok "S17: the Admin UI's login refuses the first word alone"
-# S19, S20: compose itself reads both compose files back as the exact password ($$ is compose's own escape)
-cval() { docker compose -f "$1" config --format json 2>/dev/null | jq -r "$2" | sed 's/\$\$/$/g'; }
-[ "$(cval /opt/seaweedfs/seaweedfs-compose.yaml '.services["seaweed-mini"].command | .[index("-admin.password") + 1]')" = "$P" ] \
-  && ok "S19: compose reads weed's admin password back exactly" || bad "S19: compose reads weed's admin password back changed"
-[ "$(cval /opt/seaweedfs/seaweedfs-compose.yaml '.services["seaweed-mini"].command | length')" = 7 ] \
-  && ok "S19: weed's command has all 7 arguments, -webdav=false included" || bad "S19: weed's command lost arguments"
-[ "$(cval /opt/monitoring/docker-compose.yml '.services.grafana.environment.GF_SECURITY_ADMIN_PASSWORD')" = "$P" ] \
-  && ok "S20: compose reads Grafana's password back exactly" || bad "S20: compose reads Grafana's password back changed"
+# S19, S20: what compose delivered, read from the running containers (some test images have no jq): weed's command line,
+# and Grafana's environment
+margs=$(tr '\0' '\n' < "/proc/$(weed_pid)/cmdline" 2>/dev/null)
+[ "$(grep -A1 -xF -- '-admin.password' <<< "$margs" | tail -n 1)" = "$P" ] \
+  && ok "S19: weed got the admin password exactly from compose" || bad "S19: weed got a different admin password from compose"
+grep -qxF -- '-webdav=false' <<< "$margs" && ok "S19: weed got all its arguments, -webdav=false included" || bad "S19: weed's command lost arguments"
+genv=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' grafana 2>/dev/null | sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p')
+[ "$genv" = "$P" ] && ok "S20: Grafana got the password exactly from compose" || bad "S20: Grafana got a different password from compose"
 grep -q 'basic_auth argon2id {' /opt/caddy/Caddyfile && ok "S23: Caddy's login is argon2id" || bad "S23: Caddy's login isn't argon2id"
 # smb <password>: smbclient in an Alpine container lists the share as admin, the password in its environment (PASSWD)
 smb() { docker run --rm --network host -e PASSWD="$1" alpine:3.20 sh -c "apk add -q --no-cache samba-client >/dev/null 2>&1 && smbclient -m SMB3 //$IP/artifacts -U admin -c ls" >/dev/null 2>&1; }
