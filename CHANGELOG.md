@@ -1,5 +1,37 @@
 # Changelog — seaweedfs-installer
 
+## v1.3.1 — 2026-11-12 — The admin password reaches weed whole; /opt/seaweedfs is private
+
+Spec 20 (chubtoad-automation), asked for by dap-blueprints Plan 01's Q46, from object-tech-ops 1.2.1.0's P3.
+
+### Fixed
+- **An admin password with a space, `*`, `?` or `[` now reaches the Admin UI whole** (S17). The `chrislusf/seaweedfs`
+  image's `/entrypoint.sh` passes its arguments to weed unquoted (`exec /usr/bin/weed ... mini $ARGS $@`). So
+  `-admin.password "P@ss w0rd"` reached weed as `P@ss` and `w0rd`: the Admin UI took only `P@ss`, and weed stopped
+  reading flags at `w0rd`, ignoring `-webdav=false` and every tuning and cluster flag after it. `*`, `?` and `[` were
+  globbed. Caddy, the Filer, SMB and Grafana, which get the password separately, were fine.
+  - `seaweed-mini` now starts through `/opt/seaweedfs/weed-entrypoint.sh`, mounted read-only and run by the image's
+    `/bin/sh`. It does what the image's script does for `mini` and passes the arguments whole:
+    - FIPS 140-3 mode on;
+    - `/data` given to the image's `seaweed` user when it isn't theirs;
+    - weed run as that user.
+  - An image without `su-exec` runs weed as root, as its own entrypoint did.
+  - `seaweed-mq`, `seaweed-mount` and a volume node's `seaweed-volume` keep the image's entrypoint: nothing in their
+    commands is quoted.
+- **`/opt/seaweedfs` is root-only** (S18). weed saves its flags, the admin password among them, to
+  `/opt/seaweedfs/mini/mini.options` with mode 644 at every start, and most of its data files are 644. `install`
+  and `join` now make `/opt/seaweedfs` mode 700 on every run, so other users can't read them. The containers reach
+  their data through bind mounts and aren't affected.
+
+### Upgrading
+- The first re-run recreates `seaweed-mini` once (its compose definition changed): a short pause for the Admin UI,
+  Filer and S3. Caddy, `seaweed-mount`, Samba and NFS keep running.
+- An install whose password had a space gets the whole password in the Admin UI, and the flags it lost come back. A
+  command-line flag wins over the value weed saved in `mini.options`.
+
+### Not changed
+- The password is still on weed's command line, which any local user can see with `ps`.
+
 ## v1.3.0 — 2026-11-11 — Samba and NFS stay up on a re-run; the release in .install-state
 
 Spec 18 (chubtoad-automation), asked for by object-tech-ops' Phase B, which re-runs the installer on every update.
