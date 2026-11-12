@@ -274,8 +274,8 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `DEBUG` | `1` | When disabled (`0`), sub-step output (Docker setup, package installs) is kept off the console; package-install output still goes to `seaweedfs-install.log` |
 | `SWFS_IMAGE` | `chrislusf/seaweedfs:4.30` | Container image for SeaweedFS (pinned for reproducible online/air-gapped installs; override to track a newer release) |
 | `CADDY_IMAGE` | `caddy:2.11.3` | Container image for Caddy (pinned; override to track a newer release) |
-| `SWFS_USER` | `admin` | Username for Admin UI, Filer, Master, and Caddy basic auth |
-| `SWFS_PASSWORD` | `changeme` | Password for Admin UI, Filer, Master, and Caddy basic auth |
+| `SWFS_USER` | `admin` | Username for Admin UI, Filer, Master, and Caddy basic auth. With SMB on it is also a Linux account: lowercase letters, digits, `_` and `-`, starting with a letter or `_`. With SMB off: letters, digits and `. _ @ + -` |
+| `SWFS_PASSWORD` | `changeme` | Password for Admin UI, Filer, Master, SMB, Grafana and Caddy basic auth. Any printable characters, up to 128 (spec 21) |
 | `HOST_FQDN` | `$(hostname).edge.lab` | FQDN for the host (e.g. `myhost.mydomain.com`) |
 | `SWFS_ADMIN_FQDN` | `admin.$HOST_FQDN` | FQDN for the Admin UI and Caddy landing page |
 | `SWFS_MASTER_FQDN` | `master.$HOST_FQDN` | FQDN for the SeaweedFS Master service |
@@ -296,8 +296,8 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `EXTRA_BUCKETS` | `""` | Space-separated list of additional S3 bucket names to create at install time. Useful for pre-creating per-cluster Velero buckets when the cluster inventory is known. Buckets are deduplicated against `S3_BUCKET` and `LOKI_BUCKET`. |
 | `S3_USER` | `$SWFS_USER` | S3 API username |
 | `S3_ACCESS_KEY` | *(kept, or randomly generated)* | S3 access key. Unset, a re-run keeps the pair the last install recorded for this `S3_USER`, and a first install generates one (`openssl rand -hex 8`). A new key is added: the old one keeps working until it is revoked |
-| `S3_SECRET_KEY` | *(kept, or randomly generated)* | S3 secret key, as `S3_ACCESS_KEY` (`openssl rand -hex 16`) |
-| `S3_REVOKE_ACCESS_KEYS` | *(empty)* | Space-separated access keys to delete from `S3_USER` once this run's key is configured. A key the user doesn't have is left as it is. The run refuses to revoke the key it is configuring |
+| `S3_SECRET_KEY` | *(kept, or randomly generated)* | S3 secret key, as `S3_ACCESS_KEY` (`openssl rand -hex 16`). Letters, digits and `+ / = . _ -` only, because `weed shell` can't carry other characters exactly; an access key is letters and digits only. A generated pair always fits |
+| `S3_REVOKE_ACCESS_KEYS` | *(empty)* | Space-separated access keys (letters and digits) to delete from `S3_USER` once this run's key is configured. A key the user doesn't have is left as it is. The run refuses to revoke the key it is configuring |
 | `ARTIFACTS_TO_DOWNLOAD` | `""` | Space-separated list of URLs to download and upload to the default Filer path |
 | `VOLUME_INDEX` | `""` | Optional volume index mode `[memory\|leveldb\|leveldbMedium\|leveldbLarge]`. `leveldb` lowers volume-server RAM for many small files on edge hosts. Empty = `weed mini` default (`memory`). |
 | `VOLUME_SIZE_LIMIT_MB` | `""` | Optional cap (MB) after which the master stops directing writes to a volume. Empty = `weed mini` auto-sizing (64–1024 MB). |
@@ -307,7 +307,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `CLUSTER_REPLICATION` | *(empty)* | The master's default replication, for example `001` (two copies on different servers). Set it only once a second node has joined: a lone node has nowhere to put the copy, so writes would block. |
 | `CLUSTER_MASTER_GRPC_PORT` / `CLUSTER_VOLUME_PORT` / `CLUSTER_VOLUME_GRPC_PORT` | `19333` / `9340` / `19340` | The ports cluster mode and `join` publish. |
 | `SWFS_FORCE_ONLINE` | `false` | Ignore a `swfs-save-version.txt` sentinel in the working directory and stay in online mode (recover from a stale sentinel, e.g. on a build host that ran `save`). |
-| `IMAGE_PULL_PUSH_REF` | `v1.1.2` | The `images-pull-push` release (a tag, branch or commit) whose `image_pull_push.sh` is fetched into `utilities/`. A copy already there is reused only if it came from the same ref. Air-gapped, the bundle's copy is used and nothing is downloaded |
+| `IMAGE_PULL_PUSH_REF` | `v1.2.0` | The `images-pull-push` release (a tag, branch or commit) whose `image_pull_push.sh` is fetched into `utilities/`. A copy already there is reused only if it came from the same ref. Air-gapped, the bundle's copy is used and nothing is downloaded |
 | `IMAGE_PULL_PUSH_URL` | the ref's file on `raw.githubusercontent.com` | Full URL of `image_pull_push.sh`, for a mirror. Wins over `IMAGE_PULL_PUSH_REF` |
 | `IMAGE_PULL_PUSH_SHA256` | empty | Optional checksum of `image_pull_push.sh`. A mismatch stops the run |
 | `INSTALL_PACKAGES_REF` | `v1.1.3` | The `install-packages` release whose `install_packages.sh` is fetched, the same way. It's passed on to `image_pull_push.sh`, so one setting covers both helpers |
@@ -426,7 +426,10 @@ and Samba may close an open session the new setting no longer allows.
 - `docker login` uses `--password-stdin`; registry passwords are not echoed.
 - **The admin password reaches weed whole (1.3.1).** The `chrislusf/seaweedfs` image's `/entrypoint.sh` passes its arguments to weed unquoted, so a password with a space was split, and `*`, `?` and `[` were globbed. `seaweed-mini` starts through `/opt/seaweedfs/weed-entrypoint.sh` instead, mounted read-only and run by the image's `/bin/sh`. It does what the image's does for `mini`: FIPS 140-3 mode on (`GODEBUG=fips140=on`), `/data` given to the image's `seaweed` user (uid 1000) when it isn't theirs, then weed run as that user. The other containers keep the image's entrypoint, because nothing in their commands is quoted.
 - **`/opt/seaweedfs` is root-only (1.3.1).** weed writes `mini.options`, with the admin password, mode 644 at every start, and most of its data files 644 too. So `install` and `join` make `/opt/seaweedfs` mode 700 on every run. Two limits: the password is still on weed's command line, which any local user can see with `ps`, and weed runs as uid 1000, often the VM's first login user, who can reach the process's files through `/proc`.
-- **Passwords:** `SWFS_PASSWORD` can hold a space, `*`, `?` and `[` (tested). The installer doesn't check it, and these break the compose files, so avoid them: `$` (compose reads it as a variable), `"` and `\` (the compose command's quoting), and, with monitoring on, `#` after a space, `: ` or a trailing `:` (YAML, in Grafana's environment line).
+- **Passwords:** any `SWFS_PASSWORD` of printable characters works, up to 128: letters, digits, the space and every
+  symbol (spec 21). The compose files carry it as a single-quoted list item, with `$` written `$$`, so compose neither
+  splits nor rewrites it. Caddy keeps an argon2id hash of it, made with the password on stdin. Grafana takes a changed
+  password on the next run. A tab, a newline or anything longer is refused before anything changes.
 - `/opt/caddy/data/` holds the Caddy CA private key (mode 700, root). Uninstall removes it with the rest of `/opt/caddy`.
 - `/opt/monitoring/loki/loki-config.yaml` embeds the S3 keys and is readable only by the Loki container user (UID 10001) and root; monitoring data directories are owned per container user (Loki 10001, Prometheus 65534, Grafana 472, mode 750) instead of world-writable.
 

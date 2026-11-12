@@ -53,9 +53,13 @@ docker compose version
 Run these in your shell session before executing any commands below. All subsequent steps reference these variables.
 
 ```bash
-# Authentication
+# Authentication. Any password of printable characters works (spec 21): put it in single quotes, with a ' inside written
+# '\''. The user is also a Linux account for SMB: lowercase letters, digits, _ and -.
 SWFS_USER="admin"
-SWFS_PASSWORD="changeme"
+SWFS_PASSWORD='changeme'
+# The password as a single-quoted YAML value for compose files: ' written '' and $ written $$, which compose reads back
+# exactly. The compose files below use it, never the bare password.
+SWFS_PASSWORD_YAML="'$(printf '%s' "$SWFS_PASSWORD" | sed -e "s/'/''/g" -e 's/\$/$$/g')'"
 
 # Networking — replace with your server's actual IP and domain
 HOST_IP="$(hostname -I | awk '{print $1}')"
@@ -110,10 +114,11 @@ EOF
 
 ## 3. Generate Caddy Password Hash
 
-Caddy requires its own bcrypt-hashed password format. Use a temporary Caddy container to generate it:
+Caddy logs in against a hash of the password. Use a temporary Caddy container to make an argon2id one, with the
+password on stdin, so it never shows in `ps` (bcrypt, Caddy's default, takes no more than 72 bytes):
 
 ```bash
-CADDY_HASHED_PASSWORD=$(docker run --rm caddy:2.11.3 caddy hash-password --plaintext "${SWFS_PASSWORD}")
+CADDY_HASHED_PASSWORD=$(printf '%s\n' "$SWFS_PASSWORD" | docker run --rm -i caddy:2.11.3 caddy hash-password --algorithm argon2id)
 echo "Hashed password: ${CADDY_HASHED_PASSWORD}"
 ```
 
@@ -151,7 +156,7 @@ ${SWFS_FILER_FQDN}:8888, https://${HOST_IP}:8888 {
         reverse_proxy seaweed-mini:8888
     }
     handle /${FILER_DIR}* {
-        basic_auth {
+        basic_auth argon2id {
             ${SWFS_USER} ${CADDY_HASHED_PASSWORD}
         }
         reverse_proxy seaweed-mini:8888
@@ -160,7 +165,7 @@ ${SWFS_FILER_FQDN}:8888, https://${HOST_IP}:8888 {
 
 ${SWFS_MASTER_FQDN}:9333, https://${HOST_IP}:9333 {
     tls internal
-    basic_auth {
+    basic_auth argon2id {
         ${SWFS_USER} ${CADDY_HASHED_PASSWORD}
     }
     reverse_proxy seaweed-mini:9333
@@ -188,12 +193,15 @@ services:
     image: chrislusf/seaweedfs:4.30
     container_name: seaweed-mini
     entrypoint: ["/bin/sh", "/weed-entrypoint.sh"]
-    command: >
-      mini
-      -admin.user "${SWFS_USER}"
-      -admin.password "${SWFS_PASSWORD}"
-      -dir=/data
-      -webdav=false
+    # One list item each, so compose never splits or rewrites the password
+    command:
+      - 'mini'
+      - '-admin.user'
+      - '${SWFS_USER}'
+      - '-admin.password'
+      - ${SWFS_PASSWORD_YAML}
+      - '-dir=/data'
+      - '-webdav=false'
     volumes:
       - /opt/seaweedfs/mini:/data
       - /opt/seaweedfs/weed-entrypoint.sh:/weed-entrypoint.sh:ro
@@ -257,8 +265,10 @@ done
 docker exec seaweed-mini curl -X POST http://localhost:8888/${FILER_DIR}/
 
 # Configure S3 credentials
-echo "s3.configure -access_key=${S3_ACCESS_KEY} -secret_key=${S3_SECRET_KEY} -user=${S3_USER} -actions=Read,Write,List,Admin -apply=true" \
-  | docker exec -i seaweed-mini /usr/bin/weed shell
+# weed shell splits on ; and strips quotes and backslashes: keep keys to letters and digits (the secret key may also
+# have + / = . _ -). The quotes are weed's own.
+printf 's3.configure -access_key="%s" -secret_key="%s" -user=%s -actions=Read,Write,List,Admin -apply=true\n' \
+  "$S3_ACCESS_KEY" "$S3_SECRET_KEY" "$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell
 
 # Create the default S3 bucket
 echo "s3.bucket.create -name ${S3_BUCKET} -owner=${S3_USER}" \
@@ -358,7 +368,7 @@ grep -qx 'user_allow_other' /etc/fuse.conf 2>/dev/null || echo "user_allow_other
 # Create a system user for the SMB share; joins an existing group of the same name
 # (e.g. Ubuntu's 'admin' group), which would otherwise make useradd fail
 id ${SWFS_USER} &>/dev/null || sudo useradd -M -s /sbin/nologin $(getent group ${SWFS_USER} >/dev/null && echo "-g ${SWFS_USER}") ${SWFS_USER}
-(echo "${SWFS_PASSWORD}"; echo "${SWFS_PASSWORD}") | sudo smbpasswd -a -s ${SWFS_USER}
+printf '%s\n%s\n' "$SWFS_PASSWORD" "$SWFS_PASSWORD" | sudo smbpasswd -a -s ${SWFS_USER}
 ```
 
 ### 3. Configure Samba
@@ -782,7 +792,7 @@ services:
     restart: unless-stopped
     environment:
       - GF_SECURITY_ADMIN_USER=${SWFS_USER}
-      - GF_SECURITY_ADMIN_PASSWORD=${SWFS_PASSWORD}
+      - 'GF_SECURITY_ADMIN_PASSWORD=${SWFS_PASSWORD_YAML:1}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - /opt/monitoring/grafana/data:/var/lib/grafana

@@ -17,12 +17,12 @@ printf "#!/bin/bash\necho helper\n" > "$out"'
 }
 helper_sha() { printf '#!/bin/bash\necho helper\n' | sha256sum | cut -d' ' -f1; }
 
-@test "image_pull_push.sh comes from images-pull-push v1.1.2, by tag" {
+@test "image_pull_push.sh comes from images-pull-push v1.2.0, by tag" {
   run download_image_pull_push
   [ "$status" -eq 0 ]
-  called "curl -fsSL https://raw.githubusercontent.com/Chubtoad5/images-pull-push/v1.1.2/image_pull_push.sh"
+  called "curl -fsSL https://raw.githubusercontent.com/Chubtoad5/images-pull-push/v1.2.0/image_pull_push.sh"
   [ -x "$U/image_pull_push.sh" ]
-  [ "$(cat "$U/.image_pull_push.sh.ref")" = v1.1.2 ]
+  [ "$(cat "$U/.image_pull_push.sh.ref")" = v1.2.0 ]
 }
 @test "install_packages.sh comes from install-packages v1.1.3, by tag" {
   run download_install_packages
@@ -114,7 +114,7 @@ helper_sha() { printf '#!/bin/bash\necho helper\n' | sha256sum | cut -d' ' -f1; 
   echo old > "$U/install_packages.sh"
   download_image_pull_push >/dev/null
   download_install_packages >/dev/null
-  [ "$(cat "$U/.image_pull_push.sh.ref")" = v1.1.2 ]
+  [ "$(cat "$U/.image_pull_push.sh.ref")" = v1.2.0 ]
   [ "$(cat "$U/.install_packages.sh.ref")" = v1.1.3 ]
   grep -q "echo helper" "$U/install_packages.sh"
 }

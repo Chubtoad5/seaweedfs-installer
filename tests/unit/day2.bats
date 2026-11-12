@@ -82,7 +82,7 @@ in_container() {
 caddy_stub() { # docker: hash-password prints a new hash each call, validate exits $VALIDATE_RC
   echo 0 > "$T/hashes"
   stub docker 'case "$*" in
-    *hash-password*) n=$(cat '"$T"'/hashes); echo $((n + 1)) > '"$T"'/hashes; echo "\$2a\$14\$hash$n" ;;
+    *hash-password*) cat >/dev/null; n=$(cat '"$T"'/hashes); echo $((n + 1)) > '"$T"'/hashes; echo "\$argon2id\$v=19\$m=1,t=1,p=1\$c2FsdA\$hash$n" ;;
     *validate*) exit ${VALIDATE_RC:-0} ;;
   esac'
 }
