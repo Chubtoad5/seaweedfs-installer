@@ -34,8 +34,8 @@ run_entrypoint() {
   [[ "$block" == *'entrypoint: ["/bin/sh", "/weed-entrypoint.sh"]'* ]]
   [[ "$block" == *'- /opt/seaweedfs/weed-entrypoint.sh:/weed-entrypoint.sh:ro'* ]]
   [ "$(stat -c %a /opt/seaweedfs/weed-entrypoint.sh)" = 644 ]
-  # the compose command still carries the password quoted, for compose's own split
-  [[ "$block" == *'-admin.password "Test Pass*?[1"'* ]]
+  # the compose command carries the password as its own list item (spec 21, S19)
+  [[ "$block" == *"- '-admin.password'"$'\n'"      - 'Test Pass*?[1'"* ]]
 }
 
 @test "S17: only seaweed-mini gets it; MQ, the mount and a volume node keep the image's" {

@@ -41,7 +41,8 @@ head -c 200000 /dev/urandom > obj.bin; head -c 200000 /dev/urandom > file.bin
 c=$(curl -sk -m 30 -u "admin:$P" -o /dev/null -w '%{http_code}' -F "file=@file.bin" "https://$IP:8888/artifacts/a5/"); [[ "$c" =~ ^20 ]] && ok "write a Filer file" || bad "write a Filer file: $c"
 ca1=$(ca); [ -n "$ca1" ] && [ "$ca1" != "$(printf '' | sum)" ] && ok "Caddy's root CA is there" || bad "no Caddy root CA to compare"
 
-caddy1=$(started seaweed-caddy) mount1=$(started seaweed-mount)
+caddy1=$(started seaweed-caddy) mount1=$(started seaweed-mount) mini1=$(started seaweed-mini) graf1=$(started grafana)
+cf1=$(sum < /opt/caddy/Caddyfile)
 (cd new && ./install-seaweedfs install) > o2 2>&1 && ok "install the commit under test over $old" || { bad "install the commit under test over $old"; tail -10 o2 | cut -c1-170; }
 w=$(within 90 running) && ok "every container runs after the upgrade" || bad "not running after the upgrade: $w"
 within 90 s3ok && ok "S3 answers with the same keys" || bad "S3 doesn't answer with the same keys"
@@ -51,6 +52,15 @@ within 90 s3ok && ok "S3 answers with the same keys" || bad "S3 doesn't answer w
   && ok "S17: seaweed-mini now starts through the installer's entrypoint" || bad "S17: seaweed-mini's entrypoint is $(docker inspect -f '{{json .Config.Entrypoint}}' seaweed-mini 2>/dev/null)"
 [ "$(started seaweed-caddy)" = "$caddy1" ] && [ "$(started seaweed-mount)" = "$mount1" ] \
   && ok "S17: only seaweed-mini was recreated; Caddy and the mount kept running" || bad "S17: the upgrade restarted Caddy or the mount"
+# Spec 21: for a password the last release already carried whole, compose sees the same config, and Caddy's stored
+# bcrypt hash is kept, so nothing is recreated or restarted (S19, S20, S23)
+[[ "$old" == v1.3.0 || "$old" == v1.2.* || "$old" == v1.1.* ]] || {
+  [ "$(started seaweed-mini)" = "$mini1" ] && [ "$(started grafana)" = "$graf1" ] \
+    && ok "spec 21: seaweed-mini and Grafana weren't recreated" || bad "spec 21: the upgrade recreated seaweed-mini or Grafana"
+  [ "$(sum < /opt/caddy/Caddyfile)" = "$cf1" ] && ok "spec 21: the Caddyfile is unchanged (its bcrypt hash was kept)" || bad "spec 21: the Caddyfile changed"
+}
+gr=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' -u "admin:$P" "https://$IP:3000/api/user")
+[ "$gr" = 200 ] && ok "Grafana still takes the password" || bad "Grafana answered $gr"
 within 60 admin_login "$P" && ok "S17: the Admin UI's login takes the whole password" || bad "S17: the Admin UI's login refuses the whole password"
 admin_login Test && bad "S17: the Admin UI's login still takes the first word alone" || ok "S17: the Admin UI's login refuses the first word alone"
 uid=$(docker exec seaweed-mini id -u seaweed 2>/dev/null || echo 1000) leak=""

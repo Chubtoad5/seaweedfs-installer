@@ -6,7 +6,7 @@
 
 # -- USER DEFINED Configuration Variables -- #
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.4.0"
 
 DEBUG=${DEBUG:-1}
 
@@ -91,7 +91,7 @@ SWFS_REMOVE_IMAGES=${SWFS_REMOVE_IMAGES:-"false"}  # uninstall: also 'docker rmi
 SWFS_FORCE_ONLINE=${SWFS_FORCE_ONLINE:-"false"}    # true = ignore a swfs-save-version.txt sentinel in the working directory and stay in online mode
 
 # - Helper scripts: which release of each is fetched (spec 12). A URL wins over its ref; a checksum is optional.
-IMAGE_PULL_PUSH_REF=${IMAGE_PULL_PUSH_REF:-"v1.1.2"}      # images-pull-push release (tag, branch or commit) whose image_pull_push.sh is fetched
+IMAGE_PULL_PUSH_REF=${IMAGE_PULL_PUSH_REF:-"v1.2.0"}      # images-pull-push release (tag, branch or commit) whose image_pull_push.sh is fetched
 IMAGE_PULL_PUSH_URL=${IMAGE_PULL_PUSH_URL:-"https://raw.githubusercontent.com/Chubtoad5/images-pull-push/${IMAGE_PULL_PUSH_REF}/image_pull_push.sh"}
 IMAGE_PULL_PUSH_SHA256=${IMAGE_PULL_PUSH_SHA256:-""}      # optional sha256 of image_pull_push.sh; a mismatch stops the run
 INSTALL_PACKAGES_REF=${INSTALL_PACKAGES_REF:-"v1.1.3"}    # install-packages release (tag, branch or commit) whose install_packages.sh is fetched
@@ -346,7 +346,10 @@ resolve_s3_keys() {
   [[ -n "$S3_ACCESS_KEY" ]] || S3_ACCESS_KEY=$(openssl rand -hex 8)
   [[ -n "$S3_SECRET_KEY" ]] || S3_SECRET_KEY=$(openssl rand -hex 16)
   local k
-  for k in $S3_REVOKE_ACCESS_KEYS; do
+  local -a revoke_keys
+  # S26: split without globbing, so a * ? or [ can't expand to file names
+  read -r -d '' -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS" || true
+  for k in "${revoke_keys[@]}"; do
     [[ "$k" == "$S3_ACCESS_KEY" ]] && die "S3_REVOKE_ACCESS_KEYS names the key this run configures ($k). Drop it from the list, or pass a new S3_ACCESS_KEY and S3_SECRET_KEY."
   done
   return 0
@@ -374,6 +377,48 @@ s3_key_on_this_host() {
 }
 
 # mask_s3_keys: weed shell output with every key value replaced, for the log.
+# configure_s3_credentials: this run's S3 key pair on S3_USER, then the revocations (S24, S26)
+configure_s3_credentials() {
+  echo "  Configuring S3 credentials..."
+  local shell_out=""
+  # S24: the keys passed check_secrets' rule, and go in quotes, which weed shell strips. printf, not echo.
+  shell_out=$(printf 's3.configure -access_key="%s" -secret_key="%s" -user=%s -actions=Read,Write,List,Admin -apply=true\n' \
+    "$S3_ACCESS_KEY" "$S3_SECRET_KEY" "$S3_USER" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>&1)
+  # The output lists every identity with its keys, so the log gets it only on failure, and masked. A failure is weed's
+  # own error line, or the new key missing from the identities it prints, so a key in the output can't pass for one.
+  # The key is looked for only when it's plain characters, which weed's JSON never escapes (& < > can come out as \u0026)
+  local key_missing=0
+  if [[ "$S3_ACCESS_KEY" =~ ^[A-Za-z0-9+/=._-]+$ ]] \
+      && ! sed -nE 's/.*"accessKey":[[:space:]]*"([^"]*)".*/\1/p' <<< "$shell_out" | grep -qxF -- "$S3_ACCESS_KEY"; then
+    key_missing=1
+  fi
+  if weed_shell_failed "$shell_out" || [[ $key_missing -eq 1 ]]; then
+    echo "$shell_out" | mask_s3_keys >> "$LOG_FILE"
+    die "S3 credential configuration failed (see $LOG_FILE)."
+  fi
+  record_state S3_ACCESS_KEY "$S3_ACCESS_KEY"
+  record_state S3_SECRET_KEY "$S3_SECRET_KEY"
+  record_state S3_KEYS_USER "$S3_USER"
+  local revoke
+  local -a revoke_keys
+  read -r -d '' -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS" || true
+  for revoke in "${revoke_keys[@]}"; do
+    shell_out=$(printf 's3.configure -user=%s -access_key="%s" -delete -apply=true\n' "$S3_USER" "$revoke" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>&1)
+    if weed_shell_failed "$shell_out"; then
+      echo "$shell_out" | mask_s3_keys >> "$LOG_FILE"
+      die "Revoking S3 access key $revoke failed (see $LOG_FILE)."
+    fi
+    echo "  Revoked S3 access key $revoke from user $S3_USER (a key it doesn't have is left as it is)." | tee -a "$LOG_FILE"
+  done
+}
+
+# weed_shell_failed <output>: true when weed shell reported a failure: its own "error: " line, an unknown command, or a
+# glog error or fatal line (E or F and the date). Matching 'error' or 'failed' anywhere also matched identities and
+# keys in the output (S24).
+weed_shell_failed() {
+  grep -qE '^(error: |unknown command|[EF][0-9]{4} )' <<< "$1"
+}
+
 mask_s3_keys() {
   sed -E 's/("(accessKey|secretKey)"[[:space:]]*:[[:space:]]*")[^"]*/\1****/g; s/(-(access_key|secret_key)=)[^[:space:]]*/\1****/g'
 }
@@ -744,26 +789,7 @@ install_swfs () {
     *) die "Failed to create default artifact directory '$DEFAULT_FILER_DIR_NAME' on the Filer (HTTP ${mkdir_code:-no-response})." ;;
   esac
   upload_binaries
-  echo "  Configuring S3 credentials..."
-  local shell_out=""
-  shell_out=$(echo "s3.configure -access_key=$S3_ACCESS_KEY -secret_key=$S3_SECRET_KEY -user=$S3_USER -actions=Read,Write,List,Admin -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>&1)
-  # The output lists every identity with its keys, so the log gets it only on failure, and masked.
-  if echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)'; then
-    echo "$shell_out" | mask_s3_keys >> "$LOG_FILE"
-    die "S3 credential configuration failed (see $LOG_FILE)."
-  fi
-  record_state S3_ACCESS_KEY "$S3_ACCESS_KEY"
-  record_state S3_SECRET_KEY "$S3_SECRET_KEY"
-  record_state S3_KEYS_USER "$S3_USER"
-  local revoke
-  for revoke in $S3_REVOKE_ACCESS_KEYS; do
-    shell_out=$(echo "s3.configure -user=$S3_USER -access_key=$revoke -delete -apply=true" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>&1)
-    if echo "$shell_out" | grep -qiE '(^|[[:space:]])(error|failed)'; then
-      echo "$shell_out" | mask_s3_keys >> "$LOG_FILE"
-      die "Revoking S3 access key $revoke failed (see $LOG_FILE)."
-    fi
-    echo "  Revoked S3 access key $revoke from user $S3_USER (a key it doesn't have is left as it is)." | tee -a "$LOG_FILE"
-  done
+  configure_s3_credentials
   echo "  Creating S3 buckets..."
   local all_buckets="$S3_BUCKET"
   if [[ ${ENABLE_MONITORING,,} == "true" ]] && ! list_contains "$LOKI_BUCKET" "$all_buckets"; then
@@ -911,7 +937,8 @@ run_smb () {
       || die "The existing /etc/samba/smb.conf is rejected by Samba (testparm -s; details in $LOG_FILE). Fix it and re-run."
   fi
   ensure_swfs_user
-  (echo "$SWFS_PASSWORD"; echo "$SWFS_PASSWORD") | smbpasswd -a -s "$SWFS_USER" \
+  # S22: printf, not echo, which reads a password of -n or -e as an option
+  printf '%s\n%s\n' "$SWFS_PASSWORD" "$SWFS_PASSWORD" | smbpasswd -a -s "$SWFS_USER" \
     || die "smbpasswd failed for user '$SWFS_USER'."
   local smb_conf_before
   smb_conf_before=$(file_md5 /etc/samba/smb.conf)
@@ -1105,7 +1132,7 @@ generate_caddyfile () {
   else
     local caddy_image_local="$CADDY_IMAGE"
   fi
-  # The bcrypt hash gets a fresh salt every time, so hashing on every run changed the Caddyfile and restarted Caddy
+  # A hash gets a fresh salt every time, so hashing on every run changed the Caddyfile and restarted Caddy
   # on every re-run. Keep the hash while the password is the same: .auth-hash holds it with a fingerprint of the
   # pair, and the password reaches openssl through a pipe, not its arguments.
   local auth_file=/opt/caddy/.auth-hash stored_hash="" stored_fp=""
@@ -1116,13 +1143,16 @@ generate_caddyfile () {
   if [[ -n "$stored_hash" && -n "$stored_fp" && "$(auth_fingerprint "$stored_hash")" == "$stored_fp" ]]; then
     CADDY_HASHED_PASSWORD=$stored_hash
   else
-    CADDY_HASHED_PASSWORD=$(docker run --rm ${caddy_image_local} caddy hash-password --plaintext "${SWFS_PASSWORD}")
+    CADDY_HASHED_PASSWORD=$(caddy_hash "$caddy_image_local")
     if [[ -z "$CADDY_HASHED_PASSWORD" ]]; then
       die "Failed to hash SWFS_PASSWORD with the Caddy image ($caddy_image_local). Is the image available?"
     fi
     private_file "$auth_file"
     printf 'hash=%s\nfingerprint=%s\n' "$CADDY_HASHED_PASSWORD" "$(auth_fingerprint "$CADDY_HASHED_PASSWORD")" > "$auth_file"
   fi
+  # A bcrypt hash kept from an earlier release keeps its line, so the Caddyfile doesn't change (S23)
+  local auth_open="basic_auth {"
+  [[ "$CADDY_HASHED_PASSWORD" == '$argon2id$'* ]] && auth_open="basic_auth argon2id {"
   # The Filer site's catch-all sends visitors to the Admin UI, on its port unless that is 443.
   local admin_suffix=""
   [[ "$SWFS_ADMIN_PORT" != "443" ]] && admin_suffix=":$SWFS_ADMIN_PORT"
@@ -1189,7 +1219,7 @@ $SWFS_FILER_FQDN:$SWFS_FILER_PORT, https://$MGMT_IP:$SWFS_FILER_PORT {
                 reverse_proxy seaweed-mini:8888
         }
         handle /$DEFAULT_FILER_DIR_NAME* {
-                basic_auth {
+                $auth_open
                         $SWFS_USER $CADDY_HASHED_PASSWORD
                 }
                 reverse_proxy seaweed-mini:8888
@@ -1202,7 +1232,7 @@ $SWFS_FILER_FQDN:$SWFS_FILER_PORT, https://$MGMT_IP:$SWFS_FILER_PORT {
 }
 $SWFS_MASTER_FQDN:$SWFS_MASTER_PORT, https://$MGMT_IP:$SWFS_MASTER_PORT {
         tls internal
-        basic_auth {
+        $auth_open
                 $SWFS_USER $CADDY_HASHED_PASSWORD
         }
         reverse_proxy seaweed-mini:9333
@@ -1233,7 +1263,89 @@ EOF
   rm -f "$new_cf"
 }
 
-# auth_fingerprint <bcrypt hash>: ties a stored hash to the current SWFS_PASSWORD.
+# compose_sq <value>: a YAML single-quoted scalar that docker compose reads back exactly: ' written '' and $ written $$
+# (spec 21, rule 3). Compose interpolates $ even in single quotes, and $$ is its escape.
+compose_sq() { local v=${1//\'/\'\'}; v=${v//\$/\$\$}; printf "'%s'" "$v"; }
+
+# yaml_value <value>: as typed when it's only letters and digits, so files from earlier releases stay byte-identical,
+# else a YAML single-quoted scalar (S25)
+yaml_value() {
+  if [[ "$1" =~ ^[A-Za-z0-9]+$ ]]; then printf '%s' "$1"; else local v=${1//\'/\'\'}; printf "'%s'" "$v"; fi
+}
+
+# sh_value <value>: likewise, for a file a shell sources: single quotes, with ' written '\'' (S25)
+sh_value() {
+  if [[ "$1" =~ ^[A-Za-z0-9]+$ ]]; then printf '%s' "$1"; else local v=${1//\'/\'\\\'\'}; printf "'%s'" "$v"; fi
+}
+
+# weed_key_changes <key>: true when weed's shell would change this S3 key (S24): a space, ;, a quote, a backslash or a
+# control character
+weed_key_changes() {
+  [[ "$1" == *[[:space:]\;\"\'\\]* || "$1" == *[[:cntrl:]]* ]]
+}
+
+# check_secrets: spec 21's checks, before anything is stopped or changed (rule 7). Each message names the variable and
+# never shows its value. Any SWFS_PASSWORD of printable characters works; keys and user names get the narrower rules
+# of the places they go.
+check_secrets() {
+  local bad=0 k
+  if [[ "$SWFS_PASSWORD" == *[[:cntrl:]]* ]]; then
+    echo "Error: SWFS_PASSWORD can't contain a control character, such as a tab or a newline."; bad=1
+  elif (( ${#SWFS_PASSWORD} > 128 )); then
+    echo "Error: SWFS_PASSWORD can't be longer than 128 characters."; bad=1
+  fi
+  # SWFS_USER goes into the Caddyfile and the basic-auth logins as written, so what they can't carry is refused. With SMB
+  # on it's also a Linux account, and useradd decides the rest, as before.
+  if [[ -z "$SWFS_USER" || "$SWFS_USER" == *[[:space:][:cntrl:]]* || "$SWFS_USER" == *[\"\`\\{}:]* || "$SWFS_USER" == \#* ]]; then
+    echo "Error: SWFS_USER can't be empty, contain a space, :, a quote, a backquote, a backslash, a brace or a control character,"
+    echo "  or start with #: the Caddyfile and the logins can't carry them."; bad=1
+  fi
+  # S24: weed shell splits a line at ; before its own quoting, then reads quotes and backslashes itself, so a key with
+  # ;, a quote or a backslash is refused, and a space too (it never worked here). Everything else reaches weed as
+  # written. Generated keys (hex) always fit.
+  local name
+  for name in S3_ACCESS_KEY S3_SECRET_KEY; do
+    if weed_key_changes "${!name}"; then
+      echo "Error: $name can't contain a space, ;, a quote, a backslash or a control character, which weed's own shell changes."; bad=1
+    fi
+  done
+  # S3_USER, which defaults to SWFS_USER, goes into the same weed shell lines: a ' or ; there left S3 with no working
+  # key while the install said it had one
+  if [[ -z "$S3_USER" ]] || weed_key_changes "$S3_USER"; then
+    echo "Error: S3_USER (unset, it is SWFS_USER) can't be empty, or contain a space, ;, a quote, a backslash or a control character,"
+    echo "  which weed's own shell changes. Set S3_USER to a plain name to keep this SWFS_USER."; bad=1
+  fi
+  local -a revoke_keys
+  read -r -d '' -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS" || true
+  for k in "${revoke_keys[@]}"; do
+    if weed_key_changes "$k"; then
+      echo "Error: S3_REVOKE_ACCESS_KEYS lists a key with ;, a quote, a backslash or a control character, which weed's own shell changes."; bad=1; break
+    fi
+  done
+  if [[ $REGISTRY_MODE -eq 1 || $PUSH_MODE -eq 1 ]]; then
+    if [[ "$REG_USER" == *:* || "$REG_USER" == [[:space:]]* || "$REG_USER" == *[[:space:]] || "$REG_USER$REG_PASS" == *[[:cntrl:]]* ]]; then
+      echo "Error: the registry user can't contain ':' or start or end with a space, and neither it nor the password a control character: a registry login can't carry them."; bad=1
+    fi
+  fi
+  [[ $bad -eq 0 ]] || { echo "Nothing has been changed."; exit 1; }
+}
+
+# caddy_hash <image>: Caddy's argon2id hash of SWFS_PASSWORD, with the password on stdin (S23, spec 21). bcrypt took no
+# more than 72 bytes, and --plaintext showed the password to every local account in ps. A Caddy older than 2.11 has
+# no argon2id: it hashes with bcrypt then, as before, for a password of 72 bytes or fewer.
+caddy_hash() {
+  local out
+  out=$(printf '%s\n' "$SWFS_PASSWORD" | docker run --rm -i "$1" caddy hash-password --algorithm argon2id 2>/dev/null) || out=""
+  if [[ "$out" != '$argon2id$'?* ]]; then
+    if (( $(printf '%s' "$SWFS_PASSWORD" | wc -c) > 72 )); then
+      die "SWFS_PASSWORD is over 72 bytes, which needs Caddy's argon2id, and the Caddy image ($1) has none: it's older than 2.11, or not available."
+    fi
+    out=$(printf '%s\n' "$SWFS_PASSWORD" | docker run --rm -i "$1" caddy hash-password 2>/dev/null) || out=""
+  fi
+  printf '%s' "$out"
+}
+
+# auth_fingerprint <hash>: ties a stored hash to the current SWFS_PASSWORD.
 auth_fingerprint() {
   printf '%s' "$1:$SWFS_PASSWORD" | openssl dgst -sha256 | awk '{print $NF}'
 }
@@ -1277,27 +1389,29 @@ generate_compose_file () {
   if [[ ${ENABLE_MONITORING,,} == "true" ]]; then
     CADDY_MONITORING_PORT="      - \"$GRAFANA_PORT:$GRAFANA_PORT\""
   fi
-  # Pre-compute optional 'weed mini' tuning flags (folded into the command: > block)
-  local MINI_TUNING=""
-  [[ -n "$VOLUME_INDEX" ]] && MINI_TUNING+="      -volume.index=$VOLUME_INDEX"$'\n'
-  [[ -n "$VOLUME_SIZE_LIMIT_MB" ]] && MINI_TUNING+="      -master.volumeSizeLimitMB=$VOLUME_SIZE_LIMIT_MB"$'\n'
+  # weed mini's arguments, one list item each (S19, spec 21). Compose split the old folded 'command: >' string the way a
+  # shell would, after expanding $ in it, so an admin password with $, \, a quote, & ; or | reached weed changed, cut
+  # short, or with the flags after it dropped. Each item is a single-quoted YAML scalar with $ written $$, which compose
+  # reads back exactly. For every password that worked before, compose sees the same list, so its config hash, and the
+  # container, stay the same.
+  local -a mini_args=(mini -admin.user "$SWFS_USER" -admin.password "$SWFS_PASSWORD" -dir=/data -webdav=false)
+  [[ -n "$VOLUME_INDEX" ]] && mini_args+=("-volume.index=$VOLUME_INDEX")
+  [[ -n "$VOLUME_SIZE_LIMIT_MB" ]] && mini_args+=("-master.volumeSizeLimitMB=$VOLUME_SIZE_LIMIT_MB")
   # Pre-compute optional cluster-ready flags + host-published cluster ports (CLUSTER_MODE=cluster).
   # Empty in single-node mode => the compose below is byte-identical to the non-cluster default.
-  local MINI_CLUSTER=""
   local MINI_CLUSTER_PORTS=""
   if [[ ${CLUSTER_MODE,,} == "cluster" ]]; then
-    MINI_CLUSTER+="      -ip=$MGMT_IP"$'\n'
-    [[ -n "$CLUSTER_REPLICATION" ]] && MINI_CLUSTER+="      -master.defaultReplication=$CLUSTER_REPLICATION"$'\n'
-    MINI_CLUSTER+="      -dataCenter=$CLUSTER_DC"$'\n'
-    MINI_CLUSTER+="      -rack=$CLUSTER_RACK"$'\n'
-    MINI_CLUSTER+="      -master.port.grpc=$CLUSTER_MASTER_GRPC_PORT"$'\n'
-    MINI_CLUSTER+="      -volume.port=$CLUSTER_VOLUME_PORT"$'\n'
-    MINI_CLUSTER+="      -volume.port.grpc=$CLUSTER_VOLUME_GRPC_PORT"$'\n'
+    mini_args+=("-ip=$MGMT_IP")
+    [[ -n "$CLUSTER_REPLICATION" ]] && mini_args+=("-master.defaultReplication=$CLUSTER_REPLICATION")
+    mini_args+=("-dataCenter=$CLUSTER_DC" "-rack=$CLUSTER_RACK" "-master.port.grpc=$CLUSTER_MASTER_GRPC_PORT")
+    mini_args+=("-volume.port=$CLUSTER_VOLUME_PORT" "-volume.port.grpc=$CLUSTER_VOLUME_GRPC_PORT")
     MINI_CLUSTER_PORTS+="    ports:"$'\n'
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_MASTER_GRPC_PORT:$CLUSTER_MASTER_GRPC_PORT\""$'\n'
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_VOLUME_PORT:$CLUSTER_VOLUME_PORT\""$'\n'
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_VOLUME_GRPC_PORT:$CLUSTER_VOLUME_GRPC_PORT\""$'\n'
   fi
+  local MINI_COMMAND="" arg
+  for arg in "${mini_args[@]}"; do MINI_COMMAND+="      - $(compose_sq "$arg")"$'\n'; done
   write_weed_entrypoint
   echo "  Creating seaweedfs-compose.yaml..." | tee -a "$LOG_FILE"
   # It carries the admin password, so only root reads it. Compose and the containers run as root.
@@ -1311,13 +1425,8 @@ services:
     image: $SWFS_IMAGE
     container_name: seaweed-mini
     entrypoint: ["/bin/sh", "/weed-entrypoint.sh"]
-    command: >
-      mini
-      -admin.user "$SWFS_USER"
-      -admin.password "$SWFS_PASSWORD"
-      -dir=/data
-      -webdav=false
-${MINI_TUNING}${MINI_CLUSTER}    volumes:
+    command:
+${MINI_COMMAND}    volumes:
       - /opt/seaweedfs/mini:/data
       - /opt/seaweedfs/weed-entrypoint.sh:/weed-entrypoint.sh:ro
 ${MINI_CLUSTER_PORTS}    networks:
@@ -1979,8 +2088,8 @@ storage_config:
   aws:
     endpoint: http://seaweed-mini:8333
     bucketnames: ${LOKI_BUCKET}
-    access_key_id: ${S3_ACCESS_KEY}
-    secret_access_key: ${S3_SECRET_KEY}
+    access_key_id: $(yaml_value "$S3_ACCESS_KEY")
+    secret_access_key: $(yaml_value "$S3_SECRET_KEY")
     s3forcepathstyle: true
     insecure: true
 
@@ -2125,8 +2234,8 @@ services:
     container_name: grafana
     restart: unless-stopped
     environment:
-      - GF_SECURITY_ADMIN_USER=${SWFS_USER}
-      - GF_SECURITY_ADMIN_PASSWORD=${SWFS_PASSWORD}
+      - $(compose_sq "GF_SECURITY_ADMIN_USER=$SWFS_USER")
+      - $(compose_sq "GF_SECURITY_ADMIN_PASSWORD=$SWFS_PASSWORD")
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - /opt/monitoring/grafana/data:/var/lib/grafana
@@ -2147,8 +2256,8 @@ write_monitoring_credentials () {
 # Generated by install-seaweedfs on $(date)
 # Source this file in ap-tools before running 'install monitoring'
 MONITORING_HOST=${MGMT_IP}
-MONITORING_S3_ACCESS_KEY=${S3_ACCESS_KEY}
-MONITORING_S3_SECRET_KEY=${S3_SECRET_KEY}
+MONITORING_S3_ACCESS_KEY=$(sh_value "$S3_ACCESS_KEY")
+MONITORING_S3_SECRET_KEY=$(sh_value "$S3_SECRET_KEY")
 MONITORING_S3_ENDPOINT=https://${MGMT_IP}:${SWFS_S3_PORT}
 MONITORING_S3_CA=/opt/caddy/data/caddy/pki/authorities/local/root.crt
 MONITORING_LOKI_BUCKET=${LOKI_BUCKET}
@@ -2157,6 +2266,36 @@ MONITORING_PROMETHEUS_PORT=${PROMETHEUS_EXT_PORT}
 CLUSTER_NAME=${CLUSTER_NAME}
 EOF
   chmod 600 /opt/seaweedfs/monitoring-credentials.env
+}
+
+# grafana_fingerprint <salt>: a salted sha256 of SWFS_PASSWORD, read through a pipe, never from the arguments
+grafana_fingerprint() {
+  printf '%s' "$1:$SWFS_PASSWORD" | openssl dgst -sha256 | awk '{print $NF}'
+}
+
+# sync_grafana_password <grafana.db existed before up>: S21 (spec 21). Grafana takes GF_SECURITY_ADMIN_PASSWORD only
+# when it creates its database, so a changed SWFS_PASSWORD never reached it, while the install printed the new one.
+# /opt/monitoring/.grafana-auth (0600) holds a fingerprint of the password Grafana has. When it differs, or an install
+# from before it existed is upgraded, Grafana's own CLI resets admin's password, with the password on stdin. A new
+# database already has it.
+sync_grafana_password() {
+  local f=/opt/monitoring/.grafana-auth salt="" fp="" attempt
+  if [[ -f "$f" ]]; then
+    salt=$(sed -n 's/^salt=//p' "$f"); fp=$(sed -n 's/^fingerprint=//p' "$f")
+  fi
+  [[ -n "$salt" && "$(grafana_fingerprint "$salt")" == "$fp" ]] && return 0
+  if [[ "$1" -eq 1 ]]; then
+    echo "  Setting Grafana's admin password to SWFS_PASSWORD (Grafana reads its environment's only once)..."
+    for attempt in $(seq 1 20); do
+      printf '%s\n' "$SWFS_PASSWORD" | docker exec -i grafana grafana cli admin reset-admin-password --password-from-stdin \
+        >/dev/null 2>&1 && break
+      [[ $attempt -lt 20 ]] || return 1
+      sleep 3
+    done
+  fi
+  salt=$(openssl rand -hex 16)
+  private_file "$f"
+  printf 'salt=%s\nfingerprint=%s\n' "$salt" "$(grafana_fingerprint "$salt")" > "$f"
 }
 
 setup_monitoring () {
@@ -2176,9 +2315,12 @@ setup_monitoring () {
   generate_grafana_datasources
   generate_monitoring_compose
   write_monitoring_credentials
+  local grafana_db_existed=0
+  [[ -f /opt/monitoring/grafana/data/grafana.db ]] && grafana_db_existed=1
   echo "  Starting monitoring stack (Loki, Grafana, Prometheus)..."
   docker compose -f /opt/monitoring/docker-compose.yml up -d --remove-orphans \
     || die "docker compose up failed for /opt/monitoring/docker-compose.yml."
+  sync_grafana_password "$grafana_db_existed" || die "Setting Grafana's admin password failed (check 'docker logs grafana')."
   record_state MONITORING_CONFIGURED "true"
   # Apply regenerated bind-mounted configs to running containers (SW-8).
   restart_if_changed loki "$loki_before" "$(file_md5 /opt/monitoring/loki/loki-config.yaml)" || die "Restarting loki failed (check 'docker logs loki')."
@@ -2812,6 +2954,9 @@ fi
 if ! mgmt_ip_ok; then
   echo "Error: Could not determine a valid MGMT_IP (got '${MGMT_IP}'). Set MGMT_IP to this host's management IPv4 address."
   exit 1
+fi
+if [[ $INSTALL_MODE -eq 1 || $JOIN_MODE -eq 1 || $PUSH_MODE -eq 1 ]]; then
+  check_secrets
 fi
 # Air-gap auto-detection with sanity check + explicit override (SW-17). A stale
 # sentinel (e.g. a build host that ran 'save' earlier) used to flip later runs into

@@ -126,7 +126,9 @@ echo "=== A value Caddy can't parse (S8)"
 cf=$(md5 /opt/caddy/Caddyfile); st=$(started)
 if inst SWFS_PASSWORD=$P2 SWFS_USER='bad user'; then bad "exit 0 with a Caddyfile Caddy can't parse"
 elif grep -q "Caddy rejected" "$W/o"; then ok "refuses a Caddyfile Caddy can't parse"
-else bad "failed, but not on the Caddyfile"; show; fi
+# Spec 21: a user name the Caddyfile can't carry is now refused before anything changes, ahead of Caddy's own check
+elif grep -q "SWFS_USER can't be empty, contain a space" "$W/o"; then ok "refuses a user name the Caddyfile can't carry, before Caddy's check"
+else bad "failed, but not on the Caddyfile or the user name"; show; fi
 [ "$(md5 /opt/caddy/Caddyfile)" = "$cf" ] && [ "$(started)" = "$st" ] && ok "the running Caddy keeps its config" || bad "the running Caddy's config changed"
 code=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' "https://$IP:443/login"); [[ "$code" =~ ^[23] ]] && ok "the admin UI still answers" || bad "the admin UI answered $code"
 

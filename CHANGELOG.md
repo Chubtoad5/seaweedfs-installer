@@ -1,5 +1,71 @@
 # Changelog — seaweedfs-installer
 
+## v1.4.0 — 2026-11-12 — Any admin password works everywhere it goes
+
+Spec 21 (chubtoad-automation).
+
+### Fixed
+- **The admin password reaches weed exactly** (S19). `seaweed-mini`'s `command:` was a folded string that compose
+  interpolated, then split the way a shell would. So a `$` or `\` gave the Admin UI a different password than the Filer,
+  Master and SMB, an unmatched `"` stopped the install, an invalid `${…}` stopped it **and printed the whole command,
+  password included**, and with `&`, `;` or `|` compose quietly dropped the rest of the line, `-webdav=false` and every
+  tuning and cluster flag with it. Now `command:` is a list, one single-quoted item per argument, with `$` written `$$`.
+- **Grafana gets the password exactly** (S20), and its user name: a `$` in `SWFS_USER` gave Grafana a shorter name. Its
+  environment lines were plain YAML that compose also interpolated: `$` was rewritten, `Aa1 #x` became `Aa1`, a trailing space was dropped, and `: ` or a trailing `:` stopped the install at
+  "Monitoring stack setup failed". It is now a single-quoted item with `$$`.
+- **A changed `SWFS_PASSWORD` reaches Grafana** (S21). Grafana reads its environment's password only when it creates
+  its database, so it kept the first one while the install printed the new one. `/opt/monitoring/.grafana-auth` (0600)
+  now holds a fingerprint of the password Grafana has, and a run whose password differs resets it with Grafana's own
+  CLI, the password on stdin.
+- **Samba gets a password of `-n` or `-e`** (S22): `printf`, not `echo`.
+- **Passwords over 72 bytes install** (S23). Caddy hashed with bcrypt, which takes no more than 72, and the install
+  stopped with "Failed to hash SWFS_PASSWORD with the Caddy image … Is the image available?". Caddy now hashes with
+  argon2id, with the password on stdin rather than in `ps`, and the Caddyfile says `basic_auth argon2id`.
+- **S3 keys reach `weed shell` exactly, or are refused** (S24). A key with a space or a leading space configured nothing
+  while the step said it had; `;` cut the line in two; `\` and matched quotes were stripped, so requests failed their
+  signature check. Now a key with a space, `;`, a quote, a backslash or a control character is refused before anything
+  changes, and every other key goes in quotes as written. The step fails on weed's own error line, or when a plain key
+  is missing from the identities weed prints, not on `error` or `failed` anywhere in the output.
+- **Loki's config and `monitoring-credentials.env` carry the keys exactly** (S25): YAML single quotes and shell single
+  quotes, for a key that isn't only letters and digits. Those files are byte-identical for keys that are.
+- **`S3_REVOKE_ACCESS_KEYS` isn't globbed** (S26), so a `*`, `?` or `[` can't revoke other keys. A list over several
+  lines is still read whole.
+- **`IMAGE_PULL_PUSH_REF` defaults to images-pull-push v1.2.0,** which takes the registry user and password by position,
+  so a registry password such as `--help` or `push` is a password.
+
+### Changed
+- **Checked before anything changes, each message naming the variable but never its value:** `SWFS_PASSWORD` with a
+  control character or over 128 characters; `SWFS_USER` with a space, `:`, a quote, a backquote, a backslash, a brace or
+  a control character, or a leading `#`, which the Caddyfile and the logins can't carry (with SMB on, `useradd` still
+  decides the rest, as before; a backquote or a brace, which
+  hardly anyone uses, is refused too); an S3 key, a key to revoke, or `S3_USER` (which defaults to `SWFS_USER`) that
+  weed's shell would change (above): a `'` or `;` in the S3 user configured no working key while the install reported
+  one; a registry user with `:` or a space at either end. Each of these
+  failed or came out changed before, apart from the backquote and the brace. Generated keys always fit.
+- **On the first run of v1.4.0 over an earlier release with monitoring on,** Grafana's admin password is set to
+  `SWFS_PASSWORD` once, because there's no fingerprint yet. A password changed in Grafana's own UI is replaced then.
+- **An existing install keeps its bcrypt hash** while the password is the same, so the Caddyfile and Caddy are left as
+  they are. `seaweed-mini` and Grafana keep the same compose config hash for every password that worked before, so they
+  aren't recreated. An install whose password compose changed gets `seaweed-mini` recreated once, with the real one.
+- S27 (weed stripping matching outer quotes from `mini.options`) didn't reproduce on the bench: a password of
+  `'Aa1pass'` worked across three starts. Nothing changes for it.
+- `swfs-manual.md` follows: a compose-quoted password variable, the list `command:`, argon2id, `printf` for Samba and
+  `weed shell`.
+
+### Tests
+- `tests/unit/passwords.bats`: every spec 21 test password through weed's compose command, Grafana's environment line
+  (read back with PyYAML, and `$$` undone), Samba's input, Caddy's stdin and the Caddyfile, Grafana's reset and its
+  fingerprint; the key rules and their messages; `S3_REVOKE_ACCESS_KEYS` with glob characters; weed shell's failure
+  match; Loki's and the env file's values read back.
+- `tests/integration/10-lifecycle.sh`: the install uses spec 21's full test password, and logs in with it at the Admin
+  UI, the Filer, Grafana, SMB and S3; compose's own reading of both compose files is checked; a changed password reaches
+  Grafana.
+- `tests/scenarios/a5-upgrade.sh`: over the last release, `seaweed-mini` and Grafana aren't recreated, the Caddyfile is
+  unchanged, and Grafana still takes the password.
+- `tests/unit/entrypoint.bats`, `day2.bats`, `helper-pins.bats`: the list command, Caddy's stdin, and the v1.2.0 pin.
+- `tests/password-vectors.txt`, `tests/vectors.bash`, `tests/secret-lint.py`, `tests/unit/secret-lint.bats`: spec 21's
+  shared test passwords and static check.
+
 ## v1.3.1 — 2026-11-12 — The admin password reaches weed whole; /opt/seaweedfs is private
 
 Spec 20 (chubtoad-automation), asked for by dap-blueprints Plan 01's Q46, from object-tech-ops 1.2.1.0's P3.
