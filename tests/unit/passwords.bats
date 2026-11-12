@@ -189,15 +189,14 @@ mini_command() { python3 -I -c 'import sys, yaml; d = yaml.safe_load(open(sys.ar
   S3_REVOKE_ACCESS_KEYS='good1 b-d'
   check_secrets
   S3_REVOKE_ACCESS_KEYS=""
-  ENABLE_SMB=true
-  for u in Admin ops.admin _svc s15user; do SWFS_USER=$u; check_secrets; done
-  for u in 1admin ad:min 'ad min' -admin; do
+  for u in admin Admin ops.admin _svc s15user 1admin 'svc$' 'a!b' user@example.com; do SWFS_USER=$u; check_secrets; done
+  for u in ad:min 'ad min' ' admin' 'ad"min' 'ad`min' 'ad\min' '{admin}' '#admin' $'ad\tmin' ''; do
     SWFS_USER=$u
     run check_secrets
     [ "$status" -eq 1 ]
-    [[ "$output" == *"SWFS_USER can only have letters, digits, _, . and -"* ]]
+    [[ "$output" == *"SWFS_USER can't be empty, contain a space"* ]]
   done
-  ENABLE_SMB=false SWFS_USER=admin
+  SWFS_USER=admin
   check_secrets
   SWFS_USER='ad min'
   run check_secrets
@@ -213,6 +212,13 @@ mini_command() { python3 -I -c 'import sys, yaml; d = yaml.safe_load(open(sys.ar
   REGISTRY_MODE=1 REG_USER='ro:bot' REG_PASS=x SWFS_PASSWORD=changeme
   run check_secrets
   [ "$status" -eq 1 ]
+}
+@test "S26: a revoke list over several lines is read whole, as before" {
+  S3_ACCESS_KEY=k3 S3_SECRET_KEY=abc S3_REVOKE_ACCESS_KEYS=$'k1\nk3' S3_USER=admin
+  die() { echo "DIE: $*"; exit 1; }
+  run resolve_s3_keys
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"names the key this run configures"* ]]
 }
 @test "S26: S3_REVOKE_ACCESS_KEYS isn't globbed" {
   cd "$T"; touch kfile

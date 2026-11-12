@@ -274,7 +274,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `DEBUG` | `1` | When disabled (`0`), sub-step output (Docker setup, package installs) is kept off the console; package-install output still goes to `seaweedfs-install.log` |
 | `SWFS_IMAGE` | `chrislusf/seaweedfs:4.30` | Container image for SeaweedFS (pinned for reproducible online/air-gapped installs; override to track a newer release) |
 | `CADDY_IMAGE` | `caddy:2.11.3` | Container image for Caddy (pinned; override to track a newer release) |
-| `SWFS_USER` | `admin` | Username for Admin UI, Filer, Master, and Caddy basic auth. With SMB on it is also a Linux account: letters, digits, `_`, `.` and `-`, starting with a letter or `_`. With SMB off: letters, digits and `. _ @ + -` |
+| `SWFS_USER` | `admin` | Username for Admin UI, Filer, Master, and Caddy basic auth. It can't contain a space, `:`, a quote, a backquote, a backslash, a brace or a control character, or start with `#`, which the Caddyfile and the logins can't carry. With SMB on it is also a Linux account, so `useradd` must take it |
 | `SWFS_PASSWORD` | `changeme` | Password for Admin UI, Filer, Master, SMB, Grafana and Caddy basic auth. Any printable characters, up to 128 (spec 21) |
 | `HOST_FQDN` | `$(hostname).edge.lab` | FQDN for the host (e.g. `myhost.mydomain.com`) |
 | `SWFS_ADMIN_FQDN` | `admin.$HOST_FQDN` | FQDN for the Admin UI and Caddy landing page |

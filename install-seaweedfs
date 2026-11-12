@@ -348,7 +348,7 @@ resolve_s3_keys() {
   local k
   local -a revoke_keys
   # S26: split without globbing, so a * ? or [ can't expand to file names
-  read -r -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS"
+  read -r -d '' -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS" || true
   for k in "${revoke_keys[@]}"; do
     [[ "$k" == "$S3_ACCESS_KEY" ]] && die "S3_REVOKE_ACCESS_KEYS names the key this run configures ($k). Drop it from the list, or pass a new S3_ACCESS_KEY and S3_SECRET_KEY."
   done
@@ -401,7 +401,7 @@ configure_s3_credentials() {
   record_state S3_KEYS_USER "$S3_USER"
   local revoke
   local -a revoke_keys
-  read -r -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS"
+  read -r -d '' -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS" || true
   for revoke in "${revoke_keys[@]}"; do
     shell_out=$(printf 's3.configure -user=%s -access_key="%s" -delete -apply=true\n' "$S3_USER" "$revoke" | docker exec -i seaweed-mini /usr/bin/weed shell -filer=localhost:8888 2>&1)
     if weed_shell_failed "$shell_out"; then
@@ -1288,21 +1288,21 @@ weed_key_changes() {
 # never shows its value. Any SWFS_PASSWORD of printable characters works; keys and user names get the narrower rules
 # of the places they go.
 check_secrets() {
-  local bad=0 k user_re='^[A-Za-z_][A-Za-z0-9_.-]{0,31}$' user_rule="letters, digits, _, . and -, starting with a letter or _ (Samba needs it as a Linux account)"
+  local bad=0 k
   if [[ "$SWFS_PASSWORD" == *[[:cntrl:]]* ]]; then
     echo "Error: SWFS_PASSWORD can't contain a control character, such as a tab or a newline."; bad=1
   elif (( ${#SWFS_PASSWORD} > 128 )); then
     echo "Error: SWFS_PASSWORD can't be longer than 128 characters."; bad=1
   fi
-  # Without SMB the name is never an account, so it only has to suit the Caddyfile and weed's flags, as before
-  if [[ ${ENABLE_SMB,,} != "true" ]]; then
-    user_re='^[A-Za-z0-9._@+-]{1,64}$' user_rule="letters, digits and . _ @ + -"
+  # SWFS_USER goes into the Caddyfile and the basic-auth logins as written, so what they can't carry is refused. With SMB
+  # on it's also a Linux account, and useradd decides the rest, as before.
+  if [[ -z "$SWFS_USER" || "$SWFS_USER" == *[[:space:][:cntrl:]]* || "$SWFS_USER" == *[\"\`\\{}:]* || "$SWFS_USER" == \#* ]]; then
+    echo "Error: SWFS_USER can't be empty, contain a space, :, a quote, a backquote, a backslash, a brace or a control character,"
+    echo "  or start with #: the Caddyfile and the logins can't carry them."; bad=1
   fi
-  if [[ ! "$SWFS_USER" =~ $user_re ]]; then
-    echo "Error: SWFS_USER can only have $user_rule."; bad=1
-  fi
-  # S24: weed shell splits a line at spaces and at ; before its own quoting, then strips quotes and backslashes, so a key
-  # with any of those is refused. Everything else reaches weed as written. Generated keys (hex) always fit.
+  # S24: weed shell splits a line at ; before its own quoting, then reads quotes and backslashes itself, so a key with
+  # ;, a quote or a backslash is refused, and a space too (it never worked here). Everything else reaches weed as
+  # written. Generated keys (hex) always fit.
   local name
   for name in S3_ACCESS_KEY S3_SECRET_KEY; do
     if weed_key_changes "${!name}"; then
@@ -1310,7 +1310,7 @@ check_secrets() {
     fi
   done
   local -a revoke_keys
-  read -r -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS"
+  read -r -d '' -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS" || true
   for k in "${revoke_keys[@]}"; do
     if weed_key_changes "$k"; then
       echo "Error: S3_REVOKE_ACCESS_KEYS lists a key with ;, a quote, a backslash or a control character, which weed's own shell changes."; bad=1; break
