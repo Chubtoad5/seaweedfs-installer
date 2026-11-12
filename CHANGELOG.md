@@ -10,8 +10,8 @@ Spec 21 (chubtoad-automation).
   Master and SMB, an unmatched `"` stopped the install, an invalid `${…}` stopped it **and printed the whole command,
   password included**, and with `&`, `;` or `|` compose quietly dropped the rest of the line, `-webdav=false` and every
   tuning and cluster flag with it. Now `command:` is a list, one single-quoted item per argument, with `$` written `$$`.
-- **Grafana gets the password exactly** (S20). Its environment line was plain YAML that compose also interpolated: `$`
-  was rewritten, `Aa1 #x` became `Aa1`, a trailing space was dropped, and `: ` or a trailing `:` stopped the install at
+- **Grafana gets the password exactly** (S20), and its user name: a `$` in `SWFS_USER` gave Grafana a shorter name. Its
+  environment lines were plain YAML that compose also interpolated: `$` was rewritten, `Aa1 #x` became `Aa1`, a trailing space was dropped, and `: ` or a trailing `:` stopped the install at
   "Monitoring stack setup failed". It is now a single-quoted item with `$$`.
 - **A changed `SWFS_PASSWORD` reaches Grafana** (S21). Grafana reads its environment's password only when it creates
   its database, so it kept the first one while the install printed the new one. `/opt/monitoring/.grafana-auth` (0600)
@@ -37,9 +37,11 @@ Spec 21 (chubtoad-automation).
 - **Checked before anything changes, each message naming the variable but never its value:** `SWFS_PASSWORD` with a
   control character or over 128 characters; `SWFS_USER` with a space, `:`, a quote, a backquote, a backslash, a brace or
   a control character, or a leading `#`, which the Caddyfile and the logins can't carry (with SMB on, `useradd` still
-  decides the rest, as before); an S3 key, or a key to
-  revoke, that weed's shell would change (above); a registry user with `:` or a space at either end. Each of these
-  failed or came out changed before, so nothing that worked stops working. Generated keys always fit.
+  decides the rest, as before; a backquote or a brace, which
+  hardly anyone uses, is refused too); an S3 key, a key to revoke, or `S3_USER` (which defaults to `SWFS_USER`) that
+  weed's shell would change (above): a `'` or `;` in the S3 user configured no working key while the install reported
+  one; a registry user with `:` or a space at either end. Each of these
+  failed or came out changed before, apart from the backquote and the brace. Generated keys always fit.
 - **On the first run of v1.4.0 over an earlier release with monitoring on,** Grafana's admin password is set to
   `SWFS_PASSWORD` once, because there's no fingerprint yet. A password changed in Grafana's own UI is replaced then.
 - **An existing install keeps its bcrypt hash** while the password is the same, so the Caddyfile and Caddy are left as

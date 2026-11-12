@@ -1309,6 +1309,12 @@ check_secrets() {
       echo "Error: $name can't contain a space, ;, a quote, a backslash or a control character, which weed's own shell changes."; bad=1
     fi
   done
+  # S3_USER, which defaults to SWFS_USER, goes into the same weed shell lines: a ' or ; there left S3 with no working
+  # key while the install said it had one
+  if [[ -z "$S3_USER" ]] || weed_key_changes "$S3_USER"; then
+    echo "Error: S3_USER (unset, it is SWFS_USER) can't be empty, or contain a space, ;, a quote, a backslash or a control character,"
+    echo "  which weed's own shell changes. Set S3_USER to a plain name to keep this SWFS_USER."; bad=1
+  fi
   local -a revoke_keys
   read -r -d '' -a revoke_keys <<< "$S3_REVOKE_ACCESS_KEYS" || true
   for k in "${revoke_keys[@]}"; do
@@ -2228,7 +2234,7 @@ services:
     container_name: grafana
     restart: unless-stopped
     environment:
-      - GF_SECURITY_ADMIN_USER=${SWFS_USER}
+      - $(compose_sq "GF_SECURITY_ADMIN_USER=$SWFS_USER")
       - $(compose_sq "GF_SECURITY_ADMIN_PASSWORD=$SWFS_PASSWORD")
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:

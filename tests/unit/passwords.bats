@@ -58,6 +58,14 @@ mini_command() { python3 -I -c 'import sys, yaml; d = yaml.safe_load(open(sys.ar
   want='mini -admin.user admin -admin.password changeme -dir=/data -webdav=false -volume.index=leveldb -master.volumeSizeLimitMB=512 -ip=10.0.0.5 -master.defaultReplication=001 -dataCenter=dc1 -rack=r1 -master.port.grpc=19333 -volume.port=9340 -volume.port.grpc=19340'
   [ "$(mini_command | tr '\n' ' ')" = "$want " ]
 }
+@test "S20: Grafana's user line is quoted for compose too, so a $ in the name reaches Grafana as written" {
+  ENABLE_MONITORING=true GRAFANA_IMAGE=grafana/grafana-oss:11.5.2 LOKI_IMAGE=grafana/loki:3.4.2 PROMETHEUS_EXT_IMAGE=prom/prometheus:v3.2.1
+  SWFS_PASSWORD=changeme SWFS_USER='ad$min'
+  mkdir -p /opt/monitoring
+  generate_monitoring_compose >/dev/null
+  got=$(python3 -I -c 'import sys, yaml; d = yaml.safe_load(open(sys.argv[1])); e = [x for x in d["services"]["grafana"]["environment"] if x.startswith("GF_SECURITY_ADMIN_USER=")]; print(e[0].split("=", 1)[1].replace("$$", "$"), end="")' /opt/monitoring/docker-compose.yml)
+  [ "$got" = 'ad$min' ]
+}
 @test "S20: every test password reaches Grafana's environment exactly" {
   local n
   ENABLE_MONITORING=true GRAFANA_IMAGE=grafana/grafana-oss:11.5.2 LOKI_IMAGE=grafana/loki:3.4.2 PROMETHEUS_EXT_IMAGE=prom/prometheus:v3.2.1
@@ -189,14 +197,23 @@ mini_command() { python3 -I -c 'import sys, yaml; d = yaml.safe_load(open(sys.ar
   S3_REVOKE_ACCESS_KEYS='good1 b-d'
   check_secrets
   S3_REVOKE_ACCESS_KEYS=""
-  for u in admin Admin ops.admin _svc s15user 1admin 'svc$' 'a!b' user@example.com; do SWFS_USER=$u; check_secrets; done
+  for u in admin Admin ops.admin _svc s15user 1admin 'svc$' 'a!b' user@example.com; do SWFS_USER=$u S3_USER=$u; check_secrets; done
+  # S3_USER defaults to SWFS_USER, and goes to weed shell: a ' or ; there is refused, unless S3_USER is set apart
+  for u in "o'brien" 'ad;min'; do
+    SWFS_USER=$u S3_USER=$u
+    run check_secrets
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"S3_USER (unset, it is SWFS_USER) can't be empty"* ]]
+    SWFS_USER=$u S3_USER=obrien
+    check_secrets
+  done
   for u in ad:min 'ad min' ' admin' 'ad"min' 'ad`min' 'ad\min' '{admin}' '#admin' $'ad\tmin' ''; do
-    SWFS_USER=$u
+    SWFS_USER=$u S3_USER=admin
     run check_secrets
     [ "$status" -eq 1 ]
     [[ "$output" == *"SWFS_USER can't be empty, contain a space"* ]]
   done
-  SWFS_USER=admin
+  SWFS_USER=admin S3_USER=admin
   check_secrets
   SWFS_USER='ad min'
   run check_secrets

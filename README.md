@@ -294,7 +294,7 @@ Edit the `install-seaweedfs` file and modify the `USER DEFINED VARIABLES` sectio
 | `MQ_BROKER_PORT` | `17777` | TCP port for SeaweedMQ broker |
 | `S3_BUCKET` | `charlie` | Default S3 bucket name |
 | `EXTRA_BUCKETS` | `""` | Space-separated list of additional S3 bucket names to create at install time. Useful for pre-creating per-cluster Velero buckets when the cluster inventory is known. Buckets are deduplicated against `S3_BUCKET` and `LOKI_BUCKET`. |
-| `S3_USER` | `$SWFS_USER` | S3 API username |
+| `S3_USER` | `$SWFS_USER` | S3 API username. It can't contain a space, `;`, a quote, a backslash or a control character, which `weed shell` changes: with a `SWFS_USER` like that, set a plain `S3_USER` |
 | `S3_ACCESS_KEY` | *(kept, or randomly generated)* | S3 access key. Unset, a re-run keeps the pair the last install recorded for this `S3_USER`, and a first install generates one (`openssl rand -hex 8`). A new key is added: the old one keeps working until it is revoked |
 | `S3_SECRET_KEY` | *(kept, or randomly generated)* | S3 secret key, as `S3_ACCESS_KEY` (`openssl rand -hex 16`). Neither key can contain a space, `;`, a quote, a backslash or a control character, which `weed shell` changes. A generated pair always fits |
 | `S3_REVOKE_ACCESS_KEYS` | *(empty)* | Space-separated access keys to delete from `S3_USER` once this run's key is configured. A key the user doesn't have is left as it is. The run refuses to revoke the key it is configuring |
