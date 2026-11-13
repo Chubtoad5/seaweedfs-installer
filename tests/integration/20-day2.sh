@@ -130,8 +130,22 @@ umount -f -l "$W/nfs" 2>/dev/null
 
 echo "=== S28: a re-run repairs a dead mount the guard didn't see"
 mv "$GD" "$W/dropin.aside" && systemctl daemon-reload
-systemctl restart docker; sleep 20
-dead=0; [ "$(docker inspect -f '{{.State.Running}}' seaweed-mount 2>/dev/null)" = false ] && ! timeout 5 stat -f /mnt/seaweed >/dev/null 2>&1 && dead=1
+systemctl restart docker
+# Let Docker settle rather than wait a fixed time (20 s was too short on Rocky 10): the Filer answers, and seaweed-mount
+# has either come back with a live mount or failed and stopped
+ms=""
+for _ in $(seq 1 60); do
+  ms=$(docker inspect -f '{{.State.Status}}' seaweed-mount 2>/dev/null)
+  fc=$(docker exec seaweed-mini curl -s -m 2 -o /dev/null -w '%{http_code}' http://localhost:8888 2>/dev/null)
+  [[ "$fc" == 2* ]] && { [ "$ms" = exited ] || mounted_live; } && break
+  sleep 2
+done
+# ...and the Admin UI answers through Caddy, so the re-run below doesn't race weed's own start. Once in CI on Leap 16 a
+# re-run 20 s after the restart found it still down for over 60 s; not seen in seven bench rounds
+admin_up=0
+for _ in $(seq 1 60); do [[ "$(curl -sk -m 3 -o /dev/null -w '%{http_code}' "https://$IP/login")" =~ ^[1-4] ]] && { admin_up=1; break; }; sleep 2; done
+[ $admin_up = 1 ] || bad "S28: the Admin UI isn't back 120 s after the Docker restart"
+dead=0; [ "$ms" = exited ] && ! timeout 5 stat -f /mnt/seaweed >/dev/null 2>&1 && dead=1
 mv "$W/dropin.aside" "$GD" && systemctl daemon-reload
 if [ $dead = 1 ]; then
   ok "S28: without the drop-in, a Docker restart leaves a dead mount (v1.4.0's defect)"
