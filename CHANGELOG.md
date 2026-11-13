@@ -1,5 +1,43 @@
 # Changelog — seaweedfs-installer
 
+## v1.4.1 — 2026-11-13 — seaweed-mount comes back after a Docker restart
+
+Spec 23 (chubtoad-automation).
+
+### Fixed
+- **`seaweed-mount` comes back after a Docker restart, and SMB and NFS with it** (S28). A Docker restart (by hand, a
+  package upgrade, or images-pull-push before v1.2.1 trusting a registry) left the host's FUSE mount at `/mnt/seaweed`
+  with nothing behind it. `seaweed-mount` then exited 128 ("transport endpoint is not connected", or "mkdir
+  /mnt/seaweed: file exists") and stayed down, Samba and NFS served a dead share, and an install re-run failed at
+  `docker compose up`. Only a host restart helped. With SMB or NFS on, the installer now adds
+  `/usr/local/sbin/seaweedfs-mount-guard`, a drop-in on `docker.service` that runs it before every Docker start, and
+  `seaweedfs-mount-guard.service`, which runs after. Before the start it unmounts a dead mount (a FUSE mount with no
+  `weed mount` process that fails `statfs`); a live one is never touched. After it, once the new mount is up, it
+  re-exports NFS (`exportfs -ra`) and restarts Samba, so a held SMB session reconnects; if `seaweed-mount` kept running
+  across the Docker start (`live-restore`), it leaves both alone. Measured on Ubuntu 24.04 and Rocky 10: everything back
+  about 15 s after the restart. Installing it restarts nothing, and a re-run rewrites its files only when they change. A
+  re-run with SMB and NFS off, and `uninstall`, remove it, and clear a dead mount, if compose's stop left one.
+- **An install re-run repairs a dead mount** (S28). It clears one before `docker compose up`, then restarts Samba and NFS
+  as for any replaced mount.
+- **`uninstall` clears a dead mount before removing `/mnt/seaweed`** (S28).
+
+### Changed
+- **images-pull-push v1.2.1** (S29, `IMAGE_PULL_PUSH_REF`): a `push`, or an install with `-registry`, no longer
+  restarts Docker to trust the registry.
+
+### Not covered
+- A `weed mount` process that dies by itself (killed, out of memory) while Docker keeps running still leaves the mount
+  dead, as before; the README's "Hung FUSE mount" has the steps, and a re-run repairs it.
+- A dockerd crash: Docker 29.9 then starts no container again, `restart: unless-stopped` or not, so all of SeaweedFS is
+  down. The guard warns in the journal; a same-settings re-run brings everything back.
+
+### Tests
+- `tests/unit/mount-guard.bats`: what counts as a dead mount, the guard's files for SMB, NFS or both, their removal,
+  someone else's drop-ins kept, and the guard's `clear` and `reexport`.
+- `tests/integration/20-day2.sh`: a Docker restart with SMB and NFS on brings the mount, a held NFS client and a new
+  SMB session back; with the drop-in moved aside, a re-run repairs the dead mount; uninstall removes the guard.
+- A5: the upgrade from the last release installs the guard without restarting Docker.
+
 ## v1.4.0 — 2026-11-12 — Any admin password works everywhere it goes
 
 Spec 21 (chubtoad-automation).

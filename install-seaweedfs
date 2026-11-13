@@ -6,7 +6,7 @@
 
 # -- USER DEFINED Configuration Variables -- #
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 
 DEBUG=${DEBUG:-1}
 
@@ -91,7 +91,7 @@ SWFS_REMOVE_IMAGES=${SWFS_REMOVE_IMAGES:-"false"}  # uninstall: also 'docker rmi
 SWFS_FORCE_ONLINE=${SWFS_FORCE_ONLINE:-"false"}    # true = ignore a swfs-save-version.txt sentinel in the working directory and stay in online mode
 
 # - Helper scripts: which release of each is fetched (spec 12). A URL wins over its ref; a checksum is optional.
-IMAGE_PULL_PUSH_REF=${IMAGE_PULL_PUSH_REF:-"v1.2.0"}      # images-pull-push release (tag, branch or commit) whose image_pull_push.sh is fetched
+IMAGE_PULL_PUSH_REF=${IMAGE_PULL_PUSH_REF:-"v1.2.1"}      # images-pull-push release (tag, branch or commit) whose image_pull_push.sh is fetched
 IMAGE_PULL_PUSH_URL=${IMAGE_PULL_PUSH_URL:-"https://raw.githubusercontent.com/Chubtoad5/images-pull-push/${IMAGE_PULL_PUSH_REF}/image_pull_push.sh"}
 IMAGE_PULL_PUSH_SHA256=${IMAGE_PULL_PUSH_SHA256:-""}      # optional sha256 of image_pull_push.sh; a mismatch stops the run
 INSTALL_PACKAGES_REF=${INSTALL_PACKAGES_REF:-"v1.1.3"}    # install-packages release (tag, branch or commit) whose install_packages.sh is fetched
@@ -270,6 +270,30 @@ wait_for_mount() {
     sleep 2
   done
   echo "  WARNING: /mnt/seaweed isn't mounted yet (check: docker logs seaweed-mount)." | tee -a "$LOG_FILE"
+}
+
+# S28 (spec 23): a dead /mnt/seaweed. When Docker restarts (images-pull-push before v1.2.1 trusting a registry, a
+# package upgrade, by hand) or weed is killed, the host keeps a FUSE mount at /mnt/seaweed with nothing behind it, and
+# seaweed-mount can't start over it ("transport endpoint is not connected", or "mkdir /mnt/seaweed: file exists").
+# install_swfs clears it before 'docker compose up', and configure_mount_guard copies these three functions into
+# /usr/local/sbin/seaweedfs-mount-guard, which clears it before every Docker start.
+# swfs_mount_daemon: this installer's 'weed mount' process is running, so /mnt/seaweed has its daemon.
+swfs_mount_daemon() { ps -C weed -o args= 2>/dev/null | grep -q -- '-filer=seaweed-mini:8888'; }
+# swfs_mount_dead: /mnt/seaweed is a FUSE mount with no daemon that doesn't answer. statfs always reaches the FUSE
+# daemon; stat can still be answered from the kernel's attribute cache for a while after the daemon died.
+swfs_mount_dead() {
+  [[ "$(findmnt -n -o FSTYPE /mnt/seaweed 2>/dev/null | tail -n 1)" == fuse* ]] || return 1
+  swfs_mount_daemon && return 1
+  ! timeout 5 stat -f /mnt/seaweed > /dev/null 2>&1
+}
+# swfs_clear_dead_mount: lazily unmount a dead mount at /mnt/seaweed, stacked ones too. A live one is never touched.
+swfs_clear_dead_mount() {
+  local _n
+  for _n in 1 2 3 4 5; do
+    swfs_mount_dead || return 0
+    umount -l /mnt/seaweed && echo "  Cleared a dead FUSE mount at /mnt/seaweed (no weed process behind it)."
+  done
+  return 0
 }
 
 # private_file <path>: make sure the file exists with mode 600 before secrets are written into it. 'cat >' keeps
@@ -752,6 +776,8 @@ install_swfs () {
   generate_index_html
   persist_caddy_data
   echo "  Starting SeaweedFS and Caddy containers..."
+  # A dead /mnt/seaweed (a Docker restart, say) would stop compose starting seaweed-mount, so a re-run repairs it (S28)
+  swfs_clear_dead_mount | tee -a "$LOG_FILE"
   MOUNT_BEFORE=$(mount_container)
   docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
@@ -820,6 +846,7 @@ install_swfs () {
   if [[ ${ENABLE_NFS,,} == "true" ]]; then
     run_nfs
   fi
+  configure_mount_guard
   # SELinux boolean check must come AFTER the samba packages (and their SELinux
   # policy) are installed by run_smb.
   configure_selinux
@@ -1105,6 +1132,126 @@ EOF
   systemctl enable seaweedfs-nfs-meta-refresh.timer >/dev/null 2>&1
   # restart (not 'enable --now') so a CHANGED interval takes effect on a running timer (SW-16)
   systemctl restart seaweedfs-nfs-meta-refresh.timer || die "Failed to start the NFS metadata refresh timer."
+}
+
+# S28 (spec 23): bring seaweed-mount back after a Docker restart. With SMB or NFS on, the installer writes:
+#   GUARD_BIN     the guard. 'clear' runs before every Docker start and lazily unmounts a dead /mnt/seaweed, so Docker's
+#                 restart policy starts seaweed-mount on a clean folder. 'reexport' runs after, waits for the new mount,
+#                 then re-exports NFS (exportfs -ra is enough: the bench showed held and new clients reading again) and
+#                 restarts Samba (a held SMB session keeps failing on the old mount until it reconnects).
+#   GUARD_DROPIN  the drop-in on docker.service that runs both. A failing guard never stops Docker from starting.
+#   GUARD_UNIT    the oneshot unit for 'reexport', started without blocking, so Docker's start isn't delayed.
+# Writing them restarts nothing: daemon-reload doesn't restart Docker, and the drop-in applies from its next start.
+GUARD_BIN=/usr/local/sbin/seaweedfs-mount-guard
+GUARD_UNIT=/etc/systemd/system/seaweedfs-mount-guard.service
+GUARD_DROPIN=/etc/systemd/system/docker.service.d/50-seaweedfs-mount.conf
+configure_mount_guard () {
+  if [[ ${ENABLE_SMB,,} != "true" && ${ENABLE_NFS,,} != "true" ]]; then
+    remove_mount_guard
+    # compose's --remove-orphans has just stopped seaweed-mount: clear its mount if weed outlived the stop
+    swfs_clear_dead_mount
+    return
+  fi
+  local smb_service="" nfs_on=0 changed=0 bin_txt unit_txt dropin_txt
+  [[ ${ENABLE_SMB,,} == "true" ]] && smb_service=$SMB_SERVICE
+  [[ ${ENABLE_NFS,,} == "true" ]] && nfs_on=1
+  mkdir -p /usr/local/sbin /etc/systemd/system/docker.service.d
+  bin_txt=$({
+    cat <<EOF
+#!/bin/bash
+# seaweedfs-mount-guard, written by seaweedfs-installer $SCRIPT_VERSION (spec 23, S28). Removed by its uninstall.
+#   clear     before Docker starts (docker.service drop-in): lazily unmount a dead FUSE mount at /mnt/seaweed
+#   reexport  after (seaweedfs-mount-guard.service): once the new mount is up, re-export NFS and restart Samba
+SMB_SERVICE="$smb_service"
+NFS_ON=$nfs_on
+STATE=/run/seaweedfs-mount-guard
+EOF
+    declare -f swfs_mount_daemon swfs_mount_dead swfs_clear_dead_mount
+    cat <<'EOF'
+swfs_mount_live() { [[ "$(findmnt -n -o FSTYPE /mnt/seaweed 2>/dev/null | tail -n 1)" == fuse* ]] && timeout 5 stat -f /mnt/seaweed > /dev/null 2>&1; }
+swfs_mount_up() { [[ "$(docker inspect -f '{{.State.Running}}' seaweed-mount 2>/dev/null)" == true ]] && swfs_mount_live; }
+# An older release's uninstall doesn't know this guard: with SeaweedFS gone, it has nothing to do
+if [[ ! -f /opt/seaweedfs/seaweedfs-compose.yaml ]]; then
+  echo "seaweedfs-mount-guard: SeaweedFS isn't installed here any more; nothing to do (this guard can be removed: $0, /etc/systemd/system/seaweedfs-mount-guard.service, /etc/systemd/system/docker.service.d/50-seaweedfs-mount.conf)"
+  exit 0
+fi
+case "${1:-}" in
+  clear)
+    # The time this Docker start began: reexport compares seaweed-mount's start with it
+    date +%s > "$STATE"
+    if swfs_mount_live; then echo "seaweedfs-mount-guard: /mnt/seaweed is live, left alone"; exit 0; fi
+    swfs_clear_dead_mount
+    ;;
+  reexport)
+    t0=$(cat "$STATE" 2>/dev/null); rm -f "$STATE"
+    for _ in $(seq 1 60); do swfs_mount_up && break; sleep 2; done
+    if ! swfs_mount_up; then
+      echo "seaweedfs-mount-guard: WARNING: seaweed-mount isn't up with a live /mnt/seaweed 120 s after Docker started (check: docker ps -a; docker logs seaweed-mount); Samba and NFS left as they are"
+      exit 0
+    fi
+    # Only with live-restore can seaweed-mount keep running across a Docker start, still holding the mount Samba and NFS
+    # serve. Without it, always re-export, so a clock that steps back at boot can't skip it.
+    if [[ "$(docker info -f '{{.LiveRestoreEnabled}}' 2>/dev/null)" == true ]]; then
+      at=$(docker inspect -f '{{.State.StartedAt}}' seaweed-mount 2>/dev/null)
+      started=$([[ -n "$at" ]] && date -d "$at" +%s 2>/dev/null)
+      if [[ "$t0" =~ ^[0-9]+$ && "$started" =~ ^[0-9]+$ && "$started" -lt "$t0" ]]; then
+        echo "seaweedfs-mount-guard: seaweed-mount kept running across the Docker start (live-restore); Samba and NFS left alone"
+        exit 0
+      fi
+    fi
+    if [[ $NFS_ON -eq 1 ]]; then exportfs -ra && echo "seaweedfs-mount-guard: NFS re-exported" || echo "seaweedfs-mount-guard: WARNING: exportfs -ra failed"; fi
+    if [[ -n "$SMB_SERVICE" ]]; then systemctl restart "$SMB_SERVICE" && echo "seaweedfs-mount-guard: Samba ($SMB_SERVICE) restarted" || echo "seaweedfs-mount-guard: WARNING: restarting $SMB_SERVICE failed"; fi
+    ;;
+  *) echo "usage: seaweedfs-mount-guard clear|reexport"; exit 2 ;;
+esac
+EOF
+  })
+  unit_txt=$(cat <<EOF
+[Unit]
+Description=SeaweedFS: re-export Samba and NFS once /mnt/seaweed is back after a Docker start
+Documentation=https://github.com/Chubtoad5/seaweedfs-installer
+After=docker.service smbd.service smb.service nfs-server.service nfs-kernel-server.service
+
+[Service]
+Type=oneshot
+ExecStart=$GUARD_BIN reexport
+TimeoutStartSec=180
+EOF
+)
+  dropin_txt=$(cat <<EOF
+# Written by seaweedfs-installer $SCRIPT_VERSION (spec 23, S28), removed by its uninstall: clear a dead /mnt/seaweed
+# before Docker starts, so seaweed-mount comes back, then re-export Samba and NFS once it has.
+[Service]
+ExecStartPre=-$GUARD_BIN clear
+ExecStartPost=-/usr/bin/systemctl --no-block start seaweedfs-mount-guard.service
+EOF
+)
+  # Each file only when it differs: a rewrite with the same bytes still makes systemd say the unit changed on disk.
+  # Written in place, not moved, so the guard gets its folder's SELinux label (bin_t), which systemd may run.
+  guard_write "$GUARD_BIN" 755 "$bin_txt" && changed=1
+  guard_write "$GUARD_UNIT" 644 "$unit_txt" && changed=1
+  guard_write "$GUARD_DROPIN" 644 "$dropin_txt" && changed=1
+  if [[ $changed -eq 1 ]]; then
+    systemctl daemon-reload
+    echo "  Docker restart guard for /mnt/seaweed installed ($GUARD_DROPIN); Docker wasn't restarted."
+  else
+    echo "  Docker restart guard for /mnt/seaweed: no change."
+  fi
+}
+# guard_write <file> <mode> <content>: write the file when its content differs; true when it did
+guard_write () {
+  # The mode every time: a chmod doesn't touch the mtime systemd watches
+  if [[ -f "$1" && "$(cat "$1")" == "$3" ]]; then chmod "$2" "$1"; return 1; fi
+  printf '%s\n' "$3" > "$1"
+  chmod "$2" "$1"
+}
+# remove_mount_guard: take the guard's three files away, when SMB and NFS are both off, and on uninstall
+remove_mount_guard () {
+  [[ -e "$GUARD_BIN" || -e "$GUARD_UNIT" || -e "$GUARD_DROPIN" ]] || return 0
+  rm -f "$GUARD_BIN" "$GUARD_UNIT" "$GUARD_DROPIN" /run/seaweedfs-mount-guard
+  rmdir /etc/systemd/system/docker.service.d 2>/dev/null || true   # only when no other drop-in is left
+  systemctl daemon-reload
+  echo "  Docker restart guard for /mnt/seaweed removed."
 }
 
 # Caddy keeps its internal CA (pki/authorities/local) and issued certs under /data.
@@ -2658,8 +2805,10 @@ uninstall_swfs () {
   echo "  Removing SeaweedFS and Caddy data and configuration..." | tee -a "$LOG_FILE"
   rm -rf /opt/seaweedfs
   rm -rf /opt/caddy
+  remove_mount_guard | tee -a "$LOG_FILE"
   # FUSE mountpoint (SW-24): compose down should have unmounted it; lazy-unmount any
-  # leftover, and only remove the directory once it is no longer a mountpoint.
+  # leftover, and only remove the directory once it is no longer a mountpoint. A dead one first (S28).
+  swfs_clear_dead_mount | tee -a "$LOG_FILE"
   if mountpoint -q /mnt/seaweed 2>/dev/null; then
     umount -l /mnt/seaweed 2>/dev/null
   fi

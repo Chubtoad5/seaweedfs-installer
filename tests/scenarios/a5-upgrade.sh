@@ -43,8 +43,13 @@ ca1=$(ca); [ -n "$ca1" ] && [ "$ca1" != "$(printf '' | sum)" ] && ok "Caddy's ro
 
 caddy1=$(started seaweed-caddy) mount1=$(started seaweed-mount) mini1=$(started seaweed-mini) graf1=$(started grafana)
 cf1=$(sum < /opt/caddy/Caddyfile)
+dp1=$(systemctl show -p MainPID --value docker)
 (cd new && ./install-seaweedfs install) > o2 2>&1 && ok "install the commit under test over $old" || { bad "install the commit under test over $old"; tail -10 o2 | cut -c1-170; }
 w=$(within 90 running) && ok "every container runs after the upgrade" || bad "not running after the upgrade: $w"
+# S28 (spec 23): the upgrade installs the Docker restart guard, and installing it doesn't restart Docker
+[ -x /usr/local/sbin/seaweedfs-mount-guard ] && [ -s /etc/systemd/system/docker.service.d/50-seaweedfs-mount.conf ] \
+  && ok "S28: the upgrade installed the Docker restart guard" || bad "S28: no Docker restart guard after the upgrade"
+[ "$(systemctl show -p MainPID --value docker)" = "$dp1" ] && ok "S28: Docker wasn't restarted by the upgrade" || bad "S28: the upgrade restarted Docker"
 within 90 s3ok && ok "S3 answers with the same keys" || bad "S3 doesn't answer with the same keys"
 [ "$(s3 "https://$IP:8333/$B/a5/obj.bin" | sum)" = "$(sum < obj.bin)" ] && ok "the S3 object survived" || bad "the S3 object changed or is gone"
 [ "$(filer_get | sum)" = "$(sum < file.bin)" ] && ok "the Filer file survived, and the admin password still opens it" || bad "the Filer file changed or is gone, or the password no longer works"
