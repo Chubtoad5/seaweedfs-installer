@@ -20,6 +20,7 @@ A bash automation script that deploys a self-contained, production-ready Seaweed
   - [Exit codes](#exit-codes)
   - [Install-state file](#install-state-file)
   - [Samba and NFS on a re-run](#samba-and-nfs-on-a-re-run)
+  - [After a Docker restart](#after-a-docker-restart)
   - [Firewall and SELinux handling](#firewall-and-selinux-handling)
   - [Security notes](#security-notes)
 - [Known Issues](#known-issues)
@@ -412,6 +413,36 @@ lost it. The log says which case applied ("Samba: no change, left running.", "NF
 A changed SMB password takes effect without a restart. A reload applies a changed `valid users` to new connections,
 and Samba may close an open session the new setting no longer allows.
 
+### After a Docker restart
+
+When Docker restarts, by hand, for a package upgrade, or because a tool restarted it, the host keeps the old
+`/mnt/seaweed` FUSE mount with nothing behind it, and `seaweed-mount` can't start over it. Before 1.4.1 it stayed down,
+and SMB and NFS clients lost the share until the host restarted. With SMB or NFS on, the installer now adds a guard
+(spec 23):
+
+| File | What it does |
+|:----|:----|
+| `/usr/local/sbin/seaweedfs-mount-guard` | `clear`: unmounts a dead `/mnt/seaweed` (a FUSE mount with no `weed mount` process that fails `statfs`). A live mount is never touched. `reexport`: once `seaweed-mount` is up with a live mount, re-exports NFS (`exportfs -ra`) and restarts Samba, so a held SMB session reconnects. If `seaweed-mount` kept running across the Docker start (Docker's `live-restore`), it leaves both alone |
+| `/etc/systemd/system/docker.service.d/50-seaweedfs-mount.conf` | Runs `clear` before every Docker start, and starts the unit below after it. A failing guard never stops Docker from starting |
+| `/etc/systemd/system/seaweedfs-mount-guard.service` | Runs `reexport`, without delaying Docker's start. It waits up to 120 s for the mount |
+
+So after a Docker restart, `seaweed-mount` comes back by Docker's own restart policy, and the shares with it, in
+about 15 s. Installing the guard doesn't restart Docker: it applies from Docker's next start. The guard logs to the
+journal (`journalctl -u docker -u seaweedfs-mount-guard | grep seaweedfs-mount-guard`). A re-run with SMB and NFS both
+off, and `uninstall`, remove it. An install re-run also clears a dead mount before it starts the containers, so a
+re-run repairs a host that is already in that state.
+
+Not covered:
+- **A `weed mount` process that dies on its own** (killed, out of memory) while Docker keeps running. Docker's restart
+  policy then fails the same way; see "Hung FUSE mount" below.
+- **dockerd itself crashing** (or a restart that turns `live-restore` off). Docker 29.9 then stops every running
+  container and starts none of them again, `restart: unless-stopped` or not, so all of SeaweedFS is down, not only the
+  mount. The guard logs "WARNING: seaweed-mount isn't up … 120 s after Docker started". Re-run the installer with the
+  same settings: it starts the containers and re-exports Samba and NFS. A bare `docker compose up -d` isn't enough,
+  since NFS clients then keep failing until `exportfs -ra`, and a held SMB session until Samba restarts.
+- **A guard left by an older release's `uninstall`** (before 1.4.1, uninstall didn't know it) does nothing once
+  SeaweedFS is gone, and says which three files can be removed.
+
 ### Firewall and SELinux handling
 
 - **firewalld** active (default on Rocky/RHEL and openSUSE Leap 16): install opens the ports for enabled features (admin/master/filer/S3, MQ, monitoring, cluster ports) via `--permanent --add-port`, plus the `samba` and `nfs`/`rpc-bind`/`mountd` services. Only entries the installer actually **adds** are recorded; pre-existing rules are never claimed. Re-install closes recorded entries for features you toggled off; uninstall removes exactly the recorded set.
@@ -490,13 +521,17 @@ NFS export remains the simplest option and is ideal for read-mostly or NFS-only-
 
 ### Hung FUSE mount
 
-In rare occurrences, the `seaweed-mount` container may fail to start with:
+In rare occurrences, the `seaweed-mount` container may fail to start (exit 128) with one of:
 
 ```
 Error response from daemon: invalid mount config for type "bind": stat /mnt/seaweed: transport endpoint is not connected
+error during container init: chdir to cwd ("/data") set in config.json failed: transport endpoint is not connected
+mkdir /mnt/seaweed: file exists
 ```
 
-This can happen when the host FUSE process becomes hung after an unexpected event such as a Docker crash or OOM kill.
+This happens when the host keeps a FUSE mount at `/mnt/seaweed` whose `weed mount` process is gone. Since 1.4.1, a
+Docker restart clears it by itself (see "After a Docker restart"), and an install re-run clears it too. The steps below
+are for the case the guard doesn't cover: the `weed mount` process killed (an OOM kill, say) while Docker keeps running.
 
 **To resolve:**
 
@@ -531,6 +566,15 @@ ls -al /mnt/
 ```bash
 sudo docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d
 ```
+
+6. Let NFS and Samba serve the new mount (an NFS client gets I/O errors until the re-export, and a held SMB session
+   until it reconnects):
+```bash
+sudo exportfs -ra
+sudo systemctl restart smbd   # smb on RHEL, Rocky and SLES
+```
+
+Or re-run the installer with the same settings, which does steps 3 to 6.
 
 ---
 

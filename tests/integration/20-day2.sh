@@ -101,6 +101,63 @@ end_smb && grep -q 's15-replaced.txt' "$W/hold/out" && ok "S15: a new SMB sessio
 exportfs -v | grep -q '^/mnt/seaweed' && ok "S15: NFS exports the new mount" || bad "S15: no NFS export after the restart"
 rm -f /mnt/seaweed/s15-replaced.txt
 
+echo "=== S28: seaweed-mount comes back after a Docker restart, and Samba and NFS serve it"
+G=/usr/local/sbin/seaweedfs-mount-guard GD=/etc/systemd/system/docker.service.d/50-seaweedfs-mount.conf
+mounted_live() { [ "$(docker inspect -f '{{.State.Running}}' seaweed-mount 2>/dev/null)" = true ] && timeout 5 stat -f /mnt/seaweed >/dev/null 2>&1; }
+[ -x "$G" ] && [ -s "$GD" ] && [ -s /etc/systemd/system/seaweedfs-mount-guard.service ] && ok "S28: the guard, its unit and Docker's drop-in are installed" || bad "S28: the guard isn't installed"
+echo s28 > /mnt/seaweed/s28.txt
+mkdir -p "$W/nfs"
+timeout 30 mount -t nfs -o vers=3,soft,timeo=50,retrans=2 "$IP:/mnt/seaweed" "$W/nfs" 2>/dev/null && timeout 20 grep -q s28 "$W/nfs/s28.txt" \
+  && ok "S28: an NFS client reads the share" || bad "S28: couldn't read the share over NFS"
+dp=$(systemctl show -p MainPID --value docker) since=$(date '+%Y-%m-%d %H:%M:%S')
+systemctl restart docker
+back=0
+for _ in $(seq 1 75); do
+  mounted_live && [ "$(systemctl show -p ActiveState --value seaweedfs-mount-guard)" = inactive ] \
+    && timeout 5 grep -q s28 /mnt/seaweed/s28.txt 2>/dev/null && { back=1; break; }
+  sleep 2
+done
+[ "$(systemctl show -p MainPID --value docker)" != "$dp" ] && ok "S28: Docker restarted" || bad "S28: Docker didn't restart"
+[ $back = 1 ] && ok "S28: seaweed-mount is back, with a live mount" \
+  || bad "S28: seaweed-mount didn't come back: $(docker inspect -f '{{.State.Status}} {{.State.Error}}' seaweed-mount 2>/dev/null | cut -c1-150)"
+if journalctl --since "$since" --no-pager -o cat 2>/dev/null | grep -q 'Cleared a dead FUSE mount'; then ok "S28: the guard cleared the dead mount before Docker started"
+else skip "S28: this Docker restart left no dead mount to clear"; fi
+[ "$(systemctl show -p Result --value seaweedfs-mount-guard)" = success ] && ok "S28: the re-export ran" || bad "S28: seaweedfs-mount-guard.service didn't succeed"
+timeout 20 grep -q s28 "$W/nfs/s28.txt" 2>/dev/null && ok "S28: the NFS client that stayed mounted reads the share again" || bad "S28: the NFS client still can't read the share"
+hold_smb s15user "$P1"
+end_smb && grep -q 's28.txt' "$W/hold/out" && ok "S28: a new SMB session lists the share" || { bad "S28: SMB doesn't serve the share"; tail -4 "$W/hold/out"; }
+umount -f -l "$W/nfs" 2>/dev/null
+
+echo "=== S28: a re-run repairs a dead mount the guard didn't see"
+mv "$GD" "$W/dropin.aside" && systemctl daemon-reload
+systemctl restart docker
+# Let Docker settle rather than wait a fixed time (20 s was too short on Rocky 10): the Filer answers, and seaweed-mount
+# has either come back with a live mount or failed and stopped
+ms=""
+for _ in $(seq 1 60); do
+  ms=$(docker inspect -f '{{.State.Status}}' seaweed-mount 2>/dev/null)
+  fc=$(docker exec seaweed-mini curl -s -m 2 -o /dev/null -w '%{http_code}' http://localhost:8888 2>/dev/null)
+  [[ "$fc" == 2* ]] && { [ "$ms" = exited ] || mounted_live; } && break
+  sleep 2
+done
+# ...and the Admin UI answers through Caddy, so the re-run below doesn't race weed's own start. Once in CI on Leap 16 a
+# re-run 20 s after the restart found it still down for over 60 s; not seen in seven bench rounds
+admin_up=0
+for _ in $(seq 1 60); do [[ "$(curl -sk -m 3 -o /dev/null -w '%{http_code}' "https://$IP/login")" =~ ^[1-4] ]] && { admin_up=1; break; }; sleep 2; done
+[ $admin_up = 1 ] || bad "S28: the Admin UI isn't back 120 s after the Docker restart"
+dead=0; [ "$ms" = exited ] && ! timeout 5 stat -f /mnt/seaweed >/dev/null 2>&1 && dead=1
+mv "$W/dropin.aside" "$GD" && systemctl daemon-reload
+if [ $dead = 1 ]; then
+  ok "S28: without the drop-in, a Docker restart leaves a dead mount (v1.4.0's defect)"
+  inst SWFS_PASSWORD=$P1 S3_ACCESS_KEY=$K1 S3_SECRET_KEY=$S1 SWFS_USER=s15user S3_USER=admin NFS_CLIENTS="$IP" && ok "S28: a same-settings re-run passes" || { bad "S28: the re-run over a dead mount"; show; }
+  grep -q 'Cleared a dead FUSE mount' "$W/o" && ok "S28: the re-run cleared the dead mount" || bad "S28: the re-run didn't clear the dead mount"
+  mounted_live && timeout 5 grep -q s28 /mnt/seaweed/s28.txt && ok "S28: seaweed-mount is back after the re-run" || bad "S28: seaweed-mount is still down after the re-run"
+else
+  skip "S28: this host's Docker restart left no dead mount, so the re-run case can't be shown"
+  mounted_live || bad "S28: seaweed-mount is down after the restart without the drop-in, but the mount wasn't seen as dead"
+fi
+rm -f /mnt/seaweed/s28.txt
+
 echo "=== New password and keys (S3, S7), revoking a key (SC1), re-runs with no keys (S11)"
 st=$(started)
 inst SWFS_PASSWORD=$P2 S3_ACCESS_KEY=$K2 S3_SECRET_KEY=$S2 && ok "re-run with a new password and key" || { bad "re-run with a new password and key"; show; }
@@ -199,4 +256,6 @@ else
   skip "the UFW case: this host has no UFW, or runs firewalld"
 fi
 [ -z "$(docker ps -q --filter name=seaweed 2>/dev/null)" ] && ok "no containers left" || bad "containers left behind"
+[ ! -e /usr/local/sbin/seaweedfs-mount-guard ] && [ ! -e /etc/systemd/system/seaweedfs-mount-guard.service ] \
+  && [ ! -e /etc/systemd/system/docker.service.d/50-seaweedfs-mount.conf ] && ok "S28: uninstall removed the guard" || bad "S28: uninstall left the guard behind"
 echo "=== exit $fail"; exit $fail
