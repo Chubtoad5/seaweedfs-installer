@@ -1,6 +1,6 @@
 # Changelog — seaweedfs-installer
 
-## v1.5.0 — 2026-11-23 — SeaweedFS 4.54
+## v1.5.0 — 2026-11-17 — SeaweedFS 4.54
 
 Spec 24 (chubtoad-automation).
 
