@@ -31,7 +31,9 @@ Spec 24 (chubtoad-automation).
 - **An upgrade, or any run that recreates `seaweed-mount`, failed at `docker compose up` while an NFS client had the
   share mounted** (S35). weed couldn't unmount the old mount, so it was left dead, and the new container couldn't
   start ("chdir to cwd … transport endpoint is not connected"). The mount, SMB and NFS stayed down until a re-run.
-  The run now clears the dead mount and starts again.
+  The run now clears the dead mount and starts again. On Rocky 10, Docker starts the new container on the dead mount
+  instead, and it restarts until Docker gives up ("fusermount: failed to access mountpoint .: Socket not connected").
+  There the run clears the mount and restarts `seaweed-mount` once.
 - **Caddy could stay on a Caddyfile it never loaded** (S36). A run that stopped after writing the Caddyfile and before
   restarting Caddy left the next run seeing no change. `/opt/caddy/.caddyfile-applied` records the Caddyfile Caddy
   last started with.

@@ -79,6 +79,43 @@ weed_mount_running() { echo "/usr/bin/weed mount -filer=seaweed-mini:8888 -filer
   grep -q 'remove_mount_guard' <<< "$body"
   grep -q 'swfs_clear_dead_mount' <<< "$body"
 }
+@test "S35: after compose up, a live mount is left alone and seaweed-mount isn't restarted" {
+  run swfs_mount_recover
+  [ "$status" -eq 0 ]
+  ! called "docker restart" || false
+  ! called umount || false
+}
+@test "S35: a mount left dead under the new seaweed-mount (Rocky 10) is cleared and seaweed-mount restarted once" {
+  dead
+  run swfs_mount_recover
+  echo "$output"
+  [ "$status" -eq 0 ]
+  called "umount -l /mnt/seaweed"
+  [ "$(grep -c 'docker restart seaweed-mount' "$STUB_LOG")" = 1 ]
+  [[ "$output" == *"started on the old mount it left behind"* ]]
+}
+@test "S35: while weed mount is still starting, the old mount isn't called dead" {
+  dead; weed_mount_running
+  run swfs_mount_recover
+  [ "$status" -eq 0 ]
+  ! called "docker restart" || false
+  ! called umount || false
+}
+@test "S35: no mount yet and none dead: it waits, then leaves it to wait_for_mount" {
+  echo ext4 > "$T/fstype"
+  run swfs_mount_recover
+  [ "$status" -eq 0 ]
+  ! called "docker restart" || false
+  [ "$(grep -c '^sleep' "$STUB_LOG")" = 15 ]
+}
+@test "S35: install checks the mount after compose up, only when there was one before it" {
+  body=$(declare -f install_swfs)
+  had_at=$(grep -n 'had_mount=1' <<< "$body" | head -n 1 | cut -d: -f1)
+  up_at=$(grep -n 'seaweedfs-compose.yaml up -d' <<< "$body" | head -n 1 | cut -d: -f1)
+  rec_at=$(grep -n '(( *had_mount *)) && swfs_mount_recover' <<< "$body" | head -n 1 | cut -d: -f1)
+  after_at=$(grep -n 'MOUNT_AFTER=' <<< "$body" | head -n 1 | cut -d: -f1)
+  [ -n "$had_at" ] && [ -n "$rec_at" ] && [ "$had_at" -lt "$up_at" ] && [ "$up_at" -lt "$rec_at" ] && [ "$rec_at" -lt "$after_at" ]
+}
 @test "S28: with SMB and NFS on, the guard, its unit and the Docker drop-in are written, and Docker isn't restarted" {
   run configure_mount_guard
   echo "$output"

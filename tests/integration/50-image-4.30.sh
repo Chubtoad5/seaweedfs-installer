@@ -47,7 +47,9 @@ mkdir -p "$W/nfs"
 timeout 30 mount -t nfs -o vers=3,soft,timeo=50,retrans=2 "$IP:/mnt/seaweed" "$W/nfs" 2>/dev/null && timeout 20 grep -q s35 "$W/nfs/s35.txt" \
   && ok "S35: an NFS client has the share mounted and reads it" || bad "S35: couldn't read the share over NFS"
 SWFS_IMAGE="" ./install-seaweedfs install > "$W/o" 2>&1 && ok "S35: the move from $IMG to $PIN with the NFS client mounted" || { bad "S35: the move from $IMG to $PIN with the NFS client mounted"; tail -8 "$W/o" | cut -c1-170; }
-grep -q "couldn't start on the old mount" "$W/o" && echo "INFO  S35: compose left a dead mount, and the run cleared it" || echo "INFO  S35: compose left no dead mount this time"
+if grep -q "couldn't start on the old mount" "$W/o"; then echo "INFO  S35: compose up failed on the dead mount, and the run cleared it"
+elif grep -q "started on the old mount" "$W/o"; then echo "INFO  S35: seaweed-mount started on the dead mount (Rocky), and the run cleared it and restarted it"
+else echo "INFO  S35: compose left no dead mount this time"; fi
 [ "$(docker inspect -f '{{.State.Running}} {{.Config.Image}}' seaweed-mount 2>/dev/null)" = "true $PIN" ] && timeout 5 stat -f /mnt/seaweed >/dev/null 2>&1 \
   && ok "S35: seaweed-mount runs $PIN, with a live mount" || bad "S35: seaweed-mount: $(docker inspect -f '{{.State.Status}} {{.Config.Image}}' seaweed-mount 2>/dev/null), mount $(timeout 5 stat -f /mnt/seaweed >/dev/null 2>&1 && echo live || echo dead)"
 within 60 eval 'timeout 20 grep -q s35 "$W/nfs/s35.txt" 2>/dev/null' && ok "S35: the NFS client that stayed mounted reads the share again" || bad "S35: the NFS client that stayed mounted can't read the share"

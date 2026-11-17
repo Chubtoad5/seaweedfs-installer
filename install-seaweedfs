@@ -331,6 +331,25 @@ swfs_clear_dead_mount() {
   done
   return 0
 }
+# swfs_mount_recover: after 'docker compose up' over a live mount, wait up to 30 s for /mnt/seaweed to be live again. If
+# it's dead meanwhile, clear it and restart seaweed-mount once. S35 on Rocky 10: when seaweed-mount is recreated while an
+# NFS client holds the export, the old mount is left dead, and Rocky's runc starts the new container on it anyway.
+# compose up succeeds, then weed's fusermount fails ("failed to access mountpoint .: Socket not connected"), and Docker
+# restarts the container until it gives up. Ubuntu and Leap refuse the start instead, which install_swfs handles at
+# compose up.
+swfs_mount_recover() {
+  local i
+  for ((i = 0; i < 15; i++)); do
+    [[ "$(findmnt -n -o FSTYPE /mnt/seaweed 2>/dev/null | tail -n 1)" == fuse* ]] \
+      && timeout 5 stat -f /mnt/seaweed > /dev/null 2>&1 && return 0
+    swfs_mount_dead && break
+    sleep 2
+  done
+  swfs_mount_dead || return 0
+  echo "  seaweed-mount started on the old mount it left behind; clearing it and restarting seaweed-mount..."
+  swfs_clear_dead_mount
+  docker restart seaweed-mount > /dev/null || echo "  WARNING: restarting seaweed-mount failed (check: docker logs seaweed-mount)."
+}
 
 # private_file <path>: make sure the file exists with mode 600 before secrets are written into it. 'cat >' keeps
 # an existing file's mode, so this also tightens files an earlier release left world-readable.
@@ -818,6 +837,8 @@ install_swfs () {
   # A dead /mnt/seaweed (a Docker restart, say) would stop compose starting seaweed-mount, so a re-run repairs it (S28)
   swfs_clear_dead_mount | tee -a "$LOG_FILE"
   MOUNT_BEFORE=$(mount_container)
+  local had_mount=0
+  [[ "$(findmnt -n -o FSTYPE /mnt/seaweed 2>/dev/null | tail -n 1)" == fuse* ]] && had_mount=1
   if ! docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans; then
     # S35: recreating seaweed-mount (a new image or setting) stops weed mount while an NFS client has the export
     # mounted. Its unmount then fails, the old mount is left dead, and the new container can't start on it ("chdir to
@@ -828,6 +849,8 @@ install_swfs () {
     docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
       || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
   fi
+  # S35, Rocky 10: compose can start the new seaweed-mount on the dead mount; see swfs_mount_recover
+  ((had_mount)) && swfs_mount_recover | tee -a "$LOG_FILE"
   MOUNT_AFTER=$(mount_container)
   # Apply a regenerated Caddyfile to an already-running container (SW-8): compose
   # only recreates on compose-file changes, not bind-mounted config changes.
