@@ -158,6 +158,13 @@ compose_setup() {
   stub docker 'cat > /dev/null; echo "the cluster has 1 volume servers: [110.0.2.20:9340]"'
   ! volume_admitted
 }
+@test "S38: an entry with its gRPC port (ip:9350.19340, ports that don't pair) is still this volume server" {
+  MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9350 CLUSTER_MASTER=192.0.2.10:9333
+  stub docker 'cat > /dev/null; echo "the cluster has 2 volume servers: [192.0.2.10:9340 192.0.2.20:9350.19340]"'
+  volume_admitted
+  CLUSTER_VOLUME_PORT=19340
+  ! volume_admitted
+}
 @test "S38: the check asks the master with cluster.check, which lists a server that holds no volume yet" {
   MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
   stub docker 'cat >> "$STUB_LOG"; echo "the cluster has 1 volume servers: [192.0.2.20:9340]"'
