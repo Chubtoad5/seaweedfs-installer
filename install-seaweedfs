@@ -6,15 +6,20 @@
 
 # -- USER DEFINED Configuration Variables -- #
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.5.0"
 
 DEBUG=${DEBUG:-1}
 
 # - Container Images
 # Pinned for reproducible online + air-gapped installs (a 'save' on one day and an 'install'
 # weeks later must use the same binary). Override at runtime to track a newer release.
-SWFS_IMAGE=${SWFS_IMAGE:-"chrislusf/seaweedfs:4.30"}
+SWFS_IMAGE=${SWFS_IMAGE:-"chrislusf/seaweedfs:4.54"}
 CADDY_IMAGE=${CADDY_IMAGE:-"caddy:2.11.3"}
+# The port seaweed-mini serves its Admin UI on inside seaweed_net, where Caddy reaches it (S31). Not a setting: weed
+# 4.49 moved the default from 23646 to 12535, so mini gets it as a flag, and every image (4.30 included) serves the same
+# port. Its gRPC port is this + 10000 (22535), below Linux's ephemeral range; 4.30's default gRPC port, 33646, is inside
+# it, so one of weed's own outgoing connections could take it and stop the Admin UI (seaweedfs/seaweedfs#10928).
+WEED_ADMIN_PORT=12535
 
 # - Basic Authentication
 SWFS_USER=${SWFS_USER:-"admin"}             # Username for SeaweedFS Admin UI, Filer, Master
@@ -1309,7 +1314,7 @@ generate_caddyfile () {
   # to the landing page instead of the dashboard (the Admin UI always redirects to /admin).
   local splash_gate="" login_location=""
   if [[ ${SPLASH_REQUIRE_LOGIN,,} == "true" ]]; then
-    splash_gate="forward_auth seaweed-mini:23646 {
+    splash_gate="forward_auth seaweed-mini:$WEED_ADMIN_PORT {
                         uri /admin
                 }"
     login_location='header_down Location "^(https?://[^/]+)?/admin$" "/"'
@@ -1342,7 +1347,7 @@ $SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT, https://$MGMT_IP:$SWFS_ADMIN_PORT {
                 file_server
         }
         handle /login {
-                reverse_proxy seaweed-mini:23646 {
+                reverse_proxy seaweed-mini:$WEED_ADMIN_PORT {
                         $login_location
                         header_down Set-Cookie "^(.+)$" "\$1; Secure"
                 }
@@ -1355,7 +1360,7 @@ $SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT, https://$MGMT_IP:$SWFS_ADMIN_PORT {
         # Everything else is the SeaweedFS Admin UI. A catch-all (not a per-path list) so
         # sections added by newer SeaweedFS releases (e.g. /plugin in 4.30) work unchanged.
         handle {
-                reverse_proxy seaweed-mini:23646 {
+                reverse_proxy seaweed-mini:$WEED_ADMIN_PORT {
                         header_down Set-Cookie "^(.+)$" "\$1; Secure"
                 }
         }
@@ -1505,6 +1510,9 @@ auth_fingerprint() {
 # su-exec or seaweed user runs weed as root, as its own entrypoint did. The image's /bin/sh reads it from a read-only
 # mount, so the host file needs no exec permission. A running seaweed-mini reads it only when it starts: a release that
 # changes this script but not the compose file must restart seaweed-mini itself (v1.3.1's compose change recreates it).
+# Upstream fixed its script in 4.54 (seaweedfs/seaweedfs#12587), and for 'mini' it now does the same as this one. This
+# one stays (spec 24, S32) for anyone who sets SWFS_IMAGE to an older tag, and the integration tests fail when the
+# pinned image's /entrypoint.sh changes, so each image move reviews what this one copies.
 write_weed_entrypoint () {
   cat > /opt/seaweedfs/weed-entrypoint.sh <<'WEED_ENTRYPOINT'
 #!/bin/sh
@@ -1541,7 +1549,10 @@ generate_compose_file () {
   # short, or with the flags after it dropped. Each item is a single-quoted YAML scalar with $ written $$, which compose
   # reads back exactly. For every password that worked before, compose sees the same list, so its config hash, and the
   # container, stay the same.
-  local -a mini_args=(mini -admin.user "$SWFS_USER" -admin.password "$SWFS_PASSWORD" -dir=/data -webdav=false)
+  # -admin.port pins the Admin UI to the port Caddy proxies to (S31). weed 4.49+ also keeps a best-effort listener on
+  # the old 23646; the flag that turns it off (-admin.port.legacy) doesn't exist before 4.49, and weed refuses an
+  # unknown flag, so it stays on for as long as an older SWFS_IMAGE is supported.
+  local -a mini_args=(mini -admin.user "$SWFS_USER" -admin.password "$SWFS_PASSWORD" -dir=/data -webdav=false "-admin.port=$WEED_ADMIN_PORT")
   [[ -n "$VOLUME_INDEX" ]] && mini_args+=("-volume.index=$VOLUME_INDEX")
   [[ -n "$VOLUME_SIZE_LIMIT_MB" ]] && mini_args+=("-master.volumeSizeLimitMB=$VOLUME_SIZE_LIMIT_MB")
   # Pre-compute optional cluster-ready flags + host-published cluster ports (CLUSTER_MODE=cluster).

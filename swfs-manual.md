@@ -6,7 +6,7 @@ This guide walks through manually deploying the SeaweedFS stack without the auto
 
 | Container | Image | Purpose |
 |:----------|:------|:--------|
-| `seaweed-mini` | `chrislusf/seaweedfs:4.30` | All-in-one: Master, Volume, Filer, Admin UI, S3 Gateway |
+| `seaweed-mini` | `chrislusf/seaweedfs:4.54` | All-in-one: Master, Volume, Filer, Admin UI, S3 Gateway |
 | `seaweed-caddy` | `caddy:2.11.3` | Reverse proxy with self-signed TLS and basic auth |
 
 Optional add-ons are covered in their own sections below. Image versions match the script's pinned defaults (`SWFS_IMAGE` / `CADDY_IMAGE`); change them in every step if you track a newer release.
@@ -89,12 +89,13 @@ S3_SECRET_KEY="$(openssl rand -hex 16)"
 sudo mkdir -p /opt/caddy/data /opt/caddy/config
 sudo chmod 700 /opt/caddy/data   # holds the Caddy CA private key
 sudo mkdir -p /opt/seaweedfs/mini
-sudo chmod 700 /opt/seaweedfs    # weed saves its flags, the admin password among them, to mini/mini.options, mode 644
+sudo chmod 700 /opt/seaweedfs    # the compose file holds the admin password (and weed before 4.49 saved it to mini/mini.options)
 ```
 
-`seaweed-mini` starts through this script rather than the image's `/entrypoint.sh`, which passes its arguments to weed
-unquoted: an admin password with a space would reach the Admin UI as its first word only, and `*`, `?` and `[` would be
-globbed. It does what the image's script does for `mini`, and passes the arguments whole.
+`seaweed-mini` starts through this script rather than the image's `/entrypoint.sh`. Before 4.54, that script passed
+its arguments to weed unquoted: an admin password with a space would reach the Admin UI as its first word only, and
+`*`, `?` and `[` would be globbed (fixed upstream in 4.54, seaweedfs/seaweedfs#12587). This one does what the image's
+script does for `mini`, and passes the arguments whole with any image.
 
 ```bash
 sudo tee /opt/seaweedfs/weed-entrypoint.sh > /dev/null <<'EOF'
@@ -144,7 +145,7 @@ ${SWFS_ADMIN_FQDN}:443, https://${HOST_IP}:443 {
         file_server
     }
     handle {
-        reverse_proxy seaweed-mini:23646 {
+        reverse_proxy seaweed-mini:12535 {
             header_down Set-Cookie "^(.+)\$" "\$1; Secure"
         }
     }
@@ -190,7 +191,7 @@ networks:
 
 services:
   seaweed-mini:
-    image: chrislusf/seaweedfs:4.30
+    image: chrislusf/seaweedfs:4.54
     container_name: seaweed-mini
     entrypoint: ["/bin/sh", "/weed-entrypoint.sh"]
     # One list item each, so compose never splits or rewrites the password
@@ -202,6 +203,9 @@ services:
       - ${SWFS_PASSWORD_YAML}
       - '-dir=/data'
       - '-webdav=false'
+      # The Admin UI's port, where Caddy proxies. Set, so any image serves the same one (4.49 moved the default
+      # from 23646 to 12535)
+      - '-admin.port=12535'
     volumes:
       - /opt/seaweedfs/mini:/data
       - /opt/seaweedfs/weed-entrypoint.sh:/weed-entrypoint.sh:ro
@@ -317,7 +321,7 @@ Append the `seaweed-mq` service to the existing compose file, then restart the s
 sudo tee -a /opt/seaweedfs/seaweedfs-compose.yaml > /dev/null <<EOF
 
   seaweed-mq:
-    image: chrislusf/seaweedfs:4.30
+    image: chrislusf/seaweedfs:4.54
     container_name: seaweed-mq
     command: >
       mq.broker
@@ -403,7 +407,7 @@ EOF
 sudo tee -a /opt/seaweedfs/seaweedfs-compose.yaml > /dev/null <<EOF
 
   seaweed-mount:
-    image: chrislusf/seaweedfs:4.30
+    image: chrislusf/seaweedfs:4.54
     container_name: seaweed-mount
     privileged: true
     command:
@@ -485,7 +489,7 @@ sudo zypper install -y nfs-kernel-server
 sudo tee -a /opt/seaweedfs/seaweedfs-compose.yaml > /dev/null <<EOF
 
   seaweed-mount:
-    image: chrislusf/seaweedfs:4.30
+    image: chrislusf/seaweedfs:4.54
     container_name: seaweed-mount
     privileged: true
     command:
@@ -968,11 +972,11 @@ Container images are saved separately from OS packages using the Docker CLI.
 
 ```bash
 # Pull core images
-docker pull chrislusf/seaweedfs:4.30
+docker pull chrislusf/seaweedfs:4.54
 docker pull caddy:2.11.3
 
 # Save core images only
-docker save chrislusf/seaweedfs:4.30 caddy:2.11.3 \
+docker save chrislusf/seaweedfs:4.54 caddy:2.11.3 \
   | gzip > seaweedfs-images.tar.gz
 
 # --- OR --- pull and save core + monitoring images
@@ -981,7 +985,7 @@ docker pull grafana/grafana-oss:11.5.2
 docker pull prom/prometheus:v3.2.1
 
 docker save \
-  chrislusf/seaweedfs:4.30 \
+  chrislusf/seaweedfs:4.54 \
   caddy:2.11.3 \
   grafana/loki:3.4.2 \
   grafana/grafana-oss:11.5.2 \
@@ -1204,8 +1208,8 @@ The registry must have these projects pre-created before pushing. See the [READM
 
 ```bash
 # SeaweedFS
-docker tag chrislusf/seaweedfs:4.30 ${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:4.30
-docker push ${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:4.30
+docker tag chrislusf/seaweedfs:4.54 ${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:4.54
+docker push ${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:4.54
 
 # Caddy (uses the 'library' project namespace)
 docker tag caddy:2.11.3 ${REG_HOST}:${REG_PORT}/library/caddy:2.11.3
@@ -1228,11 +1232,11 @@ When creating the Docker Compose and monitoring compose files, substitute the im
 
 ```bash
 # Override image variables before following the core install steps
-SWFS_IMAGE="${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:4.30"
+SWFS_IMAGE="${REG_HOST}:${REG_PORT}/chrislusf/seaweedfs:4.54"
 CADDY_IMAGE="${REG_HOST}:${REG_PORT}/library/caddy:2.11.3"
 LOKI_IMAGE="${REG_HOST}:${REG_PORT}/grafana/loki:3.4.2"
 GRAFANA_IMAGE="${REG_HOST}:${REG_PORT}/grafana/grafana-oss:11.5.2"
 PROMETHEUS_IMAGE="${REG_HOST}:${REG_PORT}/prom/prometheus:v3.2.1"
 ```
 
-Then proceed with [Section 5 (Create the Docker Compose File)](#5-create-the-docker-compose-file) and replace `chrislusf/seaweedfs:4.30` / `caddy:2.11.3` with `${SWFS_IMAGE}` / `${CADDY_IMAGE}`, and similarly for the monitoring compose file.
+Then proceed with [Section 5 (Create the Docker Compose File)](#5-create-the-docker-compose-file) and replace `chrislusf/seaweedfs:4.54` / `caddy:2.11.3` with `${SWFS_IMAGE}` / `${CADDY_IMAGE}`, and similarly for the monitoring compose file.

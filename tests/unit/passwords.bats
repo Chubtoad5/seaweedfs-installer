@@ -50,12 +50,12 @@ mini_command() { python3 -I -c 'import sys, yaml; d = yaml.safe_load(open(sys.ar
     [ "$(yaml_get /opt/seaweedfs/seaweedfs-compose.yaml services seaweed-mini command 3)" = "-admin.password" ]
   done
 }
-@test "S19: the arguments and their order are what the folded command gave compose, with tuning and cluster flags" {
+@test "S19: the arguments and their order are what the folded command gave compose, with tuning and cluster flags (and S31's -admin.port)" {
   SWFS_PASSWORD=changeme VOLUME_INDEX=leveldb VOLUME_SIZE_LIMIT_MB=512 CLUSTER_MODE=cluster CLUSTER_REPLICATION=001
   CLUSTER_DC=dc1 CLUSTER_RACK=r1 CLUSTER_MASTER_GRPC_PORT=19333 CLUSTER_VOLUME_PORT=9340 CLUSTER_VOLUME_GRPC_PORT=19340
   private_dir /opt/seaweedfs
   generate_compose_file
-  want='mini -admin.user admin -admin.password changeme -dir=/data -webdav=false -volume.index=leveldb -master.volumeSizeLimitMB=512 -ip=10.0.0.5 -master.defaultReplication=001 -dataCenter=dc1 -rack=r1 -master.port.grpc=19333 -volume.port=9340 -volume.port.grpc=19340'
+  want='mini -admin.user admin -admin.password changeme -dir=/data -webdav=false -admin.port=12535 -volume.index=leveldb -master.volumeSizeLimitMB=512 -ip=10.0.0.5 -master.defaultReplication=001 -dataCenter=dc1 -rack=r1 -master.port.grpc=19333 -volume.port=9340 -volume.port.grpc=19340'
   [ "$(mini_command | tr '\n' ' ')" = "$want " ]
 }
 @test "S20: Grafana's user line is quoted for compose too, so a $ in the name reaches Grafana as written" {
