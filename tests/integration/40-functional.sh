@@ -88,7 +88,9 @@ within 30 mq_registered && ok "the broker is registered with the master" || bad 
 mq_topic() { wshell "mq.topic.configure -namespace=ci -topic=c1 -partitionCount=2" > "$W/mq.out"; grep -q "\"leader_broker\": \"$mq_ip:17777\"" "$W/mq.out"; }
 within 30 mq_topic && ok "a new topic gets the broker as its partitions' leader" \
   || { bad "configure a topic"; tail -5 "$W/mq.out"; }
-grep -q 'namespace:"ci" name:"c1"' <<< "$(wshell mq.topic.list)" && ok "the topic is listed" || bad "the topic isn't listed"
+# mq.topic.list prints each topic with Go's %+v. protobuf-go varies the spaces in that on purpose, so match any spacing.
+tl=$(wshell mq.topic.list)
+grep -qE 'namespace:[[:space:]]*"ci"[[:space:]]+name:[[:space:]]*"c1"' <<< "$tl" && ok "the topic is listed" || { bad "the topic isn't listed"; head -n 6 <<< "$tl" | cut -c1-170; }
 
 echo "=== Monitoring"
 c=$(code -u "admin:$P" "https://$IP:3000/api/user"); [ "$c" = 200 ] && ok "log in to Grafana" || bad "Grafana login got $c"
