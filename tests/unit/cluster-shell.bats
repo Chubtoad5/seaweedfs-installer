@@ -6,7 +6,7 @@ S=$BATS_TEST_DIRNAME/../../install-seaweedfs
 
 @test "every weed shell names the container's own Filer" {
   # Except join's admission check (spec 24, S38): a volume node runs no Filer, and its volume.list needs only the master
-  run bash -c "grep -n 'weed shell' '$S' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -v -- '-filer=localhost:8888' | grep -vF 'exec -i seaweed-volume /usr/bin/weed shell -master=\"\$CLUSTER_MASTER\" <<< \"volume.list\"'"
+  run bash -c "grep -n 'weed shell' '$S' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -v -- '-filer=localhost:8888' | grep -vF 'exec -i seaweed-volume timeout 10 /usr/bin/weed shell -master=\"\$CLUSTER_MASTER\" <<< \"volume.list\"'"
   [ -z "$output" ]
 }
 

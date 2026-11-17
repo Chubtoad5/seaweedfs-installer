@@ -122,16 +122,17 @@ compose_setup() {
   stub docker 'cat > /dev/null; echo "  DataNode 192.0.2.10:9340 hdd(volume:1/8)"; echo "  DataNode 192.0.2.20:9340 hdd(volume:0/8)"'
   volume_admitted
   wait_for_admission
-  called "exec -i seaweed-volume /usr/bin/weed shell -master=192.0.2.10:9333"
+  called "exec -i seaweed-volume timeout 10 /usr/bin/weed shell -master=192.0.2.10:9333"
 }
 
 @test "S38: a volume server the master doesn't list isn't admitted, and the wait gives up" {
   MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
   stub docker 'cat > /dev/null; echo "  DataNode 192.0.2.10:9340 hdd(volume:1/8)"; echo "  DataNode 192.0.2.200:9340 hdd(volume:0/8)"'
   ! volume_admitted
+  : > "$STUB_LOG"
   run wait_for_admission
   [ "$status" -ne 0 ]
-  [ "$(grep -c 'weed shell' "$STUB_LOG")" -ge 18 ]
+  [ "$(grep -c 'weed shell' "$STUB_LOG")" = 18 ]
 }
 
 @test "S38: another port on the same address isn't this volume server" {
@@ -143,4 +144,81 @@ compose_setup() {
 @test "S38: join waits for admission before it reports success, and fails without it" {
   body=$(declare -f run_join)
   [[ "$body" == *"wait_for_admission"*"die "*"generate_join_outputs"* ]]
+}
+
+@test "S38: the wait stops at 90 s even when each check is slow" {
+  MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
+  n=0
+  volume_admitted() { n=$((n + 1)); SECONDS=$((SECONDS + 30)); return 1; }
+  ! wait_for_admission
+  [ "$n" -le 3 ]
+}
+
+# --- LOADED_IMAGES keeps every image a run loaded, so uninstall removes an upgrade's old image too ---
+
+@test "add_words: appends only new words, in order" {
+  [ "$(add_words "" "a:1 b:2")" = "a:1 b:2" ]
+  [ "$(add_words "a:1 b:2" "c:3 b:2")" = "a:1 b:2 c:3" ]
+  [ "$(add_words "chrislusf/seaweedfs:4.30 caddy:2.11.3" "chrislusf/seaweedfs:4.54 caddy:2.11.3")" = "chrislusf/seaweedfs:4.30 caddy:2.11.3 chrislusf/seaweedfs:4.54" ]
+}
+
+# --- S36: which Caddyfile Caddy runs with ---
+
+caddy_setup() {
+  in_container
+  rm -rf /opt/caddy; mkdir -p /opt/caddy
+  echo one > /opt/caddy/Caddyfile
+  CADDYFILE_APPLIED=/opt/caddy/.caddyfile-applied
+}
+# caddy_started <epoch>: docker inspect reports seaweed-caddy started then
+caddy_started() { stub docker "echo '$(date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.000000000Z)'"; }
+md5_now() { md5sum < /opt/caddy/Caddyfile | cut -d' ' -f1; }
+
+@test "S36: Caddy not restarted since the record: the record holds" {
+  caddy_setup
+  now=$(date +%s)
+  touch -d "@$((now - 120))" /opt/caddy/Caddyfile
+  caddy_started $((now - 100))
+  echo recorded > "$CADDYFILE_APPLIED"; touch -d "@$((now - 50))" "$CADDYFILE_APPLIED"
+  [ "$(caddyfile_running)" = recorded ]
+}
+
+@test "S36: a run stopped after writing the file: the record still names the old one" {
+  caddy_setup
+  now=$(date +%s)
+  caddy_started $((now - 100))
+  echo recorded > "$CADDYFILE_APPLIED"; touch -d "@$((now - 60))" "$CADDYFILE_APPLIED"
+  touch -d "@$((now - 50))" /opt/caddy/Caddyfile
+  [ "$(caddyfile_running)" = recorded ]
+}
+
+@test "S36: Caddy restarted after the record (an older installer, a reboot): it runs the file that was there" {
+  caddy_setup
+  now=$(date +%s)
+  echo recorded > "$CADDYFILE_APPLIED"; touch -d "@$((now - 100))" "$CADDYFILE_APPLIED"
+  touch -d "@$((now - 80))" /opt/caddy/Caddyfile
+  caddy_started $((now - 50))
+  [ "$(caddyfile_running)" = "$(md5_now)" ]
+}
+
+@test "S36: no record, and the Caddyfile changed after Caddy started: unknown, so the run restarts Caddy" {
+  caddy_setup
+  now=$(date +%s)
+  caddy_started $((now - 100))
+  touch -d "@$((now - 50))" /opt/caddy/Caddyfile
+  [ -z "$(caddyfile_running)" ]
+}
+
+@test "S36: no record, and Caddy started after the file was written: the current file" {
+  caddy_setup
+  now=$(date +%s)
+  touch -d "@$((now - 100))" /opt/caddy/Caddyfile
+  caddy_started $((now - 50))
+  [ "$(caddyfile_running)" = "$(md5_now)" ]
+}
+
+@test "S36: no Caddy container and no record: the current file, as before 1.5.0" {
+  caddy_setup
+  stub docker 'exit 1'
+  [ "$(caddyfile_running)" = "$(md5_now)" ]
 }

@@ -176,6 +176,13 @@ require_cmds() {
 # The state file records what THIS tool actually changed on the host, so uninstall
 # reverts exactly that — never keyed on the ENABLE_* env present at uninstall time.
 # Format: KEY=value lines, one per key (last write wins), mode 600.
+# add_words <list> <words>: the list with each word not already in it appended. LOADED_IMAGES keeps every image a run
+# loaded, so an upgrade's old image (4.30 after a move to 4.54) is still removed by uninstall with SWFS_REMOVE_IMAGES.
+add_words() {
+  local out=$1 w
+  for w in $2; do [[ " $out " == *" $w "* ]] || out="${out:+$out }$w"; done
+  printf '%s' "$out"
+}
 record_state() {
   local key="$1" value="$2"
   mkdir -p "$(dirname "$STATE_FILE")"
@@ -260,6 +267,27 @@ file_md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
 # caddyfile_applied <md5>: record the Caddyfile seaweed-caddy now runs with (S36)
 CADDYFILE_APPLIED=/opt/caddy/.caddyfile-applied
 caddyfile_applied() { private_file "$CADDYFILE_APPLIED"; printf '%s\n' "$1" > "$CADDYFILE_APPLIED"; }
+# caddyfile_running: the md5 of the Caddyfile seaweed-caddy runs with, or nothing when that can't be known (S36).
+# Comparing only within a run left Caddy on an old Caddyfile for good after a run stopped between writing the file and
+# restarting Caddy. The record says what Caddy last started with, unless Caddy started again after it was written (an
+# installer before 1.5.0, a reboot, a restart by hand): then it runs the Caddyfile that was there when it started, the
+# current one unless the file changed since. A host with no record is read the same way.
+caddyfile_running() {
+  local rec rec_t started start="" f_t
+  rec=$(cat "$CADDYFILE_APPLIED" 2>/dev/null)
+  rec_t=$(stat -c %Y "$CADDYFILE_APPLIED" 2>/dev/null)
+  # date -d "" is today's midnight, not an error, so parse only a start time docker gave
+  started=$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)
+  [[ "$started" == [0-9]*T* ]] && start=$(date -d "$started" +%s 2>/dev/null)
+  f_t=$(stat -c %Y /opt/caddy/Caddyfile 2>/dev/null)
+  if [[ -n "$rec" && -n "$rec_t" ]] && { [[ -z "$start" ]] || ((start <= rec_t)); }; then
+    echo "$rec"
+  elif [[ -n "$start" && -n "$f_t" ]] && ((f_t > start)); then
+    echo ""
+  else
+    file_md5 /opt/caddy/Caddyfile
+  fi
+}
 
 # S15: the seaweed-mount container that holds the /mnt/seaweed FUSE mount: its ID and start time. install_swfs reads it
 # right before and right after 'docker compose up', so a container compose recreated or restarted shows, with no race
@@ -776,18 +804,14 @@ install_swfs () {
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_binaries || die "Artifact download failed."
   fi
-  # The Caddyfile Caddy last started with (S36). A run that stopped after writing a new Caddyfile but before restarting
-  # Caddy left Caddy on the old one, and comparing only within a run would never restart it. A host from before 1.5.0
-  # has no record: Caddy runs the Caddyfile that is there now, so that is recorded before it changes.
+  # The Caddyfile Caddy runs with (S36), recorded before it changes, so a run that stops before restarting Caddy still
+  # restarts it next time.
   local caddyfile_before
-  caddyfile_before=$(cat "$CADDYFILE_APPLIED" 2>/dev/null)
-  if [[ -z "$caddyfile_before" ]]; then
-    caddyfile_before=$(file_md5 /opt/caddy/Caddyfile)
-    [[ -n "$caddyfile_before" ]] && caddyfile_applied "$caddyfile_before"
-  fi
+  caddyfile_before=$(caddyfile_running)
+  [[ -n "$caddyfile_before" ]] && caddyfile_applied "$caddyfile_before"
   generate_caddyfile
   generate_compose_file
-  record_state LOADED_IMAGES "$SWFS_IMAGE $CADDY_IMAGE"
+  record_state LOADED_IMAGES "$(add_words "$(get_state LOADED_IMAGES)" "$SWFS_IMAGE $CADDY_IMAGE")"
   generate_index_html
   persist_caddy_data
   echo "  Starting SeaweedFS and Caddy containers..."
@@ -2710,7 +2734,7 @@ run_join () {
   echo "  Waiting for the master at $CLUSTER_MASTER to admit this volume server..."
   if ! wait_for_admission; then
     docker logs --tail 15 seaweed-volume 2>&1 | tee -a "$LOG_FILE"
-    die "The master at $CLUSTER_MASTER didn't list this volume server ($MGMT_IP:$CLUSTER_VOLUME_PORT) within 90 s, so it holds no data. Its last log lines are above. 'rejected: this master admits a single volume-server reporter' means node 1 runs SeaweedFS 4.51 or later from an installer before 1.5.0: re-run install on node 1 with this release, then join again. A connection error means node 1's port $CLUSTER_MASTER_GRPC_PORT isn't reachable from here."
+    die "The master at $CLUSTER_MASTER didn't list this volume server ($MGMT_IP:$CLUSTER_VOLUME_PORT) within 90 s, so it holds no data. Its last log lines are above. 'rejected: this master admits a single volume-server reporter' means node 1 runs SeaweedFS 4.51 or later from an installer before 1.5.0: re-run install on node 1 with this release, then join again. A connection error means node 1's master gRPC port isn't reachable from here: the -master port + 10000, or the port after a '.' (-master host:9333.<grpc port>)."
   fi
   generate_join_outputs
   record_state SCRIPT_VERSION "$SCRIPT_VERSION"
@@ -2718,15 +2742,21 @@ run_join () {
 
 # S38: join waits for node 1's master to list this volume server. A master that refuses it (weed mini 4.51+ as a single
 # master, S37) or that it can't reach left join reporting success for a node that never held data. weed shell reaches
-# the master over its published gRPC port, which needs no credentials; it hangs with no master, hence the time limit.
+# the master over its published gRPC port, which needs no credentials. It hangs with no master, so it is time-limited
+# inside the container (killing docker exec alone leaves it running there), and the outer limit is a backstop.
 volume_admitted() {
-  timeout -k 5 20 docker exec -i seaweed-volume /usr/bin/weed shell -master="$CLUSTER_MASTER" <<< "volume.list" 2>/dev/null \
+  timeout -k 2 15 docker exec -i seaweed-volume timeout 10 /usr/bin/weed shell -master="$CLUSTER_MASTER" <<< "volume.list" 2>/dev/null \
     | grep -qF "$MGMT_IP:$CLUSTER_VOLUME_PORT"
 }
+# wait_for_admission: up to 90 s (and 18 checks), however long each check takes
 wait_for_admission() {
-  local i
-  for ((i = 0; i < 90; i += 5)); do volume_admitted && return 0; sleep 5; done
-  volume_admitted
+  local i end=$((SECONDS + 90))
+  for ((i = 0; i < 18; i++)); do
+    volume_admitted && return 0
+    ((SECONDS + 5 >= end)) && return 1
+    sleep 5
+  done
+  return 1
 }
 
 generate_join_compose_file () {
@@ -2738,7 +2768,7 @@ generate_join_compose_file () {
   [[ -n "$VOLUME_INDEX" ]] && VOL_TUNING+="      -index=$VOLUME_INDEX"$'\n'
   record_state STATE_VERSION "1"
   record_state NODE_ROLE "volume"
-  record_state LOADED_IMAGES "$swfs_image_local"
+  record_state LOADED_IMAGES "$(add_words "$(get_state LOADED_IMAGES)" "$swfs_image_local")"
   echo "  Creating seaweedfs-volume-compose.yaml..." | tee -a "$LOG_FILE"
   cat > /opt/seaweedfs/seaweedfs-volume-compose.yaml <<EOF
 networks:

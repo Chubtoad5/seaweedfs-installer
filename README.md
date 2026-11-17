@@ -96,7 +96,9 @@ What it protects, and what it doesn't:
   address as its only peer, which makes it a one-member raft master that admits volume nodes. Single-node installs don't
   get the flag.
 - **`join` checks it was admitted (1.5.0):** it waits up to 90 s for node 1's master to list the new volume server, over the
-  master's gRPC port. Otherwise it fails and shows the volume server's last log lines. Before 1.5.0, `join` reported
+  master's gRPC port. Otherwise it fails and shows the volume server's last log lines.
+- **A non-default `CLUSTER_MASTER_GRPC_PORT` on node 1:** a volume node finds the master's gRPC port as its HTTP port
+  + 10000. For any other port, name it after a dot: `join -master <node1-ip>:9333.<grpc port>`. Before 1.5.0, `join` reported
   success for a node the master refused or couldn't hear from.
 - **Removing a volume node:** replicate its volumes elsewhere first, then `./install-seaweedfs uninstall` on it. The uninstall warns about this too.
 
@@ -188,6 +190,9 @@ DEFAULT_FILER_DIR_NAME=share ENABLE_MONITORING=false NFS_CLIENTS=10.0.0.0/24 ./i
     flag there).
   - **Bundles:** `save` and `push` carry about 180 MB more. The image is 282 MB compressed (101 MB on 4.30) and about
     1.1 GB installed (356 MB), for 4.54's Rust volume server, maintenance worker and vector engine.
+  - **The 4.30 image stays on disk** (356 MB), so a rollback needs no download. Remove it once you're sure:
+    `docker rmi chrislusf/seaweedfs:4.30`. `uninstall` with `SWFS_REMOVE_IMAGES=true` removes every image an install or
+    join loaded since 1.5.0, the old one included.
   - **Rolling back:** re-run with `SWFS_IMAGE=chrislusf/seaweedfs:4.30` and the same settings. This was tested on Ubuntu 24.04
     and Leap 16, with data, keys, the password, the CA, SMB and NFS intact. 4.30 writes the password back into
     `mini.options`. Keep the backup anyway: upstream promises no downgrade compatibility.

@@ -37,6 +37,10 @@ Spec 24 (chubtoad-automation).
   last started with.
 - **`join` reported success for a volume node the master refused or couldn't hear from** (S38). It now waits up to 90 s
   for node 1's master to list the node, and otherwise fails with the volume server's last log lines.
+- **An upgrade's old image is removed by `uninstall` with `SWFS_REMOVE_IMAGES=true`.** The install state now keeps every
+  image a run loaded (`LOADED_IMAGES`), not only the last. The old image stays on disk until then, for a rollback.
+- **Caddy also follows a Caddyfile restored or edited outside a 1.5.0 run** (S36): when Caddy started after the record
+  was written (an older installer, a reboot, a restart by hand), the run reads the Caddyfile that was there at its start.
 
 ### Tests
 - Unit tests:
