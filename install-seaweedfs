@@ -1581,6 +1581,10 @@ generate_compose_file () {
     mini_args+=("-ip=$MGMT_IP")
     [[ -n "$CLUSTER_REPLICATION" ]] && mini_args+=("-master.defaultReplication=$CLUSTER_REPLICATION")
     mini_args+=("-dataCenter=$CLUSTER_DC" "-rack=$CLUSTER_RACK" "-master.port.grpc=$CLUSTER_MASTER_GRPC_PORT")
+    # S37: with no -master.peers, weed mini is a single master, and from 4.51 (seaweedfs PR #12061) that admits only its
+    # own volume server: every joined node is refused. Its own address as its only peer makes it a one-member raft
+    # master, which admits them. mini's master HTTP port is its default, 9333.
+    mini_args+=("-master.peers=$MGMT_IP:9333")
     mini_args+=("-volume.port=$CLUSTER_VOLUME_PORT" "-volume.port.grpc=$CLUSTER_VOLUME_GRPC_PORT")
     MINI_CLUSTER_PORTS+="    ports:"$'\n'
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_MASTER_GRPC_PORT:$CLUSTER_MASTER_GRPC_PORT\""$'\n'
@@ -2703,8 +2707,26 @@ run_join () {
   docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml up -d --remove-orphans \
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-volume-compose.yaml."
   configure_firewall "$CLUSTER_VOLUME_PORT/tcp $CLUSTER_VOLUME_GRPC_PORT/tcp" "false" "false"
+  echo "  Waiting for the master at $CLUSTER_MASTER to admit this volume server..."
+  if ! wait_for_admission; then
+    docker logs --tail 15 seaweed-volume 2>&1 | tee -a "$LOG_FILE"
+    die "The master at $CLUSTER_MASTER didn't list this volume server ($MGMT_IP:$CLUSTER_VOLUME_PORT) within 90 s, so it holds no data. Its last log lines are above. 'rejected: this master admits a single volume-server reporter' means node 1 runs SeaweedFS 4.51 or later from an installer before 1.5.0: re-run install on node 1 with this release, then join again. A connection error means node 1's port $CLUSTER_MASTER_GRPC_PORT isn't reachable from here."
+  fi
   generate_join_outputs
   record_state SCRIPT_VERSION "$SCRIPT_VERSION"
+}
+
+# S38: join waits for node 1's master to list this volume server. A master that refuses it (weed mini 4.51+ as a single
+# master, S37) or that it can't reach left join reporting success for a node that never held data. weed shell reaches
+# the master over its published gRPC port, which needs no credentials; it hangs with no master, hence the time limit.
+volume_admitted() {
+  timeout -k 5 20 docker exec -i seaweed-volume /usr/bin/weed shell -master="$CLUSTER_MASTER" <<< "volume.list" 2>/dev/null \
+    | grep -qF "$MGMT_IP:$CLUSTER_VOLUME_PORT"
+}
+wait_for_admission() {
+  local i
+  for ((i = 0; i < 90; i += 5)); do volume_admitted && return 0; sleep 5; done
+  volume_admitted
 }
 
 generate_join_compose_file () {

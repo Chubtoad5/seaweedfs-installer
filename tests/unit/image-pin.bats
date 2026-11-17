@@ -96,3 +96,51 @@ compose_setup() {
 @test "S31: nothing in the installer or the manual proxies to the old port 23646" {
   ! grep -n 'seaweed-mini:23646' "$BATS_TEST_DIRNAME/../../install-seaweedfs" "$BATS_TEST_DIRNAME/../../swfs-manual.md"
 }
+
+# --- S37: cluster mode makes mini a one-member raft master, which 4.51+ needs to admit joined volume nodes ---
+
+@test "S37: cluster mode gives mini -master.peers with its own address, once" {
+  compose_setup
+  CLUSTER_MODE=cluster CLUSTER_DC=dc1 CLUSTER_RACK=r1 CLUSTER_MASTER_GRPC_PORT=19333 CLUSTER_VOLUME_PORT=9340
+  CLUSTER_VOLUME_GRPC_PORT=19340
+  generate_compose_file
+  [ "$(mini_command | grep -c -- '^-master\.peers')" = 1 ]
+  mini_command | grep -qxF -- '-master.peers=10.0.0.5:9333'
+}
+
+@test "S37: a single-node install has no -master.peers, so its compose file is unchanged" {
+  compose_setup
+  CLUSTER_MODE=single
+  generate_compose_file
+  ! mini_command | grep -q -- '-master\.peers'
+}
+
+# --- S38: join checks that node 1's master admitted the volume server ---
+
+@test "S38: a volume server the master lists is admitted" {
+  MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
+  stub docker 'cat > /dev/null; echo "  DataNode 192.0.2.10:9340 hdd(volume:1/8)"; echo "  DataNode 192.0.2.20:9340 hdd(volume:0/8)"'
+  volume_admitted
+  wait_for_admission
+  called "exec -i seaweed-volume /usr/bin/weed shell -master=192.0.2.10:9333"
+}
+
+@test "S38: a volume server the master doesn't list isn't admitted, and the wait gives up" {
+  MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
+  stub docker 'cat > /dev/null; echo "  DataNode 192.0.2.10:9340 hdd(volume:1/8)"; echo "  DataNode 192.0.2.200:9340 hdd(volume:0/8)"'
+  ! volume_admitted
+  run wait_for_admission
+  [ "$status" -ne 0 ]
+  [ "$(grep -c 'weed shell' "$STUB_LOG")" -ge 18 ]
+}
+
+@test "S38: another port on the same address isn't this volume server" {
+  MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
+  stub docker 'cat > /dev/null; echo "  DataNode 192.0.2.20:9341 hdd(volume:0/8)"'
+  ! volume_admitted
+}
+
+@test "S38: join waits for admission before it reports success, and fails without it" {
+  body=$(declare -f run_join)
+  [[ "$body" == *"wait_for_admission"*"die "*"generate_join_outputs"* ]]
+}
