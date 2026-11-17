@@ -91,6 +91,13 @@ What it protects, and what it doesn't:
 - **Losing node 1:** the cluster stops until node 1 returns. Node 1 holds the only master and Filer. The copies on the other nodes are safe, but nothing serves them meanwhile. High availability for the control plane (three masters, two or more Filers) is SeaweedFS's [multi-component setup](https://github.com/seaweedfs/seaweedfs/wiki/Production-Setup), which this installer doesn't build.
 - **Security:** the cluster's ports (master gRPC 19333, volume 9340 and 19340 by default, set by `CLUSTER_*_PORT`) are unauthenticated, which is SeaweedFS's default. Keep them on a trusted network, or firewall them to the cluster's nodes.
 - **`weed shell` by hand:** add `-filer=localhost:8888` for `fs.*` and `s3.*` commands. In cluster mode the shell otherwise looks for the Filer at the host's address, on a port cluster mode doesn't publish. `volume.*` commands only need the master.
+- **SeaweedFS 4.51 and later:** a `weed mini` with no `-master.peers` admits only its own volume server and refuses every
+  joined one (upstream PR #12061). Since 1.5.0, cluster mode gives node 1 `-master.peers=<MGMT_IP>:9333`, its own
+  address as its only peer, which makes it a one-member raft master that admits volume nodes. Single-node installs don't
+  get the flag.
+- **`join` checks it was admitted (1.5.0):** it waits up to 90 s for node 1's master to list the new volume server, over the
+  master's gRPC port. Otherwise it fails and shows the volume server's last log lines. Before 1.5.0, `join` reported
+  success for a node the master refused or couldn't hear from.
 - **Removing a volume node:** replicate its volumes elsewhere first, then `./install-seaweedfs uninstall` on it. The uninstall warns about this too.
 
 ### Manual installation
@@ -171,6 +178,23 @@ DEFAULT_FILER_DIR_NAME=share ENABLE_MONITORING=false NFS_CLIENTS=10.0.0.0/24 ./i
 - **Image tags:** `install` doesn't pull a newer image under a tag it already has, so re-running with the same tag (for example `latest`) keeps the image you have. To move to a newer release, set `SWFS_IMAGE` or `CADDY_IMAGE` to the new tag.
 - **From before 1.1.0:** the first re-run restarts Caddy once, because the stored password hash doesn't exist yet. It also makes the compose files and the Caddyfile mode 600, and removes the credentials earlier runs left in `seaweedfs-install.log`, keeping the latest.
 - **From before 1.3.1:** the first re-run recreates `seaweed-mini` once, for its new entrypoint, a short pause for the Admin UI, Filer and S3. Caddy, the mount, Samba and NFS keep running. An admin password with a space, `*`, `?` or `[` now reaches the Admin UI whole: before, it took only the password's first word, and weed ignored every `weed mini` flag after it (`-webdav=false`, and the tuning and cluster flags). The re-run also makes `/opt/seaweedfs` mode 700.
+- **From before 1.5.0 (SeaweedFS 4.30 → 4.54):**
+  - **What restarts:** the image change recreates `seaweed-mini`, `seaweed-mount` and `seaweed-mq`, and the new Admin UI
+    port (12535) restarts Caddy. S3, the Filer, SMB and NFS pause for the seconds that takes (24 s for the whole run on the
+    bench), and Samba and NFS are restarted on the new mount. Plan the upgrade.
+  - **NFS clients:** a client that stayed mounted reads again afterwards. While an NFS client has the share mounted,
+    weed can't unmount the old mount, so the run clears what it leaves and starts `seaweed-mount` again.
+  - **`mini.options`:** the first 4.54 start rewrites it without the admin password (4.49 and later save no command-line
+    flag there).
+  - **Bundles:** `save` and `push` carry about 180 MB more. The image is 282 MB compressed (101 MB on 4.30) and about
+    1.1 GB installed (356 MB), for 4.54's Rust volume server, maintenance worker and vector engine.
+  - **Rolling back:** re-run with `SWFS_IMAGE=chrislusf/seaweedfs:4.30` and the same settings. This was tested on Ubuntu 24.04
+    and Leap 16, with data, keys, the password, the CA, SMB and NFS intact. 4.30 writes the password back into
+    `mini.options`. Keep the backup anyway: upstream promises no downgrade compatibility.
+  - **Clusters:** upgrade node 1 first (`CLUSTER_MODE=cluster` and your `CLUSTER_*` settings, as in "Clustering"), then
+    re-run `join` on each volume node. A volume node still on 4.30 keeps working with a 4.54 node 1 meanwhile, and the
+    Admin UI shows a mixed-version warning until the last node is done. The first 4.54 start makes node 1's master a
+    one-member raft (see "Clustering"); its volumes and IDs are kept.
 - **Caddy CA:** older installs kept Caddy's CA inside the container, so any recreate produced a new CA. On the first run of this version the existing CA and certificates are copied to `/opt/caddy/data` before the container is recreated, so clients that already trust it keep working; from then on it persists.
 
 #### `save`
