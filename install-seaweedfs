@@ -2767,9 +2767,12 @@ run_join () {
 # master, S37) or that it can't reach left join reporting success for a node that never held data. weed shell reaches
 # the master over its published gRPC port, which needs no credentials. It hangs with no master, so it is time-limited
 # inside the container (killing docker exec alone leaves it running there), and the outer limit is a backstop.
+# cluster.check's "the cluster has N volume servers: [a b]" names every server the master admitted. volume.list leaves
+# out one that holds no volume yet, which a new node usually doesn't (Rocky 10 CI). The list comes before the
+# connectivity checks, so a check that runs into the time limit has already printed it.
 volume_admitted() {
-  timeout -k 2 15 docker exec -i seaweed-volume timeout 10 /usr/bin/weed shell -master="$CLUSTER_MASTER" <<< "volume.list" 2>/dev/null \
-    | grep -qF "$MGMT_IP:$CLUSTER_VOLUME_PORT"
+  timeout -k 2 15 docker exec -i seaweed-volume timeout 10 /usr/bin/weed shell -master="$CLUSTER_MASTER" <<< "cluster.check" 2>/dev/null \
+    | grep -m 1 -F "volume servers:" | sed 's/.*volume servers://' | tr -d '[]' | tr ' ' '\n' | grep -qxF "$MGMT_IP:$CLUSTER_VOLUME_PORT"
 }
 # wait_for_admission: up to 90 s (and 18 checks), however long each check takes
 wait_for_admission() {

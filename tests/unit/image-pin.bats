@@ -119,7 +119,7 @@ compose_setup() {
 
 @test "S38: a volume server the master lists is admitted" {
   MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
-  stub docker 'cat > /dev/null; echo "  DataNode 192.0.2.10:9340 hdd(volume:1/8)"; echo "  DataNode 192.0.2.20:9340 hdd(volume:0/8)"'
+  stub docker 'cat > /dev/null; echo "the cluster has 2 volume servers: [192.0.2.10:9340 192.0.2.20:9340]"; echo "checking master 192.0.2.10:9333 to volume server 192.0.2.20:9340.19340 ... ok"'
   volume_admitted
   wait_for_admission
   called "exec -i seaweed-volume timeout 10 /usr/bin/weed shell -master=192.0.2.10:9333"
@@ -127,7 +127,7 @@ compose_setup() {
 
 @test "S38: a volume server the master doesn't list isn't admitted, and the wait gives up" {
   MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
-  stub docker 'cat > /dev/null; echo "  DataNode 192.0.2.10:9340 hdd(volume:1/8)"; echo "  DataNode 192.0.2.200:9340 hdd(volume:0/8)"'
+  stub docker 'cat > /dev/null; echo "the cluster has 2 volume servers: [192.0.2.10:9340 192.0.2.200:9340]"'
   ! volume_admitted
   : > "$STUB_LOG"
   run wait_for_admission
@@ -137,8 +137,33 @@ compose_setup() {
 
 @test "S38: another port on the same address isn't this volume server" {
   MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
-  stub docker 'cat > /dev/null; echo "  DataNode 192.0.2.20:9341 hdd(volume:0/8)"'
+  stub docker 'cat > /dev/null; echo "the cluster has 1 volume servers: [192.0.2.20:9341]"'
   ! volume_admitted
+}
+
+@test "S38: a master that lists no volume server, or no output at all, isn't admission" {
+  MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
+  stub docker 'cat > /dev/null; echo "the cluster has 0 volume servers: []"'
+  ! volume_admitted
+  stub docker 'cat > /dev/null; exit 1'
+  ! volume_admitted
+}
+@test "S38: only the list of volume servers counts, not a line that merely mentions the address" {
+  MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
+  stub docker 'cat > /dev/null; echo "the cluster has 1 volume servers: [192.0.2.10:9340]"; echo "rejected 192.0.2.20:9340"'
+  ! volume_admitted
+}
+@test "S38: an address that only contains this one (110.0.2.20 for 10.0.2.20) isn't this volume server" {
+  MGMT_IP=10.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=10.0.2.10:9333
+  stub docker 'cat > /dev/null; echo "the cluster has 1 volume servers: [110.0.2.20:9340]"'
+  ! volume_admitted
+}
+@test "S38: the check asks the master with cluster.check, which lists a server that holds no volume yet" {
+  MGMT_IP=192.0.2.20 CLUSTER_VOLUME_PORT=9340 CLUSTER_MASTER=192.0.2.10:9333
+  stub docker 'cat >> "$STUB_LOG"; echo "the cluster has 1 volume servers: [192.0.2.20:9340]"'
+  volume_admitted
+  called "cluster.check"
+  ! called "volume.list" || false
 }
 
 @test "S38: join waits for admission before it reports success, and fails without it" {
