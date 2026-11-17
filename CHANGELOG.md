@@ -1,5 +1,67 @@
 # Changelog — seaweedfs-installer
 
+## v1.5.0 — 2026-11-17 — SeaweedFS 4.54
+
+Spec 24 (chubtoad-automation).
+
+### Changed
+- **SeaweedFS 4.54** (S30): `SWFS_IMAGE` defaults to `chrislusf/seaweedfs:4.54` (was 4.30). A tag set by the caller wins,
+  as before. What it brings to an install:
+  - S3 refuses anonymous requests while no identities are loaded. On 4.30, a fresh install answered S3 from anyone
+    for the seconds before its user was configured.
+  - The Admin UI escapes file and bucket text, so a crafted object or bucket name can't run script in an admin's browser.
+  - A revoked S3 key can't come back through the IAM file migration.
+  - The admin password is no longer written to `/opt/seaweedfs/mini/mini.options`; the first start rewrites the file
+    without it.
+  - Many FUSE mount fixes (SMB and NFS sit on the mount), and an MQ broker deadlock fix.
+  - Go 1.26.6 and the dependency CVE fixes since May.
+  - The image's own entrypoint passes arguments whole (seaweedfs/seaweedfs#12587). `weed-entrypoint.sh` stays for
+    older tags (S32).
+- **The Admin UI is on port 12535 inside `seaweed_net`, with every image** (S31). `weed mini` gets `-admin.port=12535`,
+  and Caddy proxies there. weed 4.49 moved the default port from 23646, and 4.30's Admin UI gRPC port (33646) sat in
+  Linux's ephemeral range, where one of weed's own connections could take it and stop the Admin UI. No host port
+  changes.
+- **Cluster mode works on SeaweedFS 4.51 and later** (S37). A `weed mini` with no `-master.peers` now admits only its own
+  volume server, so `join`ed nodes were refused and never held data. Node 1 gets `-master.peers=<MGMT_IP>:9333`, a
+  one-member raft master. An existing cluster keeps its volumes and IDs, and a 4.30 volume node is admitted until it
+  re-joins.
+- **The image is larger:** 282 MB compressed (101 MB on 4.30), so `save` and `push` carry about 180 MB more.
+
+### Fixed
+- **An upgrade, or any run that recreates `seaweed-mount`, failed at `docker compose up` while an NFS client had the
+  share mounted** (S35). weed couldn't unmount the old mount, so it was left dead, and the new container couldn't
+  start ("chdir to cwd … transport endpoint is not connected"). The mount, SMB and NFS stayed down until a re-run.
+  The run now clears the dead mount and starts again. On Rocky 10, Docker starts the new container on the dead mount
+  instead, and it restarts until Docker gives up ("fusermount: failed to access mountpoint .: Socket not connected").
+  There the run clears the mount and restarts `seaweed-mount` once.
+- **Caddy could stay on a Caddyfile it never loaded** (S36). A run that stopped after writing the Caddyfile and before
+  restarting Caddy left the next run seeing no change. `/opt/caddy/.caddyfile-applied` records the Caddyfile Caddy
+  last started with.
+- **`join` reported success for a volume node the master refused or couldn't hear from** (S38). It now waits up to 90 s
+  for node 1's master to list the node, and otherwise fails with the volume server's last log lines.
+- **An upgrade's old image is removed by `uninstall` with `SWFS_REMOVE_IMAGES=true`.** The install state now keeps every
+  image a run loaded (`LOADED_IMAGES`), not only the last. The old image stays on disk until then, for a rollback.
+- **Caddy also follows a Caddyfile restored or edited outside a 1.5.0 run** (S36): when Caddy started after the record
+  was written (an older installer, a reboot, a restart by hand), the run reads the Caddyfile that was there at its start.
+
+### Tests
+- Unit tests:
+  - the pin;
+  - `-admin.port` in single-node and cluster mode, and no `-admin.port.legacy`;
+  - Caddy's three upstreams;
+  - `-master.peers` in cluster mode only;
+  - `join`'s admission check.
+- Integration:
+  - S32's recorded hash of the image's `/entrypoint.sh` (a new pin fails until it's reviewed);
+  - S33's "`mini.options` holds no password" on 4.49 and later;
+  - S36's applied-Caddyfile record;
+  - `50-image-4.30.sh`: object-tech-ops' 4.30 image with the Admin UI through Caddy, then the move to 4.54 with an NFS
+    client mounted (S35).
+- A4: a volume node joined on the last release's image (4.30) under a 4.54 node 1, then re-joined on 4.54. Its own
+  copies are checked each time.
+- A5: the image move recreates the SeaweedFS containers, the mount comes back, the Admin UI answers on 12535, and the
+  upgrade removes the password from `mini.options`.
+
 ## v1.4.1 — 2026-11-13 — seaweed-mount comes back after a Docker restart
 
 Spec 23 (chubtoad-automation).

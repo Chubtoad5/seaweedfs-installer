@@ -2,8 +2,9 @@
 # The real installer on a throwaway host, as root, from the repo root: install, same-settings re-run, uninstall.
 # The admin password is spec 21's full test password: a space and every symbol, *, ? and [ among them, which the
 # image's own entrypoint split and globbed (S17), and $, \, quotes, & ; | and # that compose changed (S19, S20). It must
-# log in at the Admin UI, the Filer, SMB and Grafana, and a changed one must reach Grafana (S21). mini.options, which
-# holds it, must stay private across a restart (S18).
+# log in at the Admin UI, the Filer, SMB and Grafana, and a changed one must reach Grafana (S21). mini.options must stay
+# private across a restart (S18). Up to weed 4.48 it held the password; from 4.49 it must not (spec 24, S33). The pinned
+# image's /entrypoint.sh must be the one recorded below, which weed-entrypoint.sh was last reviewed against (S32).
 set -uo pipefail
 REPO=$PWD
 fail=0
@@ -32,13 +33,26 @@ admin_login() {
 }
 weed_pid() { docker inspect -f '{{.State.Pid}}' seaweed-mini 2>/dev/null; }
 MO=/opt/seaweedfs/mini/mini.options
-# private <when>: mini.options holds the password, and neither nobody nor the image's seaweed uid (1000 on most VMs, the
-# first login user) can read it
+# The image the installer runs (the test sets no SWFS_IMAGE), and whether its weed saves command-line flags, the admin
+# password among them, to mini.options: 4.48 and older do, 4.49 and later save only values weed computes itself.
+IMG=$(sed -n 's/^SWFS_IMAGE=${SWFS_IMAGE:-"\(.*\)"}$/\1/p' install-seaweedfs)
+saves_flags() { local t=${IMG##*:}; [[ "$t" =~ ^([0-9]+)\.([0-9]+)$ ]] && (( BASH_REMATCH[1] < 4 || (BASH_REMATCH[1] == 4 && BASH_REMATCH[2] < 49) )); }
+# S32: the SHA-256 of each pinned image's own /entrypoint.sh, as reviewed against weed-entrypoint.sh. A new pin fails here
+# until its entrypoint is compared with ours and its hash added.
+declare -A EP_SHA=(
+  [chrislusf/seaweedfs:4.30]=b0b823a7d9af4dafba694dfc0a483efd4e0517886e6d0bd4c48d74b713c429e7
+  [chrislusf/seaweedfs:4.54]=ec9a29639787a97d571e52bdd3bf93dd83505dc78f9d80b60e3a7e6b0d6fdc1e
+)
+# private <when>: mini.options holds the password up to weed 4.48 and doesn't from 4.49, and neither nobody nor the
+# image's seaweed uid (1000 on most VMs, the first login user) can read it
 private() {
   local uid
   # weed quotes a value with a space in it, Go style: admin.password="Aa1 !\"#..."
   local q; q=$(python3 -I -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$P")
-  grep -qxF -e "admin.password=$P" -e "admin.password=\"$P\"" -e "admin.password=$q" -- "$MO" 2>/dev/null && ok "$1: mini.options holds the whole password" || bad "$1: mini.options doesn't hold the whole password"
+  if saves_flags; then
+    grep -qxF -e "admin.password=$P" -e "admin.password=\"$P\"" -e "admin.password=$q" -- "$MO" 2>/dev/null && ok "$1: mini.options holds the whole password ($IMG)" || bad "$1: mini.options doesn't hold the whole password ($IMG)"
+  elif [ -s "$MO" ] && ! grep -q '^admin\.password' "$MO" && ! grep -qF -- "$P" "$MO"; then ok "S33, $1: mini.options holds no password ($IMG)"
+  else bad "S33, $1: mini.options is empty or holds the password ($IMG)"; fi
   for uid in 65534 "$(docker exec seaweed-mini id -u seaweed 2>/dev/null || echo 1000)"; do
     if setpriv --reuid="$uid" --regid="$uid" --clear-groups cat "$MO" >/dev/null 2>&1; then
       bad "$1: uid $uid can read mini.options ($(stat -c '%a' /opt/seaweedfs 2>/dev/null) on /opt/seaweedfs)"
@@ -54,6 +68,14 @@ if systemctl is-active -q cockpit.socket 2>/dev/null; then
 fi
 ./install-seaweedfs install >"$W/o" 2>&1 && ok "install, with a space, *, ? and [ in the password" || { bad "install"; tail -6 "$W/o" | cut -c1-170; }
 for c in seaweed-mini seaweed-caddy; do [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = true ] && ok "$c is running" || bad "$c isn't running"; done
+[ "$(docker inspect -f '{{.Config.Image}}' seaweed-mini 2>/dev/null)" = "$IMG" ] && ok "S30: seaweed-mini runs $IMG" || bad "S30: seaweed-mini runs $(docker inspect -f '{{.Config.Image}}' seaweed-mini 2>/dev/null), not $IMG"
+ep=$(docker exec seaweed-mini sha256sum /entrypoint.sh 2>/dev/null | cut -d' ' -f1)
+if [ -z "${EP_SHA[$IMG]:-}" ]; then bad "S32: no recorded /entrypoint.sh hash for $IMG: compare it with weed-entrypoint.sh, then record $ep"
+elif [ "$ep" = "${EP_SHA[$IMG]}" ]; then ok "S32: $IMG's /entrypoint.sh is the one weed-entrypoint.sh was reviewed against"
+else bad "S32: $IMG's /entrypoint.sh changed ($ep): review weed-entrypoint.sh against it, then record the new hash"; fi
+# S31: the Admin UI listens on 12535 inside seaweed_net, where Caddy proxies
+code=$(docker exec seaweed-mini curl -s -m 5 -o /dev/null -w '%{http_code}' http://localhost:12535/login 2>/dev/null)
+[[ "$code" =~ ^[23] ]] && ok "S31: the Admin UI answers on 12535" || bad "S31: the Admin UI answered $code on 12535"
 code=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' "https://$IP:443/login"); [[ "$code" =~ ^[23] ]] && ok "the admin UI answers" || bad "the admin UI answered $code"
 within 60 admin_login "$P" && ok "S17: the Admin UI's login takes the whole password" || bad "S17: the Admin UI's login refuses the whole password"
 admin_login Aa1 && bad "S17: the Admin UI's login takes the password's first word" || ok "S17: the Admin UI's login refuses the first word alone"
@@ -89,6 +111,16 @@ within 60 rewritten && ok "S18: weed rewrote mini.options as it started" || bad 
 private "S18, after the restart"
 within 60 admin_login "$P" && ok "S17: after the restart, the Admin UI's login takes the whole password" || bad "S17: after the restart, the Admin UI's login refuses the whole password"
 ./install-seaweedfs install >"$W/o" 2>&1 && ok "same-settings re-run" || { bad "re-run"; tail -6 "$W/o" | cut -c1-170; }
+# S36: Caddy is restarted when the Caddyfile differs from the one it last started with, even when this run didn't change
+# it (a run that stopped after writing the Caddyfile but before restarting Caddy). The record is that file's md5.
+[ "$(cat /opt/caddy/.caddyfile-applied 2>/dev/null)" = "$(md5sum < /opt/caddy/Caddyfile | cut -d' ' -f1)" ] && [ "$(stat -c %a /opt/caddy/.caddyfile-applied)" = 600 ] \
+  && ok "S36: the record of Caddy's Caddyfile matches the file, mode 600" || bad "S36: the record of Caddy's Caddyfile doesn't match the file"
+cs=$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)
+./install-seaweedfs install >"$W/o" 2>&1 && [ "$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)" = "$cs" ] \
+  && ok "S36: a re-run with nothing changed doesn't restart Caddy" || bad "S36: a re-run with nothing changed restarted Caddy, or failed"
+echo 00000000000000000000000000000000 > /opt/caddy/.caddyfile-applied
+./install-seaweedfs install >"$W/o" 2>&1 && [ "$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)" != "$cs" ] \
+  && ok "S36: a re-run restarts Caddy when it last started with another Caddyfile" || bad "S36: Caddy wasn't restarted for a Caddyfile it hadn't loaded"
 # S21: a changed password reaches Grafana, and every other surface. Spaces at either end, which Grafana's reset keeps.
 P2=${VEC[ends]}
 SWFS_PASSWORD=$P2 ./install-seaweedfs install >"$W/o" 2>&1 && ok "a re-run with a new password" || { bad "a re-run with a new password"; tail -6 "$W/o" | cut -c1-170; }

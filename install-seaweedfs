@@ -6,15 +6,20 @@
 
 # -- USER DEFINED Configuration Variables -- #
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.5.0"
 
 DEBUG=${DEBUG:-1}
 
 # - Container Images
 # Pinned for reproducible online + air-gapped installs (a 'save' on one day and an 'install'
 # weeks later must use the same binary). Override at runtime to track a newer release.
-SWFS_IMAGE=${SWFS_IMAGE:-"chrislusf/seaweedfs:4.30"}
+SWFS_IMAGE=${SWFS_IMAGE:-"chrislusf/seaweedfs:4.54"}
 CADDY_IMAGE=${CADDY_IMAGE:-"caddy:2.11.3"}
+# The port seaweed-mini serves its Admin UI on inside seaweed_net, where Caddy reaches it (S31). Not a setting: weed
+# 4.49 moved the default from 23646 to 12535, so mini gets it as a flag, and every image (4.30 included) serves the same
+# port. Its gRPC port is this + 10000 (22535), below Linux's ephemeral range; 4.30's default gRPC port, 33646, is inside
+# it, so one of weed's own outgoing connections could take it and stop the Admin UI (seaweedfs/seaweedfs#10928).
+WEED_ADMIN_PORT=12535
 
 # - Basic Authentication
 SWFS_USER=${SWFS_USER:-"admin"}             # Username for SeaweedFS Admin UI, Filer, Master
@@ -171,6 +176,13 @@ require_cmds() {
 # The state file records what THIS tool actually changed on the host, so uninstall
 # reverts exactly that — never keyed on the ENABLE_* env present at uninstall time.
 # Format: KEY=value lines, one per key (last write wins), mode 600.
+# add_words <list> <words>: the list with each word not already in it appended. LOADED_IMAGES keeps every image a run
+# loaded, so an upgrade's old image (4.30 after a move to 4.54) is still removed by uninstall with SWFS_REMOVE_IMAGES.
+add_words() {
+  local out=$1 w
+  for w in $2; do [[ " $out " == *" $w "* ]] || out="${out:+$out }$w"; done
+  printf '%s' "$out"
+}
 record_state() {
   local key="$1" value="$2"
   mkdir -p "$(dirname "$STATE_FILE")"
@@ -252,6 +264,30 @@ EOF
 }
 
 file_md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
+# caddyfile_applied <md5>: record the Caddyfile seaweed-caddy now runs with (S36)
+CADDYFILE_APPLIED=/opt/caddy/.caddyfile-applied
+caddyfile_applied() { private_file "$CADDYFILE_APPLIED"; printf '%s\n' "$1" > "$CADDYFILE_APPLIED"; }
+# caddyfile_running: the md5 of the Caddyfile seaweed-caddy runs with, or nothing when that can't be known (S36).
+# Comparing only within a run left Caddy on an old Caddyfile for good after a run stopped between writing the file and
+# restarting Caddy. The record says what Caddy last started with, unless Caddy started again after it was written (an
+# installer before 1.5.0, a reboot, a restart by hand): then it runs the Caddyfile that was there when it started, the
+# current one unless the file changed since. A host with no record is read the same way.
+caddyfile_running() {
+  local rec rec_t started start="" f_t
+  rec=$(cat "$CADDYFILE_APPLIED" 2>/dev/null)
+  rec_t=$(stat -c %Y "$CADDYFILE_APPLIED" 2>/dev/null)
+  # date -d "" is today's midnight, not an error, so parse only a start time docker gave
+  started=$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)
+  [[ "$started" == [0-9]*T* ]] && start=$(date -d "$started" +%s 2>/dev/null)
+  f_t=$(stat -c %Y /opt/caddy/Caddyfile 2>/dev/null)
+  if [[ -n "$rec" && -n "$rec_t" ]] && { [[ -z "$start" ]] || ((start <= rec_t)); }; then
+    echo "$rec"
+  elif [[ -n "$start" && -n "$f_t" ]] && ((f_t > start)); then
+    echo ""
+  else
+    file_md5 /opt/caddy/Caddyfile
+  fi
+}
 
 # S15: the seaweed-mount container that holds the /mnt/seaweed FUSE mount: its ID and start time. install_swfs reads it
 # right before and right after 'docker compose up', so a container compose recreated or restarted shows, with no race
@@ -294,6 +330,25 @@ swfs_clear_dead_mount() {
     umount -l /mnt/seaweed && echo "  Cleared a dead FUSE mount at /mnt/seaweed (no weed process behind it)."
   done
   return 0
+}
+# swfs_mount_recover: after 'docker compose up' over a live mount, wait up to 30 s for /mnt/seaweed to be live again. If
+# it's dead meanwhile, clear it and restart seaweed-mount once. S35 on Rocky 10: when seaweed-mount is recreated while an
+# NFS client holds the export, the old mount is left dead, and Rocky's runc starts the new container on it anyway.
+# compose up succeeds, then weed's fusermount fails ("failed to access mountpoint .: Socket not connected"), and Docker
+# restarts the container until it gives up. Ubuntu and Leap refuse the start instead, which install_swfs handles at
+# compose up.
+swfs_mount_recover() {
+  local i
+  for ((i = 0; i < 15; i++)); do
+    [[ "$(findmnt -n -o FSTYPE /mnt/seaweed 2>/dev/null | tail -n 1)" == fuse* ]] \
+      && timeout 5 stat -f /mnt/seaweed > /dev/null 2>&1 && return 0
+    swfs_mount_dead && break
+    sleep 2
+  done
+  swfs_mount_dead || return 0
+  echo "  seaweed-mount started on the old mount it left behind; clearing it and restarting seaweed-mount..."
+  swfs_clear_dead_mount
+  docker restart seaweed-mount > /dev/null || echo "  WARNING: restarting seaweed-mount failed (check: docker logs seaweed-mount)."
 }
 
 # private_file <path>: make sure the file exists with mode 600 before secrets are written into it. 'cat >' keeps
@@ -768,24 +823,40 @@ install_swfs () {
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_binaries || die "Artifact download failed."
   fi
+  # The Caddyfile Caddy runs with (S36), recorded before it changes, so a run that stops before restarting Caddy still
+  # restarts it next time.
   local caddyfile_before
-  caddyfile_before=$(file_md5 /opt/caddy/Caddyfile)
+  caddyfile_before=$(caddyfile_running)
+  [[ -n "$caddyfile_before" ]] && caddyfile_applied "$caddyfile_before"
   generate_caddyfile
   generate_compose_file
-  record_state LOADED_IMAGES "$SWFS_IMAGE $CADDY_IMAGE"
+  record_state LOADED_IMAGES "$(add_words "$(get_state LOADED_IMAGES)" "$SWFS_IMAGE $CADDY_IMAGE")"
   generate_index_html
   persist_caddy_data
   echo "  Starting SeaweedFS and Caddy containers..."
   # A dead /mnt/seaweed (a Docker restart, say) would stop compose starting seaweed-mount, so a re-run repairs it (S28)
   swfs_clear_dead_mount | tee -a "$LOG_FILE"
   MOUNT_BEFORE=$(mount_container)
-  docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
-    || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+  local had_mount=0
+  [[ "$(findmnt -n -o FSTYPE /mnt/seaweed 2>/dev/null | tail -n 1)" == fuse* ]] && had_mount=1
+  if ! docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans; then
+    # S35: recreating seaweed-mount (a new image or setting) stops weed mount while an NFS client has the export
+    # mounted. Its unmount then fails, the old mount is left dead, and the new container can't start on it ("chdir to
+    # cwd: transport endpoint is not connected"). Clear the dead mount and start the rest once more.
+    swfs_mount_dead || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+    echo "  seaweed-mount couldn't start on the old mount it left behind; clearing it and starting again..." | tee -a "$LOG_FILE"
+    swfs_clear_dead_mount | tee -a "$LOG_FILE"
+    docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
+      || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+  fi
+  # S35, Rocky 10: compose can start the new seaweed-mount on the dead mount; see swfs_mount_recover
+  ((had_mount)) && swfs_mount_recover | tee -a "$LOG_FILE"
   MOUNT_AFTER=$(mount_container)
   # Apply a regenerated Caddyfile to an already-running container (SW-8): compose
   # only recreates on compose-file changes, not bind-mounted config changes.
   restart_if_changed seaweed-caddy "$caddyfile_before" "$(file_md5 /opt/caddy/Caddyfile)" \
     || die "Restarting seaweed-caddy failed (check 'docker logs seaweed-caddy')."
+  caddyfile_applied "$(file_md5 /opt/caddy/Caddyfile)"
   echo "  Waiting for SeaweedFS and Caddy to start..."
   local response_code=""
   local attempt=1
@@ -1309,7 +1380,7 @@ generate_caddyfile () {
   # to the landing page instead of the dashboard (the Admin UI always redirects to /admin).
   local splash_gate="" login_location=""
   if [[ ${SPLASH_REQUIRE_LOGIN,,} == "true" ]]; then
-    splash_gate="forward_auth seaweed-mini:23646 {
+    splash_gate="forward_auth seaweed-mini:$WEED_ADMIN_PORT {
                         uri /admin
                 }"
     login_location='header_down Location "^(https?://[^/]+)?/admin$" "/"'
@@ -1342,7 +1413,7 @@ $SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT, https://$MGMT_IP:$SWFS_ADMIN_PORT {
                 file_server
         }
         handle /login {
-                reverse_proxy seaweed-mini:23646 {
+                reverse_proxy seaweed-mini:$WEED_ADMIN_PORT {
                         $login_location
                         header_down Set-Cookie "^(.+)$" "\$1; Secure"
                 }
@@ -1355,7 +1426,7 @@ $SWFS_ADMIN_FQDN:$SWFS_ADMIN_PORT, https://$MGMT_IP:$SWFS_ADMIN_PORT {
         # Everything else is the SeaweedFS Admin UI. A catch-all (not a per-path list) so
         # sections added by newer SeaweedFS releases (e.g. /plugin in 4.30) work unchanged.
         handle {
-                reverse_proxy seaweed-mini:23646 {
+                reverse_proxy seaweed-mini:$WEED_ADMIN_PORT {
                         header_down Set-Cookie "^(.+)$" "\$1; Secure"
                 }
         }
@@ -1505,6 +1576,9 @@ auth_fingerprint() {
 # su-exec or seaweed user runs weed as root, as its own entrypoint did. The image's /bin/sh reads it from a read-only
 # mount, so the host file needs no exec permission. A running seaweed-mini reads it only when it starts: a release that
 # changes this script but not the compose file must restart seaweed-mini itself (v1.3.1's compose change recreates it).
+# Upstream fixed its script in 4.54 (seaweedfs/seaweedfs#12587), and for 'mini' it now does the same as this one. This
+# one stays (spec 24, S32) for anyone who sets SWFS_IMAGE to an older tag, and the integration tests fail when the
+# pinned image's /entrypoint.sh changes, so each image move reviews what this one copies.
 write_weed_entrypoint () {
   cat > /opt/seaweedfs/weed-entrypoint.sh <<'WEED_ENTRYPOINT'
 #!/bin/sh
@@ -1541,7 +1615,10 @@ generate_compose_file () {
   # short, or with the flags after it dropped. Each item is a single-quoted YAML scalar with $ written $$, which compose
   # reads back exactly. For every password that worked before, compose sees the same list, so its config hash, and the
   # container, stay the same.
-  local -a mini_args=(mini -admin.user "$SWFS_USER" -admin.password "$SWFS_PASSWORD" -dir=/data -webdav=false)
+  # -admin.port pins the Admin UI to the port Caddy proxies to (S31). weed 4.49+ also keeps a best-effort listener on
+  # the old 23646; the flag that turns it off (-admin.port.legacy) doesn't exist before 4.49, and weed refuses an
+  # unknown flag, so it stays on for as long as an older SWFS_IMAGE is supported.
+  local -a mini_args=(mini -admin.user "$SWFS_USER" -admin.password "$SWFS_PASSWORD" -dir=/data -webdav=false "-admin.port=$WEED_ADMIN_PORT")
   [[ -n "$VOLUME_INDEX" ]] && mini_args+=("-volume.index=$VOLUME_INDEX")
   [[ -n "$VOLUME_SIZE_LIMIT_MB" ]] && mini_args+=("-master.volumeSizeLimitMB=$VOLUME_SIZE_LIMIT_MB")
   # Pre-compute optional cluster-ready flags + host-published cluster ports (CLUSTER_MODE=cluster).
@@ -1551,6 +1628,10 @@ generate_compose_file () {
     mini_args+=("-ip=$MGMT_IP")
     [[ -n "$CLUSTER_REPLICATION" ]] && mini_args+=("-master.defaultReplication=$CLUSTER_REPLICATION")
     mini_args+=("-dataCenter=$CLUSTER_DC" "-rack=$CLUSTER_RACK" "-master.port.grpc=$CLUSTER_MASTER_GRPC_PORT")
+    # S37: with no -master.peers, weed mini is a single master, and from 4.51 (seaweedfs PR #12061) that admits only its
+    # own volume server: every joined node is refused. Its own address as its only peer makes it a one-member raft
+    # master, which admits them. mini's master HTTP port is its default, 9333.
+    mini_args+=("-master.peers=$MGMT_IP:9333")
     mini_args+=("-volume.port=$CLUSTER_VOLUME_PORT" "-volume.port.grpc=$CLUSTER_VOLUME_GRPC_PORT")
     MINI_CLUSTER_PORTS+="    ports:"$'\n'
     MINI_CLUSTER_PORTS+="      - \"$CLUSTER_MASTER_GRPC_PORT:$CLUSTER_MASTER_GRPC_PORT\""$'\n'
@@ -2673,8 +2754,37 @@ run_join () {
   docker compose -f /opt/seaweedfs/seaweedfs-volume-compose.yaml up -d --remove-orphans \
     || die "docker compose up failed for /opt/seaweedfs/seaweedfs-volume-compose.yaml."
   configure_firewall "$CLUSTER_VOLUME_PORT/tcp $CLUSTER_VOLUME_GRPC_PORT/tcp" "false" "false"
+  echo "  Waiting for the master at $CLUSTER_MASTER to admit this volume server..."
+  if ! wait_for_admission; then
+    docker logs --tail 15 seaweed-volume 2>&1 | tee -a "$LOG_FILE"
+    die "The master at $CLUSTER_MASTER didn't list this volume server ($MGMT_IP:$CLUSTER_VOLUME_PORT) within 90 s, so it holds no data. Its last log lines are above. 'rejected: this master admits a single volume-server reporter' means node 1 runs SeaweedFS 4.51 or later from an installer before 1.5.0: re-run install on node 1 with this release, then join again. A connection error means node 1's master gRPC port isn't reachable from here: the -master port + 10000, or the port after a '.' (-master host:9333.<grpc port>)."
+  fi
   generate_join_outputs
   record_state SCRIPT_VERSION "$SCRIPT_VERSION"
+}
+
+# S38: join waits for node 1's master to list this volume server. A master that refuses it (weed mini 4.51+ as a single
+# master, S37) or that it can't reach left join reporting success for a node that never held data. weed shell reaches
+# the master over its published gRPC port, which needs no credentials. It hangs with no master, so it is time-limited
+# inside the container (killing docker exec alone leaves it running there), and the outer limit is a backstop.
+# cluster.check's "the cluster has N volume servers: [a b]" names every server the master admitted. volume.list leaves
+# out one that holds no volume yet, which a new node usually doesn't (Rocky 10 CI). The list comes before the
+# connectivity checks, so a check that runs into the time limit has already printed it. An entry carries ".<grpc port>"
+# when that isn't the HTTP port + 10000 (a CLUSTER_VOLUME_PORT set without CLUSTER_VOLUME_GRPC_PORT), so it's dropped.
+volume_admitted() {
+  timeout -k 2 15 docker exec -i seaweed-volume timeout 10 /usr/bin/weed shell -master="$CLUSTER_MASTER" <<< "cluster.check" 2>/dev/null \
+    | grep -m 1 -F "volume servers:" | sed 's/.*volume servers://' | tr -d '[]' | tr ' ' '\n' \
+    | sed -E 's/^([^:]+:[0-9]+)\.[0-9]+$/\1/' | grep -qxF "$MGMT_IP:$CLUSTER_VOLUME_PORT"
+}
+# wait_for_admission: up to 90 s (and 18 checks), however long each check takes
+wait_for_admission() {
+  local i end=$((SECONDS + 90))
+  for ((i = 0; i < 18; i++)); do
+    volume_admitted && return 0
+    ((SECONDS + 5 >= end)) && return 1
+    sleep 5
+  done
+  return 1
 }
 
 generate_join_compose_file () {
@@ -2686,7 +2796,7 @@ generate_join_compose_file () {
   [[ -n "$VOLUME_INDEX" ]] && VOL_TUNING+="      -index=$VOLUME_INDEX"$'\n'
   record_state STATE_VERSION "1"
   record_state NODE_ROLE "volume"
-  record_state LOADED_IMAGES "$swfs_image_local"
+  record_state LOADED_IMAGES "$(add_words "$(get_state LOADED_IMAGES)" "$swfs_image_local")"
   echo "  Creating seaweedfs-volume-compose.yaml..." | tee -a "$LOG_FILE"
   cat > /opt/seaweedfs/seaweedfs-volume-compose.yaml <<EOF
 networks:
