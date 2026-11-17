@@ -257,6 +257,9 @@ EOF
 }
 
 file_md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
+# caddyfile_applied <md5>: record the Caddyfile seaweed-caddy now runs with (S36)
+CADDYFILE_APPLIED=/opt/caddy/.caddyfile-applied
+caddyfile_applied() { private_file "$CADDYFILE_APPLIED"; printf '%s\n' "$1" > "$CADDYFILE_APPLIED"; }
 
 # S15: the seaweed-mount container that holds the /mnt/seaweed FUSE mount: its ID and start time. install_swfs reads it
 # right before and right after 'docker compose up', so a container compose recreated or restarted shows, with no race
@@ -773,8 +776,15 @@ install_swfs () {
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     download_binaries || die "Artifact download failed."
   fi
+  # The Caddyfile Caddy last started with (S36). A run that stopped after writing a new Caddyfile but before restarting
+  # Caddy left Caddy on the old one, and comparing only within a run would never restart it. A host from before 1.5.0
+  # has no record: Caddy runs the Caddyfile that is there now, so that is recorded before it changes.
   local caddyfile_before
-  caddyfile_before=$(file_md5 /opt/caddy/Caddyfile)
+  caddyfile_before=$(cat "$CADDYFILE_APPLIED" 2>/dev/null)
+  if [[ -z "$caddyfile_before" ]]; then
+    caddyfile_before=$(file_md5 /opt/caddy/Caddyfile)
+    [[ -n "$caddyfile_before" ]] && caddyfile_applied "$caddyfile_before"
+  fi
   generate_caddyfile
   generate_compose_file
   record_state LOADED_IMAGES "$SWFS_IMAGE $CADDY_IMAGE"
@@ -784,13 +794,22 @@ install_swfs () {
   # A dead /mnt/seaweed (a Docker restart, say) would stop compose starting seaweed-mount, so a re-run repairs it (S28)
   swfs_clear_dead_mount | tee -a "$LOG_FILE"
   MOUNT_BEFORE=$(mount_container)
-  docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
-    || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+  if ! docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans; then
+    # S35: recreating seaweed-mount (a new image or setting) stops weed mount while an NFS client has the export
+    # mounted. Its unmount then fails, the old mount is left dead, and the new container can't start on it ("chdir to
+    # cwd: transport endpoint is not connected"). Clear the dead mount and start the rest once more.
+    swfs_mount_dead || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+    echo "  seaweed-mount couldn't start on the old mount it left behind; clearing it and starting again..." | tee -a "$LOG_FILE"
+    swfs_clear_dead_mount | tee -a "$LOG_FILE"
+    docker compose -f /opt/seaweedfs/seaweedfs-compose.yaml up -d --remove-orphans \
+      || die "docker compose up failed for /opt/seaweedfs/seaweedfs-compose.yaml."
+  fi
   MOUNT_AFTER=$(mount_container)
   # Apply a regenerated Caddyfile to an already-running container (SW-8): compose
   # only recreates on compose-file changes, not bind-mounted config changes.
   restart_if_changed seaweed-caddy "$caddyfile_before" "$(file_md5 /opt/caddy/Caddyfile)" \
     || die "Restarting seaweed-caddy failed (check 'docker logs seaweed-caddy')."
+  caddyfile_applied "$(file_md5 /opt/caddy/Caddyfile)"
   echo "  Waiting for SeaweedFS and Caddy to start..."
   local response_code=""
   local attempt=1

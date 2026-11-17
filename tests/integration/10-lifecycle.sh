@@ -111,6 +111,16 @@ within 60 rewritten && ok "S18: weed rewrote mini.options as it started" || bad 
 private "S18, after the restart"
 within 60 admin_login "$P" && ok "S17: after the restart, the Admin UI's login takes the whole password" || bad "S17: after the restart, the Admin UI's login refuses the whole password"
 ./install-seaweedfs install >"$W/o" 2>&1 && ok "same-settings re-run" || { bad "re-run"; tail -6 "$W/o" | cut -c1-170; }
+# S36: Caddy is restarted when the Caddyfile differs from the one it last started with, even when this run didn't change
+# it (a run that stopped after writing the Caddyfile but before restarting Caddy). The record is that file's md5.
+[ "$(cat /opt/caddy/.caddyfile-applied 2>/dev/null)" = "$(md5sum < /opt/caddy/Caddyfile | cut -d' ' -f1)" ] && [ "$(stat -c %a /opt/caddy/.caddyfile-applied)" = 600 ] \
+  && ok "S36: the record of Caddy's Caddyfile matches the file, mode 600" || bad "S36: the record of Caddy's Caddyfile doesn't match the file"
+cs=$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)
+./install-seaweedfs install >"$W/o" 2>&1 && [ "$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)" = "$cs" ] \
+  && ok "S36: a re-run with nothing changed doesn't restart Caddy" || bad "S36: a re-run with nothing changed restarted Caddy, or failed"
+echo 00000000000000000000000000000000 > /opt/caddy/.caddyfile-applied
+./install-seaweedfs install >"$W/o" 2>&1 && [ "$(docker inspect -f '{{.State.StartedAt}}' seaweed-caddy 2>/dev/null)" != "$cs" ] \
+  && ok "S36: a re-run restarts Caddy when it last started with another Caddyfile" || bad "S36: Caddy wasn't restarted for a Caddyfile it hadn't loaded"
 # S21: a changed password reaches Grafana, and every other surface. Spaces at either end, which Grafana's reset keeps.
 P2=${VEC[ends]}
 SWFS_PASSWORD=$P2 ./install-seaweedfs install >"$W/o" 2>&1 && ok "a re-run with a new password" || { bad "a re-run with a new password"; tail -6 "$W/o" | cut -c1-170; }
